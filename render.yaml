@@ -1,0 +1,13 @@
+
+services:
+  - type: web
+    name: doge-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python runner.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: BOT_MODULE
+        value: "bot"
