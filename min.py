@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ====================================================================
 # RF LIQUIDITY ENGINE v28 - PRODUCTION (REFACTORED TRADE MANAGEMENT)
-# [FORENSIC FIX + ARCHITECTURAL SURGERY + WAITING LIST]
+# [FORENSIC FIX + ARCHITECTURAL SURGERY]
 # ====================================================================
 # REFACTORING SUMMARY (2026-07-14):
 # 1. Unified state management: STATE is the sole truth; removed TRADE_STATE writes.
@@ -12,7 +12,6 @@
 # 6. Unused legacy functions removed; redundant fields cleaned up.
 # 7. Order verification mandatory for all closes; dashboard reads directly from STATE.
 # 8. All strategic logic unchanged.
-# 9. Professional Institutional Waiting List (Thesis-driven) - added as monitoring layer.
 # ====================================================================
 
 import os
@@ -33,9 +32,6 @@ import pandas as pd
 import numpy as np
 from flask import Flask, jsonify, request
 import requests
-
-# ========== FLASK APP ==========
-app = Flask(__name__)  # <-- FIXED: app is now defined before any route decorators
 
 # ========== FALLBACK LOGGING ==========
 if 'log_execution' not in dir():
@@ -64,7 +60,7 @@ class SmartMoneyEngine:
 
     @staticmethod
     def analyze_smart_money(df):
-        # ... (unchanged, original code kept)
+        # ... (unchanged, keep original code)
         if df is None or df.empty:
             return SmartMoneyEngine._default_state()
         required = ["close", "high", "low", "volume"]
@@ -150,6 +146,7 @@ class SmartMoneyEngine:
             "flow_alignment": 25.0
         }
 
+
 class MomentumFlowEngine:
     @staticmethod
     def _rsi(series, period=14):
@@ -219,6 +216,7 @@ class MomentumFlowEngine:
             "greed_state": False,
             "flow_bias": "NEUTRAL"
         }
+
 
 # ========== TRADE STATE MACHINE (UNCHANGED) ==========
 class TradeStateMachine:
@@ -324,6 +322,7 @@ class TradeStateMachine:
             return "LOW"
         else:
             return "MEDIUM"
+
 
 # ========== TRADE STATE & PERFORMANCE TRACKING ==========
 # DEPRECATED: TRADE_STATE is no longer written to; kept only for legacy dashboard compatibility.
@@ -484,7 +483,7 @@ def send_once(msg, key, cooldown=60):
         _tg_send(msg)
 
 def tg_start(balance, mode):
-    send_once(f"🚀 <b>RF v28 Professional Edition (REFACTORED + WAITING LIST)</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nEntry Engine: ADX flexible + Sweep + MSS required for reversals", "startup", 86400)
+    send_once(f"🚀 <b>RF v28 Professional Edition (REFACTORED)</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nEntry Engine: ADX flexible + Sweep + MSS required for reversals", "startup", 86400)
 
 def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
     side_emoji = "🟢" if side == "BUY" else "🔴"
@@ -2172,7 +2171,7 @@ def close_position_full():
 def evaluate_profit_protection(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
     """
     Evaluates profit protection and returns a proposal dict:
-    {'action': 'HOLD'|'PARTIAL'|'EXIT', 'ratio': float (if PARTIAL),
+    {'action': 'HOLD'|'PARTIAL'|'EXIT', 'ratio': float (if PARTIAL), 
      'new_sl': float, 'new_trail': float, 'flags': dict}
     Does NOT execute any orders.
     """
@@ -4440,69 +4439,6 @@ def evaluate_liquidity_narrative(df, ob, atr, side):
     return narrative, score
 
 def smart_opportunity_selection():
-    """ Main entry selection. First tries Waiting List, then falls back to original scanner logic. """
-    # Try Waiting List first
-    best = select_best_ready()
-    if best:
-        symbol = best["symbol"]
-        side = best["side"]
-        df = get_ohlcv_safe(symbol, 100)
-        if df is not None:
-            ob = get_orderbook_cached(symbol, 10)
-            atr = compute_atr(df).iloc[-1]
-            price = df['close'].iloc[-1]
-            should_enter, classification, reason = check_institutional_entry(symbol, side, df, ob, atr, price)
-            if should_enter:
-                should_enter_narr, final_class, narrative = evaluate_with_narrative(symbol, side, price, atr, df, ob, side)
-                if should_enter_narr:
-                    sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL" if "REVERSAL" in classification else "EARLY_TREND", atr, df)
-                    log_execution(f"[WAITING_LIST] Executing READY entry: {symbol} {side}", "SUCCESS")
-                    ok = execute_entry(side, symbol, price, sl, tp1, tp2, best["score"], reason, atr,
-                                       trade_type="INSTITUTIONAL", entry_type="WAITING_LIST", classification=classification)
-                    if ok:
-                        # Mark as executed
-                        if symbol in MEMORY.get("waiting_list", {}):
-                            MEMORY["waiting_list"][symbol]["current_stage"] = "EXECUTED"
-                            MEMORY["waiting_list"][symbol]["history"].append({
-                                "time": time.time(),
-                                "from": "READY",
-                                "to": "EXECUTED",
-                                "reason": "Entry executed"
-                            })
-                        return True
-                else:
-                    # Narrative failed – keep in waiting list, but maybe demote
-                    log_execution(f"[WAITING_LIST] {symbol} {side} failed narrative check, staying in WAITING", "WARN")
-                    if symbol in MEMORY.get("waiting_list", {}):
-                        entry = MEMORY["waiting_list"][symbol]
-                        entry["current_stage"] = "WAITING"
-                        entry["missing_conditions"].append("Narrative check failed")
-                        entry["thesis"]["next_expected_event"] = "Re‑evaluate narrative"
-                        entry["history"].append({
-                            "time": time.time(),
-                            "from": "READY",
-                            "to": "WAITING",
-                            "reason": "Narrative check failed"
-                        })
-            else:
-                # Not ready – keep in waiting list
-                log_execution(f"[WAITING_LIST] {symbol} {side} failed entry check: {reason}", "INFO")
-                if symbol in MEMORY.get("waiting_list", {}):
-                    entry = MEMORY["waiting_list"][symbol]
-                    entry["current_stage"] = "WAITING"
-                    entry["missing_conditions"].append(f"Entry check failed: {reason}")
-                    entry["thesis"]["next_expected_event"] = "Wait for conditions to improve"
-                    entry["history"].append({
-                        "time": time.time(),
-                        "from": "READY",
-                        "to": "WAITING",
-                        "reason": f"Entry check failed: {reason}"
-                    })
-    # Fallback to original logic (if no ready entry from waiting list)
-    return fallback_opportunity_selection()
-
-def fallback_opportunity_selection():
-    """ Original smart_opportunity_selection logic (preserved). """
     candidates = []
     for c in MEMORY.get("scanner_v2_buy", [])[:5]:
         candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"], "source": "v2"})
@@ -5317,7 +5253,7 @@ def near_key_zone(df, price):
             return True
     return False
 
-# ========== MONITOR WATCHLIST (UNCHANGED, but note it is not called) ==========
+# ========== MONITOR WATCHLIST (UNCHANGED) ==========
 def monitor_watchlist():
     watchlist = MEMORY.get("rf_watchlist", [])
     for c in watchlist:
@@ -5631,525 +5567,6 @@ def emergency_kill_switch_active():
 def trailing_stop_new(price, atr):
     return False
 
-# ========== WAITING LIST INTEGRATION ==========
-# New constants
-WAITING_LIST_MAX = 70
-WATCHLIST_SIZE = 8
-WAITING_TTL = 86400  # 24 hours
-INVALIDATED_TTL = 1800  # 30 minutes
-
-def create_waiting_entry(symbol, side, data):
-    """Create a new waiting list entry with full thesis."""
-    now = time.time()
-    entry = {
-        "symbol": symbol,
-        "side": side,
-        "opportunity_type": data.get("opportunity_type", "TREND_CONTINUATION"),
-        "current_stage": "DISCOVERED",
-        "score": data.get("score", 0.0),
-        "priority": 3,
-        "time_added": now,
-        "last_analysis": now,
-        "metadata": data.get("metadata", {}),
-        "thesis": {
-            "summary": data.get("thesis_summary", "Institutional setup detected"),
-            "narrative": data.get("narrative", {}),
-            "key_levels": data.get("key_levels", {}),
-            "required_events": data.get("required_events", []),
-            "missing_conditions": data.get("missing_conditions", []),
-            "next_expected_event": data.get("next_expected_event", "Initial analysis"),
-            "thesis_health": 50.0,
-            "analysis_confidence": 50.0,
-            "execution_probability": 50.0,
-            "institutional_risk": "MEDIUM",
-            "management_profile": data.get("management_profile", {
-                "trail_mult": 1.5,
-                "hold_score": 10,
-                "profile_type": "STANDARD"
-            })
-        },
-        "history": [
-            {"time": now, "from": "CREATED", "to": "DISCOVERED", "reason": "Entry created"}
-        ]
-    }
-    return entry
-
-def update_waiting_entry(entry, df, ob, atr, price):
-    """Update a waiting list entry with fresh data."""
-    now = time.time()
-    side = entry["side"]
-    # Compute thesis health
-    health = compute_thesis_health(entry, df, ob, atr, price)
-    entry["thesis"]["thesis_health"] = health
-    entry["thesis"]["analysis_confidence"] = min(100, health + 5)
-    # Compute execution probability
-    prob = compute_execution_probability(entry, df, ob, atr, price)
-    entry["thesis"]["execution_probability"] = prob
-    # Update missing conditions and next event
-    missing, next_event = evaluate_missing_conditions(entry, df, ob, atr, price)
-    entry["thesis"]["missing_conditions"] = missing
-    entry["thesis"]["next_expected_event"] = next_event
-    # Determine stage
-    new_stage = determine_stage(entry)
-    if new_stage != entry["current_stage"]:
-        entry["history"].append({
-            "time": now,
-            "from": entry["current_stage"],
-            "to": new_stage,
-            "reason": f"Thesis health {health:.1f}, missing {len(missing)} conditions"
-        })
-        entry["current_stage"] = new_stage
-    # Update priority
-    entry["priority"] = compute_priority(entry)
-    # Update score (derived from health and probability)
-    entry["score"] = round((health * 0.5 + prob * 0.3 + entry["priority"] * 10) / 100 * 100, 2)
-    entry["last_analysis"] = now
-    # Update metadata
-    entry["metadata"]["adx"] = compute_adx(df).iloc[-1] if df is not None else 0
-    entry["metadata"]["atr"] = atr
-    entry["metadata"]["price"] = price
-    entry["metadata"]["volume_ratio"] = df['volume'].iloc[-1] / df['volume'].iloc[-10:-1].mean() if df is not None and len(df) > 10 else 1.0
-    return entry
-
-def compute_thesis_health(entry, df, ob, atr, price):
-    """Calculate thesis health 0-100."""
-    score = 0.0
-    # 1. Narrative score (from existing classification)
-    narrative = entry["thesis"]["narrative"]
-    narr_score = narrative.get("narrative_score", 0)
-    score += min(30, narr_score * 2)
-    # 2. Zone proximity
-    key_levels = entry["thesis"]["key_levels"]
-    zone_price = key_levels.get("zone_price", None)
-    if zone_price:
-        dist_pct = abs(price - zone_price) / price
-        if dist_pct < 0.001:
-            score += 20
-        elif dist_pct < 0.003:
-            score += 15
-        elif dist_pct < 0.005:
-            score += 10
-        else:
-            score += 5
-    # 3. Volume confirmation
-    vol_ratio = entry["metadata"].get("volume_ratio", 1.0)
-    if vol_ratio > 1.5:
-        score += 15
-    elif vol_ratio > 1.0:
-        score += 10
-    else:
-        score += 5
-    # 4. ADX/DI health
-    adx = compute_adx(df).iloc[-1] if df is not None else 20
-    plus_di, minus_di, _, _ = get_di_components(df)
-    if plus_di is not None and minus_di is not None:
-        di_spread = abs(plus_di - minus_di)
-        if side == "BUY" and plus_di > minus_di:
-            score += min(20, di_spread * 2)
-        elif side == "SELL" and minus_di > plus_di:
-            score += min(20, di_spread * 2)
-        else:
-            score += 5
-    # 5. Sweep/CHoCH confirmation
-    pools = build_liquidity_pools(df)
-    swept_h, swept_l = detect_sweep(df, pools)
-    if (side == "BUY" and swept_l) or (side == "SELL" and swept_h):
-        score += 10
-    bos_up, bos_down = detect_bos(df)
-    struct_shift = detect_structure_shift(df)
-    if side == "BUY" and (bos_up or struct_shift == "bullish_shift"):
-        score += 10
-    elif side == "SELL" and (bos_down or struct_shift == "bearish_shift"):
-        score += 10
-    # 6. Time decay (if waiting too long, health decreases)
-    time_in_system = time.time() - entry["time_added"]
-    if time_in_system > 3600 * 6:  # >6 hours
-        score -= 5
-    if time_in_system > 3600 * 12:
-        score -= 10
-    # Clamp
-    return max(0, min(100, score))
-
-def compute_priority(entry):
-    """Compute priority 1-5."""
-    health = entry["thesis"]["thesis_health"]
-    prob = entry["thesis"]["execution_probability"]
-    stage = entry["current_stage"]
-    # Base priority
-    if stage == "READY":
-        priority = 5
-    elif stage == "ALMOST_READY":
-        priority = 4
-    elif stage == "WAITING":
-        priority = 3
-    elif stage == "ANALYZING":
-        priority = 2
-    else:
-        priority = 1
-    # Adjust by health
-    if health > 80:
-        priority += 1
-    elif health < 40:
-        priority -= 1
-    # Adjust by probability
-    if prob > 80:
-        priority += 1
-    # Clamp
-    return max(1, min(5, priority))
-
-def compute_execution_probability(entry, df, ob, atr, price):
-    """Estimate execution probability 0-100."""
-    health = entry["thesis"]["thesis_health"]
-    missing = entry["thesis"]["missing_conditions"]
-    # Base from health
-    prob = health * 0.6
-    # Penalty for each missing condition
-    prob -= len(missing) * 5
-    # Spread check
-    spread = get_spread_bps(entry["symbol"])
-    max_spread = dynamic_spread_tolerance(entry["symbol"])
-    if spread > max_spread:
-        prob -= 20
-    # Margin availability
-    free_bal = get_free_balance_safe()
-    if free_bal < 100:
-        prob -= 30
-    # Clamp
-    return max(0, min(100, prob))
-
-def evaluate_missing_conditions(entry, df, ob, atr, price):
-    """Determine what is missing and the next expected event."""
-    side = entry["side"]
-    missing = []
-    next_event = ""
-    # Check zone
-    key_levels = entry["thesis"]["key_levels"]
-    zone_price = key_levels.get("zone_price", None)
-    if zone_price:
-        dist_pct = abs(price - zone_price) / price
-        if dist_pct > 0.003:
-            missing.append(f"Price not at zone (dist {dist_pct*100:.2f}%)")
-            next_event = f"Wait for price to retest {zone_price:.4f}"
-        else:
-            next_event = "Zone reached, waiting for confirmation"
-    else:
-        missing.append("No key zone identified")
-        next_event = "Identify key zone"
-    # Check volume
-    vol_ratio = entry["metadata"].get("volume_ratio", 1.0)
-    if vol_ratio < 1.2:
-        missing.append(f"Volume below threshold (ratio {vol_ratio:.2f})")
-        if not next_event:
-            next_event = "Wait for volume expansion"
-    # Check ADX
-    adx = compute_adx(df).iloc[-1] if df is not None else 0
-    if adx < 20:
-        missing.append(f"ADX too low ({adx:.1f})")
-        if not next_event:
-            next_event = "Wait for ADX to rise above 20"
-    # Check DI
-    plus_di, minus_di, _, _ = get_di_components(df)
-    if plus_di is not None and minus_di is not None:
-        di_spread = abs(plus_di - minus_di)
-        if side == "BUY" and plus_di <= minus_di:
-            missing.append("DI not bullish (DI- > DI+)")
-            if not next_event:
-                next_event = "Wait for DI+ to cross above DI-"
-        elif side == "SELL" and minus_di <= plus_di:
-            missing.append("DI not bearish (DI+ > DI-)")
-            if not next_event:
-                next_event = "Wait for DI- to cross above DI+"
-    # Check structure
-    bos_up, bos_down = detect_bos(df)
-    struct_shift = detect_structure_shift(df)
-    if side == "BUY" and not (bos_up or struct_shift == "bullish_shift"):
-        missing.append("No bullish BOS/CHoCH")
-        if not next_event:
-            next_event = "Wait for bullish structure break"
-    elif side == "SELL" and not (bos_down or struct_shift == "bearish_shift"):
-        missing.append("No bearish BOS/CHoCH")
-        if not next_event:
-            next_event = "Wait for bearish structure break"
-    # If all conditions met, set next event to "Ready for execution"
-    if not missing:
-        next_event = "Ready for execution"
-    return missing, next_event
-
-def determine_stage(entry):
-    """Determine the lifecycle stage based on health and conditions."""
-    health = entry["thesis"]["thesis_health"]
-    missing = entry["thesis"]["missing_conditions"]
-    prob = entry["thesis"]["execution_probability"]
-    stage = entry["current_stage"]
-    # If health is very low, invalidate
-    if health < 30:
-        return "INVALIDATED"
-    # If already invalidated, wait for recovery
-    if stage == "INVALIDATED":
-        if time.time() - entry["last_analysis"] > INVALIDATED_TTL:
-            return "ARCHIVED"
-        if health > 50:
-            return "WAITING"
-        return "INVALIDATED"
-    # If already archived, keep archived
-    if stage == "ARCHIVED":
-        return "ARCHIVED"
-    # If executed or closed, keep
-    if stage in ("EXECUTED", "CLOSED"):
-        return stage
-    # Transition logic
-    if health >= 85 and len(missing) == 0 and prob >= 80:
-        return "READY"
-    elif health >= 70 and len(missing) <= 1 and prob >= 60:
-        return "ALMOST_READY"
-    elif health >= 50:
-        return "WAITING"
-    elif health >= 30:
-        return "ANALYZING"
-    else:
-        return "INVALIDATED"
-
-def update_waiting_list():
-    """Main update function for the waiting list."""
-    now = time.time()
-    # Get fresh candidates from scanners (already stored in MEMORY)
-    candidates = []
-    # From RF watchlist
-    for c in MEMORY.get("rf_watchlist", [])[:20]:
-        if c.get("rf_signal") in ("BUY", "SELL"):
-            candidates.append({
-                "symbol": c["symbol"],
-                "side": c["rf_signal"],
-                "score": c["score"],
-                "source": "RF"
-            })
-    # From scanner v2
-    for c in MEMORY.get("scanner_v2_buy", [])[:10]:
-        candidates.append({
-            "symbol": c["symbol"],
-            "side": "BUY",
-            "score": c["score"],
-            "source": "v2"
-        })
-    for c in MEMORY.get("scanner_v2_sell", [])[:10]:
-        candidates.append({
-            "symbol": c["symbol"],
-            "side": "SELL",
-            "score": c["score"],
-            "source": "v2"
-        })
-    # From radar top5
-    for c in MEMORY.get("radar_top5", [])[:5]:
-        candidates.append({
-            "symbol": c["symbol"],
-            "side": "BUY",  # radar doesn't provide side, default to BUY? we'll analyze both later
-            "score": c["score"],
-            "source": "radar"
-        })
-    # Deduplicate and keep highest score per symbol+side
-    best_candidates = {}
-    for c in candidates:
-        key = f"{c['symbol']}_{c['side']}"
-        if key not in best_candidates or c["score"] > best_candidates[key]["score"]:
-            best_candidates[key] = c
-    # Now update waiting list
-    waiting_list = MEMORY.get("waiting_list", {})
-    # First, remove expired or invalidated entries
-    to_remove = []
-    for sym, entry in waiting_list.items():
-        if entry["current_stage"] == "ARCHIVED":
-            to_remove.append(sym)
-            continue
-        if entry["current_stage"] == "INVALIDATED" and time.time() - entry["last_analysis"] > INVALIDATED_TTL:
-            to_remove.append(sym)
-            continue
-        if time.time() - entry["time_added"] > WAITING_TTL and entry["current_stage"] not in ("EXECUTED", "CLOSED"):
-            to_remove.append(sym)
-            continue
-    for sym in to_remove:
-        del waiting_list[sym]
-    # Update existing entries
-    for sym, entry in waiting_list.items():
-        try:
-            df = get_ohlcv_safe(sym, 100)
-            if df is None:
-                continue
-            ob = get_orderbook_cached(sym, 10)
-            atr = compute_atr(df).iloc[-1]
-            price = df['close'].iloc[-1]
-            update_waiting_entry(entry, df, ob, atr, price)
-        except Exception as e:
-            log_execution(f"[WAITING_LIST] Error updating {sym}: {e}", "ERROR")
-    # Add new candidates if space
-    for key, c in best_candidates.items():
-        if len(waiting_list) >= WAITING_LIST_MAX:
-            break
-        sym = c["symbol"]
-        side = c["side"]
-        if sym in waiting_list:
-            continue
-        # Create entry with initial data
-        try:
-            df = get_ohlcv_safe(sym, 100)
-            if df is None:
-                continue
-            ob = get_orderbook_cached(sym, 10)
-            atr = compute_atr(df).iloc[-1]
-            price = df['close'].iloc[-1]
-            # Build narrative
-            narrative = classify_market_narrative(df, ob, atr, side, side)
-            # Determine opportunity type
-            opp_type = "TREND_CONTINUATION"
-            pools = build_liquidity_pools(df)
-            swept_h, swept_l = detect_sweep(df, pools)
-            if (side == "BUY" and swept_l) or (side == "SELL" and swept_h):
-                opp_type = "INSTITUTIONAL_REVERSAL"
-            bos_up, bos_down = detect_bos(df)
-            if bos_up or bos_down:
-                opp_type = "BREAKOUT"
-            if classify_volume(df) == "expansion":
-                opp_type = "LIQUIDITY_EXPANSION"
-            # Key levels
-            supports, resistances = get_clustered_zones(df)
-            zone_price = None
-            if side == "BUY" and supports:
-                zone_price = max([s for s in supports if s <= price], default=None)
-            elif side == "SELL" and resistances:
-                zone_price = min([r for r in resistances if r >= price], default=None)
-            key_levels = {"zone_price": zone_price} if zone_price else {}
-            required_events = []
-            if not zone_price: required_events.append("price_reaches_zone")
-            if classify_volume(df) not in ("expansion", "spike"): required_events.append("volume_expansion")
-            adx_val = compute_adx(df).iloc[-1]
-            if adx_val < 20: required_events.append("adx_rises_above_20")
-            # Management profile
-            if opp_type == "TREND_CONTINUATION":
-                mgmt_profile = {"trail_mult": 1.8, "hold_score": 12, "profile_type": "TREND"}
-            elif opp_type == "INSTITUTIONAL_REVERSAL":
-                mgmt_profile = {"trail_mult": 1.2, "hold_score": 8, "profile_type": "REVERSAL"}
-            elif opp_type == "LIQUIDITY_EXPANSION":
-                mgmt_profile = {"trail_mult": 2.0, "hold_score": 10, "profile_type": "EXPLOSIVE"}
-            else:
-                mgmt_profile = {"trail_mult": 1.5, "hold_score": 10, "profile_type": "STANDARD"}
-            data = {
-                "opportunity_type": opp_type,
-                "score": c["score"],
-                "metadata": {"adx": adx_val, "atr": atr, "source": c["source"]},
-                "thesis_summary": f"{opp_type} setup detected with score {c['score']}",
-                "narrative": narrative,
-                "key_levels": key_levels,
-                "required_events": required_events,
-                "missing_conditions": ["Initial analysis pending"],
-                "next_expected_event": "Analyzing conditions",
-                "management_profile": mgmt_profile
-            }
-            entry = create_waiting_entry(sym, side, data)
-            # Initial update to set stage
-            update_waiting_entry(entry, df, ob, atr, price)
-            waiting_list[sym] = entry
-            log_execution(f"[WAITING_LIST] Added {sym} {side} as {opp_type}", "INFO")
-        except Exception as e:
-            log_execution(f"[WAITING_LIST] Error adding {sym}: {e}", "ERROR")
-    MEMORY["waiting_list"] = waiting_list
-
-def select_best_ready():
-    """Select the best READY entry based on priority, health, probability."""
-    waiting_list = MEMORY.get("waiting_list", {})
-    ready_entries = [e for e in waiting_list.values() if e["current_stage"] == "READY"]
-    if not ready_entries:
-        return None
-    # Sort by priority desc, then health desc, then probability desc, then score desc
-    ready_entries.sort(key=lambda e: (
-        -e["priority"],
-        -e["thesis"]["thesis_health"],
-        -e["thesis"]["execution_probability"],
-        -e["score"]
-    ))
-    return ready_entries[0]
-
-def rotate_watchlist():
-    """Rotate the dynamic watchlist (size = WATCHLIST_SIZE)."""
-    # Get current watchlist
-    watchlist = MEMORY.get("watchlist", {})
-    # Get candidates from waiting list and scanner outputs
-    candidates = []
-    # From waiting list (all stages except archived)
-    for sym, entry in MEMORY.get("waiting_list", {}).items():
-        if entry["current_stage"] not in ("ARCHIVED", "INVALIDATED"):
-            candidates.append({
-                "symbol": sym,
-                "side": entry["side"],
-                "score": entry["score"],
-                "priority": entry["priority"],
-                "health": entry["thesis"]["thesis_health"],
-                "momentum": 0  # will compute later
-            })
-    # Also add from scanner outputs directly (in case not in waiting list yet)
-    for c in MEMORY.get("rf_watchlist", [])[:20]:
-        if c.get("rf_signal") in ("BUY", "SELL"):
-            sym = c["symbol"]
-            if sym not in [x["symbol"] for x in candidates]:
-                candidates.append({
-                    "symbol": sym,
-                    "side": c["rf_signal"],
-                    "score": c["score"],
-                    "priority": 2,
-                    "health": 50,
-                    "momentum": 0
-                })
-    # Compute momentum for existing watchlist entries
-    for sym, entry in watchlist.items():
-        # Check if symbol still in candidates
-        if sym not in [x["symbol"] for x in candidates]:
-            # If not, it might be weak; we will remove later
-            continue
-        # Compute momentum as change in health or score (simplified)
-        # We use the difference between current and last stored
-        last_health = entry.get("last_health", 50)
-        current_health = 50
-        # Find in waiting list for actual health
-        if sym in MEMORY.get("waiting_list", {}):
-            current_health = MEMORY["waiting_list"][sym]["thesis"]["thesis_health"]
-        momentum = current_health - last_health
-        # Update candidate with momentum
-        for c in candidates:
-            if c["symbol"] == sym:
-                c["momentum"] = momentum
-                c["health"] = current_health
-                break
-    # Sort candidates by priority, health, momentum
-    candidates.sort(key=lambda x: (-x["priority"], -x["health"], -x["momentum"], -x["score"]))
-    # Select top WATCHLIST_SIZE
-    top_candidates = candidates[:WATCHLIST_SIZE]
-    # Build new watchlist
-    new_watchlist = {}
-    for c in top_candidates:
-        sym = c["symbol"]
-        # If already in watchlist, keep its data, else create new
-        if sym in watchlist:
-            new_watchlist[sym] = watchlist[sym]
-            # Update last_health
-            new_watchlist[sym]["last_health"] = c["health"]
-        else:
-            # Create new entry
-            new_watchlist[sym] = {
-                "symbol": sym,
-                "side": c["side"],
-                "score": c["score"],
-                "last_health": c["health"],
-                "last_update": time.time(),
-                "state": "WATCHLIST",
-                "reasons": ["Added by rotation"],
-                "trade_type": "UNKNOWN",
-                "strength": "MEDIUM"
-            }
-    # Remove symbols not in top_candidates
-    for sym in list(watchlist.keys()):
-        if sym not in new_watchlist:
-            # Move to watchlist removal log
-            log_execution(f"[WATCHLIST] Removed {sym} due to rotation", "INFO")
-    MEMORY["watchlist"] = new_watchlist
-
 # ========== RADAR FUNCTIONS (UNCHANGED) ==========
 def fast_market_filter(df):
     price = df['close'].iloc[-1]
@@ -6223,8 +5640,1270 @@ def refresh_radar_watchlist():
     log_execution(f"Radar refreshed: {len(updated)} symbols remain in watchlist", "INFO")
 
 def radar_entry_scan():
-    # This function is not called; kept for reference
-    pass
+    if not MEMORY.get("radar_top5"):
+        return
+    now = time.time()
+    for entry in MEMORY["radar_top5"]:
+        sym = entry["symbol"]
+        last = LAST_ENTRY_PER_SYMBOL.get(sym, 0)
+        if now - last < RADAR_COOLDOWN_SEC:
+            continue
+        df = get_ohlcv_safe(sym, 120)
+        if df is None or not validate_dataframe(df, 80):
+            continue
+        price = df['close'].iloc[-1]
+        atr_val = compute_atr(df).iloc[-1]
+        ob = get_orderbook_cached(sym, limit=10)
+        if ob is None:
+            continue
+        for side_try in ("BUY", "SELL"):
+            should_enter, classification, reason_str = check_institutional_entry(sym, side_try, df, ob, atr_val, price)
+            if should_enter:
+                should_enter_narr, final_class, narrative = evaluate_with_narrative(sym, side_try, price, atr_val, df, ob, side_try)
+                if not should_enter_narr:
+                    continue
+                sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
+                ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
+                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification)
+                if ok:
+                    LAST_ENTRY_PER_SYMBOL[sym] = now
+                    return True
+        decision, dec_side, dec_info = smart_decision(df, ob, sym)
+        if decision == "STOP_HUNT":
+            should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
+            if not should_enter:
+                continue
+            sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
+            reason_str = f"RADAR_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
+            ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification)
+            if ok:
+                LAST_ENTRY_PER_SYMBOL[sym] = now
+                return True
+        elif decision == "EXHAUSTION_ENTRY":
+            should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
+            if not should_enter:
+                continue
+            sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
+            reason_str = f"RADAR_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
+            ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification)
+            if ok:
+                LAST_ENTRY_PER_SYMBOL[sym] = now
+                return True
+        total_v1, scn_v1, dir_v1, reasons_v1 = decision_score_v1(df, ob, atr_val, "BUY")
+        total_v1 = apply_overrides_v1(df, atr_val, total_v1)
+        if dir_v1 and total_v1 >= 5:
+            should_enter, classification, narrative = evaluate_with_narrative(sym, dir_v1, price, atr_val, df, ob, dir_v1)
+            if not should_enter:
+                continue
+            sl_v1, tp1_v1, tp2_v1 = compute_sl_tp(price, dir_v1,
+                                                   "REVERSAL" if scn_v1 in ("TRAP","REVERSAL") else "EARLY_TREND",
+                                                   atr_val, df)
+            ok = decide_and_execute_v1(sym, dir_v1, total_v1, reasons_v1, price, sl_v1, tp1_v1, tp2_v1)
+            if ok:
+                LAST_ENTRY_PER_SYMBOL[sym] = now
+                return True
+        total_score, scenario_name, scenario_dir, all_reasons = decision_score(df, ob, atr_val, "BUY")
+        if total_score >= 7:
+            should_enter, classification, narrative = evaluate_with_narrative(sym, scenario_dir, price, atr_val, df, ob, scenario_dir)
+            if not should_enter:
+                continue
+            sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
+            reason_str = f"RADAR_UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
+            ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification)
+            if ok:
+                LAST_ENTRY_PER_SYMBOL[sym] = now
+                return True
+        elif total_score >= 5:
+            should_enter, classification, narrative = evaluate_with_narrative(sym, scenario_dir, price, atr_val, df, ob, scenario_dir)
+            if not should_enter:
+                continue
+            sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
+            reason_str = f"RADAR_UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
+            ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification)
+            if ok:
+                LAST_ENTRY_PER_SYMBOL[sym] = now
+                return True
+        for side in ("BUY", "SELL"):
+            es, reasons = early_score(df, ob, atr_val, side)
+            if es >= 6:
+                should_enter, classification, narrative = evaluate_with_narrative(sym, side, price, atr_val, df, ob, side)
+                if not should_enter:
+                    continue
+                sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
+                reason_str = f"RADAR_EARLY ({','.join(reasons)}) score={es} | NARR={narrative['classification']}"
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, es, reason_str, atr_val,
+                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification)
+                if ok:
+                    LAST_ENTRY_PER_SYMBOL[sym] = now
+                    return True
+    return False
+
+def compute_zone_strength(df, level, zone_type, atr, ob):
+    price = df['close'].iloc[-1]
+    dist_pct = abs(price - level) / price
+    touch_indices = []
+    for i in range(max(0, len(df)-30), len(df)):
+        candle_high = df['high'].iloc[i]
+        candle_low = df['low'].iloc[i]
+        if (zone_type == "support" and abs(candle_low - level) < atr) or \
+           (zone_type == "resistance" and abs(candle_high - level) < atr):
+            touch_indices.append(i)
+    vol_strength = 0
+    if touch_indices:
+        volumes = df['volume'].iloc[touch_indices]
+        avg_vol = volumes.mean()
+        overall_avg = df['volume'].iloc[-30:].mean() if len(df) >= 30 else df['volume'].mean()
+        vol_strength = min(3.0, avg_vol / overall_avg) if overall_avg > 0 else 0
+    reaction_count = 0
+    for idx in touch_indices:
+        if idx < len(df)-1:
+            next_close = df['close'].iloc[idx+1]
+            if (zone_type == "support" and next_close > df['close'].iloc[idx]) or \
+               (zone_type == "resistance" and next_close < df['close'].iloc[idx]):
+                reaction_count += 1
+    reaction_score = min(3.0, reaction_count)
+    liquidity_score = 0
+    if ob:
+        obi = orderbook_imbalance(ob)
+        if zone_type == "support" and obi > 0.1:
+            liquidity_score = 2
+        elif zone_type == "resistance" and obi < -0.1:
+            liquidity_score = 2
+        elif abs(obi) > 0.05:
+            liquidity_score = 1
+    inst_score = 0
+    bos_up, bos_down = detect_bos(df, lookback=5)
+    struct_shift = detect_structure_shift(df)
+    if zone_type == "support" and (bos_up or struct_shift == "bullish_shift"):
+        inst_score = 2
+    elif zone_type == "resistance" and (bos_down or struct_shift == "bearish_shift"):
+        inst_score = 2
+    rejection_score = 0
+    if len(df) >= 1:
+        last = df.iloc[-1]
+        body, range_, upper_wick, lower_wick = candle_metrics(last)
+        if zone_type == "support" and lower_wick > body * 1.5 and abs(last['low'] - level) < atr:
+            rejection_score = 2
+        elif zone_type == "resistance" and upper_wick > body * 1.5 and abs(last['high'] - level) < atr:
+            rejection_score = 2
+    total = vol_strength + reaction_score + liquidity_score + inst_score + rejection_score
+    strength = min(10.0, total * 10 / 10)
+    return round(strength, 1), {
+        "vol_strength": round(vol_strength, 1),
+        "reaction_count": reaction_count,
+        "liquidity_score": liquidity_score,
+        "institutional_score": inst_score,
+        "rejection_score": rejection_score
+    }
+
+def build_smart_zone_map(symbol, df, ob=None):
+    atr = compute_atr(df).iloc[-1]
+    supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
+    buy_zones = []
+    for sup in supports:
+        strength, details = compute_zone_strength(df, sup, "support", atr, ob)
+        buy_zones.append({"price": sup, "strength": strength, "details": details, "type": "support"})
+    sell_zones = []
+    for res in resistances:
+        strength, details = compute_zone_strength(df, res, "resistance", atr, ob)
+        sell_zones.append({"price": res, "strength": strength, "details": details, "type": "resistance"})
+    buy_zones.sort(key=lambda x: x["strength"], reverse=True)
+    sell_zones.sort(key=lambda x: x["strength"], reverse=True)
+    return {"buy_zones": buy_zones, "sell_zones": sell_zones}
+
+def get_smart_zones(symbol, df, ob):
+    key = f"smart_zones_{symbol}"
+    cached = MEMORY.get(key)
+    if cached and time.time() - cached.get("ts", 0) < 90:
+        return cached["data"]
+    zones = build_smart_zone_map(symbol, df, ob)
+    MEMORY[key] = {"data": zones, "ts": time.time()}
+    return zones
+
+# ========== NEW LIQUIDITY DISCOVERY LAYER (UNCHANGED) ==========
+class FreshLiquidityRadar:
+    @staticmethod
+    def compute_liquidity_score(df):
+        if len(df) < 30:
+            return 0.0, {}
+        score = 0.0
+        details = {}
+        vol = df['volume']
+        vol_accel = vol.iloc[-5:].mean() / (vol.iloc[-10:-5].mean() + 1e-9)
+        vol_accel_score = min(2.0, vol_accel - 1.0) if vol_accel > 1.0 else 0.0
+        score += vol_accel_score * 2
+        details["vol_accel"] = round(vol_accel, 2)
+        vol_ratio = vol.iloc[-1] / vol.iloc[-20:].mean()
+        vol_exp_score = min(1.5, vol_ratio - 0.8) if vol_ratio > 0.8 else 0.0
+        score += vol_exp_score * 1.5
+        details["vol_ratio"] = round(vol_ratio, 2)
+        atr = compute_atr(df)
+        atr_ratio = atr.iloc[-1] / atr.iloc[-20:].mean()
+        atr_exp_score = min(1.5, atr_ratio - 0.9) if atr_ratio > 0.9 else 0.0
+        score += atr_exp_score * 1.5
+        details["atr_ratio"] = round(atr_ratio, 2)
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        range_ = last['high'] - last['low']
+        if range_ > 0:
+            body_ratio = body / range_
+            displacement = 1.0 if body_ratio > 0.6 else 0.0
+            score += displacement * 1.0
+            details["displacement"] = displacement
+        sweep_count = 0
+        for i in range(-5, 0):
+            sub_df = df.iloc[:i] if i < 0 else df
+            if len(sub_df) >= 2:
+                pools = build_liquidity_pools(sub_df)
+                swept_h, swept_l = detect_sweep(sub_df, pools)
+                if swept_h or swept_l:
+                    sweep_count += 1
+        sweep_score = min(2.0, sweep_count / 3.0)
+        score += sweep_score * 2
+        details["sweep_count"] = sweep_count
+        adx = compute_adx(df)
+        if len(adx) >= 5:
+            adx_slope = adx.iloc[-1] - adx.iloc[-4]
+            if adx_slope > 0:
+                score += min(1.5, adx_slope / 5) * 1.0
+                details["adx_slope"] = round(adx_slope, 2)
+        final_score = min(10.0, score)
+        return final_score, details
+
+    @staticmethod
+    def scan(symbols, limit=15):
+        candidates = []
+        for sym in symbols:
+            try:
+                df = get_ohlcv_safe(sym, 60)
+                if df is None or not validate_dataframe(df, 30):
+                    continue
+                price = df['close'].iloc[-1]
+                atr = compute_atr(df).iloc[-1]
+                atr_pct = (atr / price) * 100 if price > 0 else 0
+                if atr_pct < 0.2:
+                    continue
+                score, details = FreshLiquidityRadar.compute_liquidity_score(df)
+                if score >= 3.0:
+                    candidates.append({
+                        "symbol": sym,
+                        "score": round(score, 2),
+                        "details": details
+                    })
+            except Exception:
+                continue
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:limit]
+
+# ========== SECTOR CLASSIFICATION & LEADER SELECTION (UNCHANGED) ==========
+SECTOR_MAP = {
+    "AI": ["FET", "AGIX", "OCEAN", "RNDR", "TAO", "WLD", "PHB", "CTXC", "NMR", "ORAI"],
+    "MEME": ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BABYDOGE", "ELON", "SAMO"],
+    "LAYER1": ["BTC", "ETH", "SOL", "BNB", "ADA", "AVAX", "TON", "DOT", "ATOM", "NEAR", "ICP", "APT", "SUI", "KAS", "ALGO", "XLM", "VET", "HBAR", "FTM", "EGLD"],
+    "LAYER2": ["MATIC", "ARB", "OP", "METIS", "BOBA", "LRC", "SKL", "IMX", "ZK", "POL"],
+    "DEFI": ["UNI", "AAVE", "MKR", "COMP", "CRV", "LDO", "SNX", "BAL", "1INCH", "SUSHI", "CAKE", "RUNE", "ENJ", "YFI"],
+    "GAMING": ["SAND", "MANA", "GALA", "AXS", "ILV", "YGG", "MAGIC", "PRIME", "GHST", "ALICE", "WAXP", "CROWN"],
+    "INFRASTRUCTURE": ["LINK", "GRT", "FIL", "AR", "STORJ", "ANKR", "GNO", "LPT", "HNT", "THETA"],
+    "RWA": ["ONDO", "CFG", "RIO", "LNDX", "PRO", "BTRST", "DUSK", "TRU"],
+    "PAYMENT": ["XRP", "XLM", "ALGO", "NANO", "XDC", "AMP", "ACH"],
+    "PRIVACY": ["ZEC", "XMR", "DASH", "KEEP", "NU", "SCRT", "NYM"],
+    "STORAGE": ["FIL", "AR", "STORJ", "BLZ", "SIA", "BTT"]
+}
+
+def get_sector(symbol):
+    base = symbol.replace("/USDT", "").upper()
+    for sector, keywords in SECTOR_MAP.items():
+        if any(kw in base for kw in keywords):
+            return sector
+    return "OTHER"
+
+def get_volume_growth(sym):
+    df = get_ohlcv_safe(sym, 30)
+    if df is None or len(df) < 20:
+        return 0.0
+    vol = df['volume']
+    recent_avg = vol.iloc[-5:].mean()
+    older_avg = vol.iloc[-20:-5].mean()
+    if older_avg == 0:
+        return 0.0
+    return (recent_avg / older_avg) - 1.0
+
+def get_price_momentum(sym):
+    df = get_ohlcv_safe(sym, 30)
+    if df is None or len(df) < 20:
+        return 0.0
+    return (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
+
+def select_sector_leaders():
+    sectors = set(SECTOR_MAP.keys())
+    leaders = []
+    for sector in sectors:
+        symbols_in_sector = [s for s in get_usdt_perp_symbols() if get_sector(s) == sector][:20]
+        if not symbols_in_sector:
+            continue
+        best = None
+        best_score = -1e9
+        for sym in symbols_in_sector:
+            vol_growth = get_volume_growth(sym)
+            momentum = get_price_momentum(sym)
+            score = vol_growth * 10 + momentum
+            if score > best_score:
+                best_score = score
+                best = sym
+        if best:
+            leaders.append({"symbol": best, "score": round(best_score, 2), "sector": sector})
+    leaders.sort(key=lambda x: x["score"], reverse=True)
+    return leaders[:5]
+
+# ========== WATCHLIST ROTATION ENGINE (UNCHANGED) ==========
+class WatchlistRotation:
+    def __init__(self, symbols_40):
+        self.symbols = symbols_40
+        self.batch_size = 6
+        self.current_index = 0
+        self.last_rotate = time.time()
+        self.rotation_interval = 30
+
+    def get_next_batch(self):
+        batch = []
+        for i in range(self.batch_size):
+            idx = (self.current_index + i) % len(self.symbols)
+            batch.append(self.symbols[idx])
+        self.current_index = (self.current_index + self.batch_size) % len(self.symbols)
+        self.last_rotate = time.time()
+        return batch
+
+    def should_rotate(self):
+        return time.time() - self.last_rotate >= self.rotation_interval
+
+def build_40_symbol_universe():
+    strong_set = set()
+    for c in MEMORY.get("scanner_v2_buy", []) + MEMORY.get("scanner_v2_sell", []):
+        strong_set.add(c["symbol"])
+    for c in MEMORY.get("radar_top5", []):
+        strong_set.add(c["symbol"])
+    for c in MEMORY.get("rf_watchlist", []):
+        strong_set.add(c["symbol"])
+    strong_list = list(strong_set)[:20]
+    all_symbols = get_usdt_perp_symbols()
+    fresh_radar = FreshLiquidityRadar.scan(all_symbols, limit=20)
+    fresh_list = [c["symbol"] for c in fresh_radar if c["symbol"] not in strong_set][:15]
+    sector_leaders = select_sector_leaders()
+    leader_list = [l["symbol"] for l in sector_leaders if l["symbol"] not in strong_set and l["symbol"] not in fresh_list][:5]
+    universe = strong_list + fresh_list + leader_list
+    seen = set()
+    unique_universe = []
+    for sym in universe:
+        if sym not in seen:
+            seen.add(sym)
+            unique_universe.append(sym)
+    if len(unique_universe) < 40:
+        extra = [s for s in all_symbols if s not in seen][:40 - len(unique_universe)]
+        unique_universe.extend(extra)
+    return unique_universe[:40]
+
+# ========== FLASK DASHBOARD (UNCHANGED EXCEPT DATA ENDPOINT REFLECTS NEW STATE) ==========
+app = Flask(__name__)
+
+def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
+    DASHBOARD_STATE["position"] = {
+        "symbol": symbol,
+        "side": side,
+        "entry": round(entry, 4),
+        "qty": qty,
+        "pnl": round(pnl, 2),
+        "sl": round(STATE.get("synthetic_sl", 0), 4),
+        "tp1": round(STATE.get("synthetic_tp1", 0), 4),
+        "tp2": round(STATE.get("tp2_price", 0), 4),
+        "tp1_done": STATE.get("tp1_hit", False),
+        "trailing_active": STATE.get("trail_activated", False),
+        "regime": MEMORY.get("regime", "UNKNOWN"),
+        "trade_type": STATE.get("trade_type", "N/A"),
+        "entry_type": STATE.get("entry_type", "N/A"),
+        "classification": STATE.get("classification", "N/A"),
+        "location": STATE.get("location", "N/A"),
+        "zone": STATE.get("zone_info", "N/A"),
+        "score": STATE.get("trade_score", 0),
+        "narrative_classification": STATE.get("narrative_classification", ""),
+        "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+        "confidence_level": STATE.get("confidence_level", ""),
+        "current_confidence": STATE.get("current_confidence", 50.0),
+        "market_regime": STATE.get("market_regime", "UNKNOWN"),
+        "continuation_pressure": STATE.get("continuation_pressure", 50),
+        "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+        "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+        "delay_tp1": STATE.get("delay_tp1", False)
+    }
+
+def clear_position_dashboard():
+    DASHBOARD_STATE["position"] = None
+
+def render_live_supervisor_panel():
+    return """
+    <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
+      <div class="rf-live-header">
+        <span class="rf-live-title">🧠 RF v28 Fixed Live Supervisor</span>
+        <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
+      </div>
+      <div class="rf-live-grid">
+        <div class="rf-live-card"><div class="rf-live-metric-icon">💰</div><div class="rf-live-metric-label">Entry</div><div class="rf-live-metric-value" id="rf-sup-entry">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📈</div><div class="rf-live-metric-label">Mark Price</div><div class="rf-live-metric-value" id="rf-sup-mark">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">ROE%</div><div class="rf-live-metric-value" id="rf-sup-roe">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">💵</div><div class="rf-live-metric-label">Unrealized PnL</div><div class="rf-live-metric-value" id="rf-sup-upnl">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📊</div><div class="rf-live-metric-label">ADX</div><div class="rf-live-metric-value" id="rf-sup-adx">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🟢</div><div class="rf-live-metric-label">DI+</div><div class="rf-live-metric-value" id="rf-sup-dip">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🔴</div><div class="rf-live-metric-label">DI-</div><div class="rf-live-metric-value" id="rf-sup-dim">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🔥</div><div class="rf-live-metric-label">Continuation</div><div class="rf-live-metric-value" id="rf-sup-cont">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Thesis Failure</div><div class="rf-live-metric-value" id="rf-sup-fail">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">✅</div><div class="rf-live-metric-label">Confidence</div><div class="rf-live-metric-value" id="rf-sup-conf">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP1</div><div class="rf-live-metric-value" id="rf-sup-tp1">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP2</div><div class="rf-live-metric-value" id="rf-sup-tp2">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">Trailing</div><div class="rf-live-metric-value" id="rf-sup-trail">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Personality</div><div class="rf-live-metric-value" id="rf-sup-personality">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🏦</div><div class="rf-live-metric-label">Institutional Flow</div><div class="rf-live-metric-value" id="rf-sup-flow">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚙️</div><div class="rf-live-metric-label">Trade State</div><div class="rf-live-metric-value" id="rf-sup-state">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📏</div><div class="rf-live-metric-label">Trail Mult</div><div class="rf-live-metric-value" id="rf-sup-trail-mult">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⏰</div><div class="rf-live-metric-label">Delay TP1</div><div class="rf-live-metric-value" id="rf-sup-delay-tp1">❌</div></div>
+      </div>
+      <div class="rf-live-status-row">
+        <span id="rf-pill-thesis" class="rf-live-pill rf-live-pill-active">🧠 THESIS ACTIVE</span>
+        <span id="rf-pill-trail" class="rf-live-pill">⚡ TRAILING OFF</span>
+        <span id="rf-pill-flow" class="rf-live-pill">🏦 NEUTRAL</span>
+        <span id="rf-pill-reclaim" class="rf-live-pill">🟢 RECLAIM LOW</span>
+      </div>
+    </div>
+    <style>
+    .rf-live-supervisor {
+      background: linear-gradient(145deg, #0f1724 0%, #0a0f17 100%);
+      border-radius: 20px;
+      padding: 20px;
+      margin-bottom: 20px;
+      border: 1px solid #2c3e50;
+    }
+    .rf-live-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #2c3e50;
+    }
+    .rf-live-title {
+      font-size: 18px;
+      font-weight: bold;
+      color: #00ffa6;
+    }
+    .rf-live-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .rf-live-card {
+      background: #111827;
+      border-radius: 14px;
+      padding: 10px;
+      text-align: center;
+      transition: 0.2s;
+    }
+    .rf-live-metric-icon {
+      font-size: 22px;
+      margin-bottom: 4px;
+    }
+    .rf-live-metric-label {
+      font-size: 11px;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .rf-live-metric-value {
+      font-size: 15px;
+      font-weight: bold;
+      color: #e6edf3;
+      margin-top: 4px;
+    }
+    .rf-live-status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .rf-live-pill {
+      background: #111827;
+      padding: 6px 14px;
+      border-radius: 30px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid #2c3e50;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .rf-live-pill-active {
+      background: rgba(0, 255, 166, 0.1);
+      border-color: #00ffa6;
+      color: #00ffa6;
+    }
+    .rf-live-pill-failed {
+      background: rgba(255, 77, 77, 0.1);
+      border-color: #ff4d4d;
+      color: #ff4d4d;
+    }
+    .rf-live-pill-trail {
+      background: rgba(0, 255, 166, 0.1);
+      border-color: #00ffa6;
+    }
+    .rf-live-pill-flow-buy {
+      background: rgba(0, 255, 166, 0.1);
+      border-color: #00ffa6;
+      color: #00ffa6;
+    }
+    .rf-live-pill-flow-sell {
+      background: rgba(255, 77, 77, 0.1);
+      border-color: #ff4d4d;
+      color: #ff4d4d;
+    }
+    .rf-live-pill-risk-low {
+      color: #00ffa6;
+    }
+    .rf-live-pill-risk-mid {
+      color: #ffc800;
+    }
+    .rf-live-pill-risk-high {
+      color: #ff4d4d;
+    }
+    </style>
+    """
+
+@app.route("/")
+def dashboard():
+    # ... (unchanged dashboard rendering code, using DASHBOARD_STATE from fixed updates)
+    # For brevity, keep same as original but with updated variables
+    rf_items = MEMORY.get("rf_dashboard", [])[:20]
+    rf_html = "".join([f"<div>{item['icon']} {item['symbol']} | {item['status']} | score={item['score']:.2f} | ADX={item['adx']:.1f} | RSI={item['rsi']:.1f}</div>" for item in rf_items])
+    
+    scanner_buy = MEMORY.get("scanner_v2_buy", [])
+    scanner_sell = MEMORY.get("scanner_v2_sell", [])
+    buy_html = ""
+    for b in scanner_buy:
+        icon = "🔥" if b["score"] >= 7 else "⚡"
+        sm = b.get("smart_money", {})
+        mom = b.get("momentum", {})
+        sm_str = f"{sm.get('bias_detailed', sm.get('bias', '?'))} "
+        if sm.get("dominant"): sm_str += "🧠"
+        mom_str = ""
+        if mom.get("expansion"): mom_str += "🚀"
+        if mom.get("decay"): mom_str += "📉"
+        buy_html += f"<div>{icon} {b['symbol']} | Score: {b['score']}<br>📍 {b['location']} | RF: {b['rf_prox']}% | Vol: {'Spike' if b['volume_spike'] else 'Norm'} | Rej: {'✔' if b['rejection'] else '✖'}<br>🏦 {sm_str} | 📈 {mom_str}</div><hr>"
+    sell_html = ""
+    for s in scanner_sell:
+        icon = "🔥" if s["score"] >= 7 else "⚡"
+        sm = s.get("smart_money", {})
+        mom = s.get("momentum", {})
+        sm_str = f"{sm.get('bias_detailed', sm.get('bias', '?'))} "
+        if sm.get("dominant"): sm_str += "🧠"
+        mom_str = ""
+        if mom.get("expansion"): mom_str += "🚀"
+        if mom.get("decay"): mom_str += "📉"
+        sell_html += f"<div>{icon} {s['symbol']} | Score: {s['score']}<br>📍 {s['location']} | RF: {s['rf_prox']}% | Vol: {'Spike' if s['volume_spike'] else 'Norm'} | Rej: {'✔' if s['rejection'] else '✖'}<br>🏦 {sm_str} | 📈 {mom_str}</div><hr>"
+    scanner_v2_section = f"""
+    <div class="section smart-layer"><div class="title">📡 SMART SCANNER v2 (Ranked)</div>
+    <div style="display:flex; gap:20px;">
+        <div style="flex:1; background:#0f1724; padding:12px; border-radius:8px;"><b>🟢 TOP 10 BUY</b><br>{buy_html or 'No candidates'}</div>
+        <div style="flex:1; background:#0f1724; padding:12px; border-radius:8px;"><b>🔴 TOP 10 SELL</b><br>{sell_html or 'No candidates'}</div>
+    </div>
+    </div>
+    """
+    
+    decision_panel_html = """
+    <div id="decision-panel" style="padding:12px; border:1px solid #2c3e50; margin-bottom:16px; border-radius:8px; background:#0a0c10;">
+      <h3>🧠 SMC Decision Engine (Scenario + Decision)</h3>
+      <div id="decision-list" style="max-height:400px; overflow-y:auto; font-size:13px;"></div>
+    </div>
+    """
+    
+    watchlist_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">👁 WATCHLIST / ACTIVE CANDIDATES</div>
+      <div id="watchlist-panel" style="max-height:400px; overflow-y:auto; font-size:13px; background:#0f1724; padding:10px; border-radius:8px;">
+        Loading...
+      </div>
+    </div>
+    """
+    
+    no_entry_feed_section_html = """
+    <div class="section smart-layer"><div class="title">🚫 WHY NO ENTRY (Last 5)</div>
+    <div id="no-entry-feed" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+    
+    free_balance_card = '<div class="card">FREE BALANCE<div id="free_bal">-</div><div id="avail_margin">-</div></div>'
+    
+    continuation_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">📈 CONTINUATION ENGINE</div>
+      <div id="continuation-panel" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+    
+    thesis_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">🧠 TRADE THESIS</div>
+      <div id="thesis-panel" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+    
+    confidence_regime_panel = """
+    <div class="section smart-layer">
+      <div class="title">📊 CONFIDENCE & REGIME</div>
+      <div class="grid">
+        <div class="card">Current Confidence<div id="current_conf">-</div></div>
+        <div class="card">Market Regime<div id="market_regime">-</div></div>
+        <div class="card">Continuation Pressure<div id="cont_pressure">-</div></div>
+        <div class="card">Thesis Failure Score<div id="thesis_failure">-</div></div>
+      </div>
+    </div>
+    """
+    
+    flow_section_html = """
+    <div class="section smart-layer">
+      <div class="title">🧠 Institutional Flow Intelligence</div>
+      <div class="rf-flow-grid">
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Banker Pressure</div><div id="flow-banker" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Retail Pressure</div><div id="flow-retail" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Hot Money</div><div id="flow-hot" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Institutional Bias</div><div id="flow-bias" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Flow Alignment</div><div id="flow-align" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Distribution Risk</div><div id="flow-dist" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Momentum Health</div><div id="flow-mom-health" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Continuation Strength</div><div id="flow-cont-str" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Exhaustion Risk</div><div id="flow-exh-risk" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Climax Risk</div><div id="flow-climax" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Greed State</div><div id="flow-greed" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Smart Money Dominant</div><div id="flow-dom" class="rf-flow-value">-</div></div>
+      </div>
+    </div>
+    <style>
+    .rf-flow-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .rf-flow-card {
+      background: #111827;
+      border-radius: 12px;
+      padding: 8px;
+      text-align: center;
+    }
+    .rf-flow-metric-label {
+      font-size: 11px;
+      color: #9ca3af;
+      text-transform: uppercase;
+    }
+    .rf-flow-value {
+      font-size: 16px;
+      font-weight: bold;
+      margin-top: 4px;
+      color: #e6edf3;
+    }
+    </style>
+    """
+    
+    supervisor_panel_html = render_live_supervisor_panel()
+    
+    html = f"""
+<!DOCTYPE html>
+<html><head><title>RF v28 Fixed Live Supervisor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
+.header{{padding:14px 16px;background:#111827;color:#00ff9f;font-size:22px;}}
+.section{{padding:12px 14px;border-bottom:1px solid #1f2937}}
+.title{{color:#9ca3af;margin-bottom:6px}}
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}
+.card{{background:#111827;border-radius:10px;padding:10px}}
+.green{{color:#00ffa6}}
+.red{{color:#ff4d4d}}
+.log,.err{{max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px}}
+.btn{{background:#2d3748;border:none;color:white;padding:8px 16px;margin:4px;border-radius:6px;cursor:pointer}}
+.btn-buy{{background:#0f7b3a}}
+.btn-sell{{background:#9b2c2c}}
+.btn-close{{background:#4a5568}}
+.smart-layer{{background:#0f1724;margin-top:12px;border-radius:8px}}
+.position-details{{font-size:14px}}
+</style>
+</head>
+<body>
+<div class="header">🔥 RF v28 Fixed Live Supervisor</div>
+{decision_panel_html}
+{scanner_v2_section}
+{supervisor_panel_html}
+{flow_section_html}
+{continuation_panel_html}
+{thesis_panel_html}
+{confidence_regime_panel}
+<div class="section"><div class="title">💰 ACCOUNT & PERFORMANCE</div><div class="grid">
+<div class="card">Balance<div id="bal">-</div></div>
+{free_balance_card}
+<div class="card">Mode<div id="mode">-</div></div>
+<div class="card">Trades<div id="trades">0</div></div>
+<div class="card">Wins<div id="wins" class="green">0</div></div>
+<div class="card">Losses<div id="losses" class="red">0</div></div>
+<div class="card">WinRate<div id="winrate">0%</div></div>
+</div></div>
+<div class="section"><div class="title">📊 TOTAL P&L & LAST TRADE</div><div class="grid">
+<div class="card">Total PnL%<div id="total_pnl" class="green">0%</div></div>
+<div class="card">Total PnL USDT<div id="total_pnl_usdt">0.00</div></div>
+<div class="card">Last Trade<div id="last_trade">N/A</div></div>
+</div></div>
+<div class="section"><div class="title">📍 LIVE POSITION</div>
+<div id="pos" class="card"></div>
+</div>
+<div class="section smart-layer"><div class="title">📡 TOP RF OPPORTUNITIES</div>
+<div id="top5" class="card"></div>
+</div>
+<div class="section smart-layer"><div class="title">📡 RF SIGNALS (Trigger Candidates)</div>
+<div id="rfSignals" class="card">{rf_html}</div>
+</div>
+{watchlist_panel_html}
+<div class="section"><div class="title">📜 EXECUTION LOG</div><div id="logs" class="card log"></div></div>
+<div class="section"><div class="title">🚨 SYSTEM ERRORS</div><div id="errors" class="card err"></div></div>
+{no_entry_feed_section_html}
+<div class="section"><div class="title">🎮 MANUAL CONTROLS</div>
+<button class="btn btn-buy" onclick="manualTrade('BUY')">BUY</button>
+<button class="btn btn-sell" onclick="manualTrade('SELL')">SELL</button>
+<button class="btn btn-close" onclick="manualClose()">CLOSE</button>
+</div>
+<div class="section smart-layer"><div class="title">📡 MONITORING</div><div class="grid">
+<div class="card">Regime<div id="regimeLabel">-</div></div>
+<div class="card">Scanned<div id="scanned">0</div></div>
+<div class="card">Last Scan<div id="lastScan">-</div></div>
+</div></div>
+<div class="section smart-layer"><div class="title">🩺 SYSTEM HEALTH</div><div class="grid">
+<div class="card">API Status<div id="apiStatus">-</div></div>
+<div class="card">Errors<div id="errCount">0</div></div>
+<div class="card">Bot Status<div id="botStatus">-</div></div>
+</div></div>
+<script>
+let lastFetch = 0;
+let cachedData = null;
+async function fetchData() {{
+    const now = Date.now();
+    if (cachedData && (now - lastFetch) < 5000) {{
+        updateUI(cachedData);
+        return;
+    }}
+    lastFetch = now;
+    try {{
+        const r = await fetch('/data');
+        const d = await r.json();
+        cachedData = d;
+        updateUI(d);
+    }} catch(e) {{ console.error(e); }}
+}}
+function updateUI(d) {{
+    document.getElementById("bal").innerText = d.balance.toFixed(2);
+    document.getElementById("free_bal").innerText = "$" + d.free_balance.toFixed(2);
+    document.getElementById("avail_margin").innerText = "Margin: " + d.avail_margin.toFixed(2);
+    document.getElementById("mode").innerText = d.mode;
+    document.getElementById("trades").innerText = d.stats.trades;
+    document.getElementById("wins").innerText = d.stats.wins;
+    document.getElementById("losses").innerText = d.stats.losses;
+    document.getElementById("winrate").innerText = d.stats.win_rate.toFixed(1)+"%";
+    document.getElementById("total_pnl").innerHTML = d.total_pnl || "0%";
+    document.getElementById("total_pnl_usdt").innerHTML = d.total_pnl_usdt ? d.total_pnl_usdt.toFixed(2) : "0.00";
+    document.getElementById("last_trade").innerText = d.last_trade || "N/A";
+    if(d.position) {{
+        let pnlClass = d.position.pnl >= 0 ? "green" : "red";
+        document.getElementById("pos").innerHTML = `
+            <div><b>${{d.position.symbol}}</b> | ${{d.position.side}} | ${{d.position.entry_type}} (${{d.position.classification}})</div>
+            <div>Entry: ${{d.position.entry}} | PnL: <span class="${{pnlClass}}">${{d.position.pnl}}%</span></div>
+            <div>SL: ${{d.position.sl}} | TP1: ${{d.position.tp1}} | TP2: ${{d.position.tp2}}</div>
+            <div>TP1 done: ${{d.position.tp1_done}} | Trailing: ${{d.position.trailing_active}}</div>
+            <div>Location: ${{d.position.location}} | Zone: ${{d.position.zone}}</div>
+            <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}}) | Conf Level: ${{d.position.confidence_level}}</div>
+            <div>Current Confidence: ${{d.position.current_confidence}} | Regime: ${{d.position.market_regime}} | Cont. Pressure: ${{d.position.continuation_pressure}}</div>
+            <div>Trade State: ${{d.position.trade_state}} | Trail Mult: ${{d.position.trail_multiplier}} | Delay TP1: ${{d.position.delay_tp1}}</div>
+        `;
+    }} else {{
+        document.getElementById("pos").innerHTML = "No active trade";
+    }}
+    if(d.live_trade_mode && d.supervisor) {{
+        const sup = d.supervisor;
+        document.getElementById("rf-sup-entry").innerText = sup.entry_price?.toFixed(4) || "-";
+        document.getElementById("rf-sup-mark").innerText = sup.mark_price?.toFixed(4) || "-";
+        document.getElementById("rf-sup-roe").innerHTML = sup.roe_pct?.toFixed(2) + "%";
+        document.getElementById("rf-sup-upnl").innerText = sup.unrealized_pnl?.toFixed(2) || "-";
+        document.getElementById("rf-sup-adx").innerText = sup.adx?.toFixed(1) || "-";
+        document.getElementById("rf-sup-dip").innerText = sup.di_plus?.toFixed(1) || "-";
+        document.getElementById("rf-sup-dim").innerText = sup.di_minus?.toFixed(1) || "-";
+        document.getElementById("rf-sup-cont").innerText = sup.continuation_pressure || "-";
+        document.getElementById("rf-sup-fail").innerText = sup.thesis_failure_score || "-";
+        document.getElementById("rf-sup-conf").innerText = sup.current_confidence?.toFixed(1) || "-";
+        document.getElementById("rf-sup-tp1").innerHTML = sup.tp1_hit ? "✅" : "❌";
+        document.getElementById("rf-sup-tp2").innerHTML = sup.tp2_hit ? "✅" : "❌";
+        document.getElementById("rf-sup-trail").innerHTML = sup.trailing_active ? "✅" : "❌";
+        document.getElementById("rf-sup-personality").innerText = sup.trade_personality || "NEUTRAL";
+        document.getElementById("rf-sup-flow").innerText = sup.institutional_flow || "NEUTRAL";
+        document.getElementById("rf-sup-state").innerText = sup.trade_state || "RANGE_CHOP";
+        document.getElementById("rf-sup-trail-mult").innerText = sup.trail_multiplier || "1.5";
+        document.getElementById("rf-sup-delay-tp1").innerHTML = sup.delay_tp1 ? "✅" : "❌";
+        const reclaim = sup.reclaim_risk || 0;
+        let reclaimClass = "rf-live-pill-risk-low";
+        if (reclaim > 0.6) reclaimClass = "rf-live-pill-risk-high";
+        else if (reclaim > 0.3) reclaimClass = "rf-live-pill-risk-mid";
+        document.getElementById("rf-pill-reclaim").innerHTML = `🟢 RECLAIM ${{(reclaim*100).toFixed(0)}}%`;
+        document.getElementById("rf-pill-reclaim").className = `rf-live-pill ${{reclaimClass}}`;
+        const trailActive = sup.trailing_active;
+        document.getElementById("rf-pill-trail").innerHTML = trailActive ? "⚡ TRAILING ON" : "⚡ TRAILING OFF";
+        document.getElementById("rf-pill-trail").className = trailActive ? "rf-live-pill rf-live-pill-trail" : "rf-live-pill";
+        document.getElementById("rf-live-panel").style.display = "block";
+    }} else {{
+        document.getElementById("rf-live-panel").style.display = "none";
+    }}
+    if(d.continuation_probability) {{
+        let color = d.continuation_probability >= 0.65 ? "green" : (d.continuation_probability >= 0.5 ? "yellow" : "red");
+        document.getElementById("continuation-panel").innerHTML = `
+            <div>Continuation: <span style="color:${{color}};">${{(d.continuation_probability*100).toFixed(1)}}%</span></div>
+            <div>Hold Quality: ${{d.hold_quality}}</div>
+            <div>Trend Strength: ${{d.trend_strength}}</div>
+            <div>Counter Pressure: ${{d.counter_pressure}}</div>
+            <div>Reclaim Risk: ${{d.reclaim_risk}}</div>
+            <div>Reasons: ${{(d.continuation_reasons || []).join(", ")}}</div>
+        `;
+    }}
+    if(d.trade_thesis) {{
+        let t = d.trade_thesis;
+        document.getElementById("thesis-panel").innerHTML = `
+            <div>Status: ${{t.current_status || "ACTIVE"}}</div>
+            <div>Confidence: ${{t.confidence}}</div>
+            <div>Continuation Prob: ${{t.continuation_probability}}</div>
+            <div>Exhaustion Prob: ${{t.exhaustion_probability}}</div>
+            <div>Entry Reasons: ${{(t.entry_reason || []).join(", ")}}</div>
+            <div>Risks: ${{(t.risk_factors || []).join(", ")}}</div>
+        `;
+    }}
+    document.getElementById("current_conf").innerHTML = (d.current_confidence || 50).toFixed(1);
+    document.getElementById("market_regime").innerHTML = d.market_regime || "UNKNOWN";
+    document.getElementById("cont_pressure").innerHTML = d.continuation_pressure || 50;
+    document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
+    document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
+    document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
+    let top5Html = "";
+    (d.top5 || []).forEach(o => {{
+        top5Html += `<div><b>${{o.symbol}}</b> | Score: ${{o.score.toFixed(2)}} | ADX: ${{o.adx || 0}} | RSI: ${{o.rsi || 0}}</div><hr>`;
+    }});
+    document.getElementById("top5").innerHTML = top5Html || "No opportunities";
+    document.getElementById("scanned").innerText = d.scanned_count;
+    document.getElementById("lastScan").innerText = d.last_scan ? new Date(d.last_scan*1000).toLocaleTimeString() : "-";
+    document.getElementById("regimeLabel").innerText = d.regime;
+    document.getElementById("apiStatus").innerText = d.health.api;
+    document.getElementById("errCount").innerText = d.health.errors;
+    document.getElementById("botStatus").innerText = d.health.status;
+    if(d.rf_dashboard) {{
+        let rfHtml = "";
+        d.rf_dashboard.forEach(item => {{
+            let signalIcon = item.signal === "BUY" ? "🟢" : (item.signal === "SELL" ? "🔴" : "⚪");
+            rfHtml += `<div>${{item.icon}} ${{signalIcon}} ${{item.symbol}} | ${{item.status}} | score=${{item.score.toFixed(2)}} | ADX=${{item.adx||0}} | RSI=${{item.rsi||0}}</div>`;
+        }});
+        document.getElementById("rfSignals").innerHTML = rfHtml || "No RF signals";
+    }}
+    if(d.watchlist) {{
+        let wHtml = "";
+        for (let sym in d.watchlist) {{
+            let w = d.watchlist[sym];
+            let sideIcon = w.side === "BUY" ? "🟢" : "🔴";
+            let strengthIcon = w.strength === "STRONG" ? "⚡" : (w.strength === "MEDIUM" ? "🟡" : "👁");
+            let reasonsStr = (w.reasons || []).join(", ");
+            let stateColor = "";
+            if (w.state === "CONFIRMED") stateColor = "#2ecc71";
+            else if (w.state === "DISPLACEMENT") stateColor = "#f1c40f";
+            else if (w.state === "REJECTION") stateColor = "#e74c3c";
+            else if (w.state === "RETEST") stateColor = "#3498db";
+            else stateColor = "#95a5a6";
+            let lastUpdate = new Date(w.last_update * 1000).toLocaleTimeString();
+            let extraInfo = "";
+            if (w.smart_money_bias_detailed) extraInfo += ` | Bias: ${{w.smart_money_bias_detailed}}`;
+            else if (w.smart_money_bias) extraInfo += ` | Bias: ${{w.smart_money_bias}}`;
+            if (w.distribution_risk !== undefined) extraInfo += ` | DistRisk: ${{w.distribution_risk}}`;
+            if (w.momentum_expansion) extraInfo += ` | 🚀`;
+            if (w.momentum_decay) extraInfo += ` | 📉`;
+            wHtml += `<div style="margin-bottom:8px; border-bottom:1px solid #2c3e50; padding-bottom:4px;">
+              <b>${{sideIcon}} ${{w.symbol}}</b> | Score: ${{w.score}} | <span style="color:${{stateColor}}">${{w.state}}</span> | ${{w.trade_type}} | ${{strengthIcon}} ${{w.strength}}
+              <br>Reasons: ${{reasonsStr}}
+              <br><small>Last update: ${{lastUpdate}} ${{extraInfo}}</small>
+            </div>`;
+        }}
+        document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
+    }} else {{
+        document.getElementById("watchlist-panel").innerHTML = "No watchlist data";
+    }}
+    let noEntryHtml = "";
+    if(d.no_entry_feed) {{
+        d.no_entry_feed.forEach(item => {{
+            let timeStr = new Date(item.time * 1000).toLocaleTimeString();
+            noEntryHtml += `<div>${{timeStr}} | ${{item.symbol}} ${{item.side}}: ${{item.reason}} (score ${{item.score}})</div>`;
+        }});
+    }}
+    document.getElementById("no-entry-feed").innerHTML = noEntryHtml || "No recent skips";
+    if(d.institutional_flow) {{
+        let flow = d.institutional_flow;
+        document.getElementById("flow-banker").innerHTML = flow.banker_pressure.toFixed(1);
+        document.getElementById("flow-retail").innerHTML = flow.retailer_pressure.toFixed(1);
+        document.getElementById("flow-hot").innerHTML = flow.hot_money.toFixed(1);
+        document.getElementById("flow-bias").innerHTML = flow.institutional_bias_detailed || flow.institutional_bias;
+        document.getElementById("flow-align").innerHTML = flow.flow_alignment.toFixed(1);
+        document.getElementById("flow-dist").innerHTML = flow.distribution_risk.toFixed(1);
+        document.getElementById("flow-mom-health").innerHTML = flow.momentum_health.toFixed(1);
+        document.getElementById("flow-cont-str").innerHTML = flow.continuation_strength.toFixed(1);
+        document.getElementById("flow-exh-risk").innerHTML = flow.exhaustion_risk.toFixed(1);
+        document.getElementById("flow-climax").innerHTML = flow.climax_risk.toFixed(1);
+        document.getElementById("flow-greed").innerHTML = flow.greed_state ? "🚨 Yes" : "✅ No";
+        document.getElementById("flow-dom").innerHTML = flow.smart_money_dominant ? "✅ Yes" : "❌ No";
+    }}
+}}
+async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
+async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
+setInterval(fetchData, 6000);
+async function loadDecision() {{
+  try {{
+    const res = await fetch('/decision');
+    const json = await res.json();
+    const list = json.data || [];
+    const container = document.getElementById("decision-list");
+    container.innerHTML = "";
+    for (let i = 0; i < list.length; i++) {{
+      const s = list[i];
+      const div = document.createElement("div");
+      div.style.borderBottom = "1px solid #222";
+      div.style.padding = "8px";
+      const color = (s.decision === "ENTER") ? "#2ecc71" : "#e74c3c";
+      let reasonsHtml = (s.reasons || []).join(" + ") || "-";
+      let entryHtml = "";
+      if (s.decision === "ENTER") {{
+        entryHtml = "Spread: OK (" + s.spread + " <= " + s.max_spread + ")<br><b style=\\"color:" + color + "\\">Decision: ENTER</b><br>ADX: " + (s.adx || "?") + " | Sweep: Yes" + (s.extra ? " | " + s.extra : "");
+      }} else {{
+        entryHtml = "<b style=\\"color:" + color + "\\">Decision: SKIP</b><br>Reason: " + (s.skip_reason || "-");
+      }}
+      div.innerHTML = "<b style=\\"color:" + color + "\\">" + s.symbol + " | " + s.side + "</b><br>RF: " + s.rf + "<br>Score: " + s.score + "<br>Reasons: " + reasonsHtml + "<br>Type: " + s.type + "<br>" + entryHtml;
+      container.appendChild(div);
+    }}
+  }} catch(e) {{ console.error(e); }}
+}}
+setInterval(loadDecision, 6000);
+loadDecision();
+fetchData();
+</script>
+</body></html>
+"""
+    return html
+
+@app.route("/data")
+def data():
+    cached = cache_get("dashboard", 5)
+    if cached is not None:
+        return jsonify(safe_json(cached))
+    try:
+        bal = get_balance_safe()
+        free_bal = get_free_balance_safe()
+        avail_margin = free_bal
+        mode = "LIVE" if MODE_LIVE else "PAPER"
+        DASHBOARD_STATE["account"]["balance"] = bal
+        DASHBOARD_STATE["account"]["free_balance"] = free_bal
+        DASHBOARD_STATE["account"]["available_margin"] = avail_margin
+        DASHBOARD_STATE["account"]["mode"] = mode
+        perf = get_dashboard_metrics()
+        pos = None
+        if STATE["open"] and STATE.get("current_symbol"):
+            roe = STATE.get("roe_pct", 0.0)
+            pos = {
+                "symbol": STATE["current_symbol"],
+                "side": STATE["side"],
+                "entry": round(STATE["entry"],4),
+                "qty": STATE["qty"],
+                "pnl": round(roe, 2),
+                "sl": round(STATE.get("synthetic_sl",0),4),
+                "tp1": round(STATE.get("synthetic_tp1",0),4),
+                "tp2": round(STATE.get("tp2_price",0),4),
+                "tp1_done": STATE.get("tp1_hit", False),
+                "trailing_active": STATE.get("trail_activated", False),
+                "regime": MEMORY.get("regime", "UNKNOWN"),
+                "trade_type": STATE.get("trade_type", "N/A"),
+                "entry_type": STATE.get("entry_type", "N/A"),
+                "classification": STATE.get("classification", "N/A"),
+                "location": STATE.get("location", "N/A"),
+                "zone": STATE.get("zone_info", "N/A"),
+                "score": STATE.get("trade_score", 0),
+                "narrative_classification": STATE.get("narrative_classification", ""),
+                "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+                "confidence_level": STATE.get("confidence_level", ""),
+                "current_confidence": STATE.get("current_confidence", 50.0),
+                "market_regime": STATE.get("market_regime", "UNKNOWN"),
+                "continuation_pressure": STATE.get("continuation_pressure", 50),
+                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+                "delay_tp1": STATE.get("delay_tp1", False)
+            }
+        else:
+            pos = DASHBOARD_STATE["position"]
+        health = MEMORY["health"].copy()
+        health["errors"] = len(DASHBOARD_STATE["errors"])
+        top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
+        cleanup_watchlist()
+        watchlist_data = MEMORY.get("watchlist", {})
+        no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
+        live_data = {}
+        supervisor_data = None
+        if DASHBOARD_STATE.get("live_trade_mode", False) and STATE.get("open"):
+            supervisor_data = {
+                "side": STATE["side"],
+                "entry_price": STATE["entry"],
+                "mark_price": STATE.get("mark_price", 0),
+                "unrealized_pnl": STATE.get("unrealized_pnl_usdt", 0),
+                "roe_pct": STATE.get("roe_pct", 0),
+                "liquidation_price": STATE.get("liquidation_price", 0),
+                "position_size": STATE["qty"],
+                "leverage": LEVERAGE,
+                "tp1_hit": STATE.get("tp1_hit", False),
+                "tp2_hit": STATE.get("tp2_hit", False),
+                "trailing_active": STATE.get("trail_activated", False),
+                "adx": STATE.get("adx_live", 0),
+                "di_plus": STATE.get("di_plus_live", 0),
+                "di_minus": STATE.get("di_minus_live", 0),
+                "continuation_pressure": STATE.get("continuation_pressure", 50),
+                "trend_strength": STATE.get("trend_strength", 0),
+                "thesis_failure_score": STATE.get("thesis_failure_score", 0),
+                "current_confidence": STATE.get("current_confidence", 50),
+                "trade_personality": STATE.get("trade_personality", "NEUTRAL"),  # kept for dashboard compatibility
+                "institutional_flow": STATE.get("institutional_flow", "NEUTRAL"),  # kept for dashboard compatibility
+                "reclaim_risk": STATE.get("reclaim_risk", 0),
+                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+                "delay_tp1": STATE.get("delay_tp1", False)
+            }
+            live_data["live_trade_mode"] = True
+            live_data["supervisor"] = supervisor_data
+            live_data["lifecycle_state"] = _live_manager.lifecycle_state.value
+        else:
+            live_data["live_trade_mode"] = False
+
+        institutional_flow_data = DASHBOARD_STATE.get("institutional_flow", {})
+        if not institutional_flow_data and STATE.get("smart_money"):
+            mf = STATE.get("momentum_flow", {})
+            institutional_flow_data = {
+                "banker_pressure": STATE["smart_money"].get("banker_pressure", 0),
+                "retailer_pressure": STATE["smart_money"].get("retailer_pressure", 0),
+                "hot_money": STATE["smart_money"].get("hot_money_pressure", 0),
+                "institutional_bias": STATE["smart_money"].get("institutional_bias", "NEUTRAL"),
+                "institutional_bias_detailed": STATE["smart_money"].get("institutional_bias_detailed", "NEUTRAL"),
+                "flow_alignment": STATE["smart_money"].get("flow_alignment", 0),
+                "distribution_risk": STATE["smart_money"].get("distribution_risk", 0),
+                "momentum_health": mf.get("momentum_health", 0),
+                "continuation_strength": mf.get("continuation_strength", 0),
+                "exhaustion_risk": mf.get("exhaustion_risk", 0),
+                "climax_risk": mf.get("climax_risk", 0),
+                "greed_state": mf.get("greed_state", False),
+                "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
+            }
+
+        payload = {
+            "balance": bal,
+            "free_balance": free_bal,
+            "avail_margin": avail_margin,
+            "mode": mode,
+            "stats": DASHBOARD_STATE["stats"],
+            "position": pos,
+            "logs": DASHBOARD_STATE["logs"][-30:],
+            "errors": DASHBOARD_STATE["errors"][-10:],
+            "top5": top5,
+            "candidates": MEMORY.get("top_candidates", []),
+            "scanned_count": len(MEMORY.get("top_candidates", [])),
+            "last_scan": MEMORY["last_scan"],
+            "regime": MEMORY["regime"],
+            "health": health,
+            "rf_dashboard": MEMORY.get("rf_dashboard", [])[:20],
+            "total_pnl": perf["total_pnl"],
+            "total_pnl_usdt": perf["total_pnl_usdt"],
+            "last_trade": perf["last_trade"],
+            "scanner_v2_buy": MEMORY.get("scanner_v2_buy", []),
+            "scanner_v2_sell": MEMORY.get("scanner_v2_sell", []),
+            "watchlist": watchlist_data,
+            "no_entry_feed": no_entry_feed,
+            "continuation_probability": STATE.get("continuation_probability", 0.5),
+            "hold_quality": STATE.get("hold_quality", "UNKNOWN"),
+            "counter_pressure": STATE.get("counter_pressure", 0.0),
+            "reclaim_risk": STATE.get("reclaim_risk", 0.0),
+            "trend_strength": STATE.get("trend_strength", 0.0),
+            "continuation_reasons": STATE.get("continuation_reasons", []),
+            "trade_thesis": STATE.get("trade_thesis", {}),
+            "current_confidence": STATE.get("current_confidence", 50.0),
+            "market_regime": STATE.get("market_regime", "UNKNOWN"),
+            "continuation_pressure": STATE.get("continuation_pressure", 50),
+            "thesis_failure_score": STATE.get("thesis_failure_score", 0),
+            "institutional_flow": institutional_flow_data,
+            "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
+            **live_data
+        }
+        safe_payload = safe_json(payload)
+        cache_set("dashboard", safe_payload)
+        return jsonify(safe_payload), 200
+    except Exception as e:
+        log_execution(f"/data error: {traceback.format_exc()}", "ERROR")
+        return jsonify({"error": str(e)}), 200
+
+@app.route("/decision")
+def decision_endpoint():
+    decisions = MEMORY.get("decision_log", [])[-50:]
+    return jsonify({"data": decisions})
+
+@app.route("/trade", methods=["POST"])
+def manual_trade():
+    data = request.json
+    side = data.get("side")
+    if not side or side not in ["BUY","SELL"]:
+        return jsonify({"error": "Invalid side"}),400
+    if STATE["open"]:
+        return jsonify({"error": "Position open"}),400
+    sync_position_state(DEFAULT_SYMBOL)
+    if STATE["open"]:
+        return jsonify({"error": "Already in position (synced with exchange)"}),400
+    if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
+        return jsonify({"error": "Insufficient margin cooldown active"}),400
+    price = get_ticker_safe(DEFAULT_SYMBOL)
+    if not price or price <= 0:
+        return jsonify({"error": "No price"}),400
+    df = get_ohlcv_safe(DEFAULT_SYMBOL, 100)
+    if df is None:
+        return jsonify({"error": "No data"}),500
+    atr = compute_atr(df).iloc[-1]
+    sl = price - atr*1.6 if side=="BUY" else price + atr*1.6
+    tp1 = price*1.006 if side=="BUY" else price*0.994
+    tp2 = price*1.02 if side=="BUY" else price*0.98
+    classification = "SNIPER"
+    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
+    return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
+
+@app.route("/close", methods=["POST"])
+def manual_close():
+    if not STATE["open"]:
+        return jsonify({"error": "No position"}),400
+    price = get_ticker_safe(STATE["current_symbol"])
+    if price:
+        finalize_trade_with_reality(STATE["current_symbol"])
+    else:
+        close_position_full()
+        finalize_trade_with_reality(STATE["current_symbol"])
+    return jsonify({"message": "Closed"}),200
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
+
+def keep_alive():
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        try:
+            requests.get(f"http://localhost:{os.environ.get('PORT', 8000)}/health", timeout=5)
+        except:
+            pass
+
+_last_cleanup = 0
+def hourly_cleanup():
+    global _last_cleanup
+    if time.time() - _last_cleanup < 3600:
+        return
+    CACHE["ohlcv"]["value"].clear()
+    CACHE["ticker"]["value"].clear()
+    CACHE["orderbook"]["value"].clear()
+    gc.collect()
+    _last_cleanup = time.time()
+
+_last_snapshot_time = 0
+def print_snapshot():
+    global _last_snapshot_time
+    now = time.time()
+    if now - _last_snapshot_time < SNAPSHOT_INTERVAL:
+        return
+    _last_snapshot_time = now
+    bal = get_balance_safe()
+    free_bal = get_free_balance_safe()
+    mode = "LIVE" if MODE_LIVE else "PAPER"
+    perf = get_dashboard_metrics()
+    print("\n" + "="*70)
+    print(color_text(f"🔥 RF v28 Professional (REFACTORED) ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
+    print(f"💰 Balance (Total): {color_text(f'{bal:.2f} USDT', GREEN)}   Free: {color_text(f'{free_bal:.2f} USDT', GREEN)}")
+    print(f"📊 Total PnL: {color_text(perf['total_pnl'], GREEN if perf['total_pnl'].startswith('+') else RED)} | Last Trade: {perf['last_trade']}")
+    regime = MEMORY.get("regime", "RANGE")
+    regime_color = CYAN if regime == "TREND" else YELLOW
+    print(f"🧠 Regime: {color_text(regime, regime_color)} | Scanned: {len(MEMORY.get('top_candidates', []))}")
+    print_rf_dashboard()
+    buy = MEMORY.get("scanner_v2_buy", [])
+    sell = MEMORY.get("scanner_v2_sell", [])
+    if buy or sell:
+        print(color_text("=== Smart Scanner v2 (Ranked) ===", MAGENTA))
+        if buy:
+            print(f"  BUY top: {buy[0]['symbol']} score={buy[0]['score']}")
+        if sell:
+            print(f"  SELL top: {sell[0]['symbol']} score={sell[0]['score']}")
+    if STATE["open"]:
+        roe = STATE.get("roe_pct", 0.0)
+        roe_colored = color_pnl(roe)
+        print(f"📊 POSITION: {STATE['current_symbol']} {STATE['side']} ({STATE.get('entry_type','?')} / {STATE.get('classification','?')})")
+        print(f"   Entry: {STATE['entry']:.4f} | ROE: {roe_colored} (5x leveraged)")
+        print(f"   SL: {STATE.get('synthetic_sl',0):.4f} | TP1: {STATE.get('synthetic_tp1',0):.4f} | TP2: {STATE.get('tp2_price',0):.4f}")
+        print(f"   Narrative: {STATE.get('narrative_classification','N/A')} (Conf: {STATE.get('narrative_confidence',0):.1f}) | Conf Level: {STATE.get('confidence_level','')}")
+        cp = STATE.get("continuation_probability", 0.5)
+        hq = STATE.get("hold_quality", "UNKNOWN")
+        print(f"   Continuation: {cp*100:.1f}% | Hold Quality: {hq}")
+        print(f"   Current Confidence: {STATE.get('current_confidence',50):.1f} | Market Regime: {STATE.get('market_regime','UNKNOWN')} | Cont. Pressure: {STATE.get('continuation_pressure',50)}")
+        print(f"   Trade State: {STATE.get('trade_state','RANGE_CHOP')} | Trail Mult: {STATE.get('smart_trail_mult',1.5)} | Delay TP1: {STATE.get('delay_tp1',False)}")
+        if STATE.get("tp1_hit"): print(color_text(f"   ✅ TP1 achieved - partial close, SL moved to breakeven", GREEN))
+        if DASHBOARD_STATE.get("live_trade_mode", False):
+            print(color_text(f"   [LIVE MGMT] State: {_live_manager.lifecycle_state.value}", MAGENTA))
+    else:
+        print("📊 POSITION: None")
+    print("="*70 + "\n")
+
+def print_rf_dashboard():
+    print("\n" + color_text("=== RF TRIGGER CANDIDATES (Top 20) ===", MAGENTA))
+    for item in MEMORY.get("rf_dashboard", [])[:20]:
+        signal_icon = "🟢" if item["signal"] == "BUY" else "🔴" if item["signal"] == "SELL" else "⚪"
+        print(f"{item['icon']} {signal_icon} {item['symbol']} | {item['status']} | score={item['score']:.2f} | ADX={item['adx']:.1f} | RSI={item['rsi']:.1f}")
+    print("")
+
+def build_rf_dashboard():
+    dashboard = []
+    candidates = scan_market_rf(top_n=30)
+    for c in candidates:
+        dashboard.append({
+            "symbol": c["symbol"],
+            "status": c.get("status", "PROXIMITY"),
+            "icon": "🔔" if c["rf_triggered"] else "📡",
+            "score": c["score"],
+            "adx": c["adx"],
+            "rsi": c["rsi"],
+            "atrp": c["atrp"],
+            "signal": c["rf_signal"] or "N/A"
+        })
+    MEMORY["rf_dashboard"] = dashboard
+    return dashboard
+
+def run_scanner_v2():
+    try:
+        buy, sell = smart_scanner_v2()
+        MEMORY["scanner_v2_buy"] = buy
+        MEMORY["scanner_v2_sell"] = sell
+        MEMORY["scanner_v2_last_scan"] = time.time()
+        log_execution(f"[SCANNER] TOP BUY updated: {len(buy)} candidates", "INFO")
+        log_execution(f"[SCANNER] TOP SELL updated: {len(sell)} candidates", "INFO")
+    except Exception as e:
+        log_execution(f"Smart Scanner v2 error: {traceback.format_exc()}", "ERROR")
 
 # ========== SNIPER V2 (UNCHANGED) ==========
 SNIPER_ZONES = {}
@@ -6494,8 +7173,7 @@ MEMORY = {
     "log_debounce": {},
     "watchlist": {},
     "no_entry_feed": [],
-    "decision_log": [],
-    "waiting_list": {}  # New: Professional Institutional Waiting List
+    "decision_log": []
 }
 
 SNIPER_MODE = True
@@ -6806,8 +7484,6 @@ def main_loop_sniper():
     last_candidate_scan = 0
     last_flow_update = 0
     last_universe_build = 0
-    last_waiting_update = 0
-    last_watchlist_rotate = 0
     watchlist_rotation = None
     try:
         ex.load_markets()
@@ -6872,17 +7548,19 @@ def main_loop_sniper():
                     if now - last_radar_refresh >= WATCHLIST_REFRESH:
                         refresh_radar_watchlist()
                         last_radar_refresh = now
-                # Waiting List update (every 10 seconds)
-                if now - last_waiting_update >= 10:
-                    update_waiting_list()
-                    last_waiting_update = now
-                # Watchlist rotation (every 10 seconds)
-                if now - last_watchlist_rotate >= 10:
-                    rotate_watchlist()
-                    last_watchlist_rotate = now
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        # Use the enhanced smart_opportunity_selection (which checks Waiting List first)
+                        if watchlist_rotation and watchlist_rotation.should_rotate():
+                            batch = watchlist_rotation.get_next_batch()
+                            for sym in batch:
+                                df = get_ohlcv_safe(sym, 60)
+                                if df is None:
+                                    continue
+                                price = df['close'].iloc[-1]
+                                atr_val = compute_atr(df).iloc[-1]
+                                ob = get_orderbook_cached(sym, limit=10)
+                                if ob is None:
+                                    continue
                         smart_opportunity_selection()
                         last_candidate_scan = now
                     time.sleep(1)
@@ -6929,224 +7607,6 @@ def safe_main_loop():
                 print(f"Failed to log: {log_err}")
             time.sleep(5)
 
-# ========== DASHBOARD FUNCTIONS ==========
-def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
-    DASHBOARD_STATE["position"] = {
-        "symbol": symbol,
-        "side": side,
-        "entry": round(entry, 4),
-        "qty": qty,
-        "pnl": round(pnl, 2),
-        "sl": round(STATE.get("synthetic_sl", 0), 4),
-        "tp1": round(STATE.get("synthetic_tp1", 0), 4),
-        "tp2": round(STATE.get("tp2_price", 0), 4),
-        "tp1_done": STATE.get("tp1_hit", False),
-        "trailing_active": STATE.get("trail_activated", False),
-        "regime": MEMORY.get("regime", "UNKNOWN"),
-        "trade_type": STATE.get("trade_type", "N/A"),
-        "entry_type": STATE.get("entry_type", "N/A"),
-        "classification": STATE.get("classification", "N/A"),
-        "location": STATE.get("location", "N/A"),
-        "zone": STATE.get("zone_info", "N/A"),
-        "score": STATE.get("trade_score", 0),
-        "narrative_classification": STATE.get("narrative_classification", ""),
-        "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-        "confidence_level": STATE.get("confidence_level", ""),
-        "current_confidence": STATE.get("current_confidence", 50.0),
-        "market_regime": STATE.get("market_regime", "UNKNOWN"),
-        "continuation_pressure": STATE.get("continuation_pressure", 50),
-        "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
-        "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-        "delay_tp1": STATE.get("delay_tp1", False)
-    }
-
-def clear_position_dashboard():
-    DASHBOARD_STATE["position"] = None
-
-def render_live_supervisor_panel():
-    return """
-    <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
-      <div class="rf-live-header">
-        <span class="rf-live-title">🧠 RF v28 Fixed Live Supervisor</span>
-        <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
-      </div>
-      <div class="rf-live-grid">
-        <div class="rf-live-card"><div class="rf-live-metric-icon">💰</div><div class="rf-live-metric-label">Entry</div><div class="rf-live-metric-value" id="rf-sup-entry">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">📈</div><div class="rf-live-metric-label">Mark Price</div><div class="rf-live-metric-value" id="rf-sup-mark">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">ROE%</div><div class="rf-live-metric-value" id="rf-sup-roe">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">💵</div><div class="rf-live-metric-label">Unrealized PnL</div><div class="rf-live-metric-value" id="rf-sup-upnl">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">📊</div><div class="rf-live-metric-label">ADX</div><div class="rf-live-metric-value" id="rf-sup-adx">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🟢</div><div class="rf-live-metric-label">DI+</div><div class="rf-live-metric-value" id="rf-sup-dip">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🔴</div><div class="rf-live-metric-label">DI-</div><div class="rf-live-metric-value" id="rf-sup-dim">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🔥</div><div class="rf-live-metric-label">Continuation</div><div class="rf-live-metric-value" id="rf-sup-cont">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Thesis Failure</div><div class="rf-live-metric-value" id="rf-sup-fail">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">✅</div><div class="rf-live-metric-label">Confidence</div><div class="rf-live-metric-value" id="rf-sup-conf">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP1</div><div class="rf-live-metric-value" id="rf-sup-tp1">❌</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP2</div><div class="rf-live-metric-value" id="rf-sup-tp2">❌</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">Trailing</div><div class="rf-live-metric-value" id="rf-sup-trail">❌</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Personality</div><div class="rf-live-metric-value" id="rf-sup-personality">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🏦</div><div class="rf-live-metric-label">Institutional Flow</div><div class="rf-live-metric-value" id="rf-sup-flow">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">⚙️</div><div class="rf-live-metric-label">Trade State</div><div class="rf-live-metric-value" id="rf-sup-state">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">📏</div><div class="rf-live-metric-label">Trail Mult</div><div class="rf-live-metric-value" id="rf-sup-trail-mult">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">⏰</div><div class="rf-live-metric-label">Delay TP1</div><div class="rf-live-metric-value" id="rf-sup-delay-tp1">❌</div></div>
-      </div>
-      <div class="rf-live-status-row">
-        <span id="rf-pill-thesis" class="rf-live-pill rf-live-pill-active">🧠 THESIS ACTIVE</span>
-        <span id="rf-pill-trail" class="rf-live-pill">⚡ TRAILING OFF</span>
-        <span id="rf-pill-flow" class="rf-live-pill">🏦 NEUTRAL</span>
-        <span id="rf-pill-reclaim" class="rf-live-pill">🟢 RECLAIM LOW</span>
-      </div>
-    </div>
-    <style>
-    .rf-live-supervisor {
-      background: linear-gradient(145deg, #0f1724 0%, #0a0f17 100%);
-      border-radius: 20px;
-      padding: 20px;
-      margin-bottom: 20px;
-      border: 1px solid #2c3e50;
-    }
-    .rf-live-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 18px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid #2c3e50;
-    }
-    .rf-live-title {
-      font-size: 18px;
-      font-weight: bold;
-      color: #00ffa6;
-    }
-    .rf-live-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 12px;
-      margin-bottom: 18px;
-    }
-    .rf-live-card {
-      background: #111827;
-      border-radius: 14px;
-      padding: 10px;
-      text-align: center;
-      transition: 0.2s;
-    }
-    .rf-live-metric-icon {
-      font-size: 22px;
-      margin-bottom: 4px;
-    }
-    .rf-live-metric-label {
-      font-size: 11px;
-      color: #9ca3af;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .rf-live-metric-value {
-      font-size: 15px;
-      font-weight: bold;
-      color: #e6edf3;
-      margin-top: 4px;
-    }
-    .rf-live-status-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .rf-live-pill {
-      background: #111827;
-      padding: 6px 14px;
-      border-radius: 30px;
-      font-size: 12px;
-      font-weight: 600;
-      border: 1px solid #2c3e50;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .rf-live-pill-active {
-      background: rgba(0, 255, 166, 0.1);
-      border-color: #00ffa6;
-      color: #00ffa6;
-    }
-    .rf-live-pill-failed {
-      background: rgba(255, 77, 77, 0.1);
-      border-color: #ff4d4d;
-      color: #ff4d4d;
-    }
-    .rf-live-pill-trail {
-      background: rgba(0, 255, 166, 0.1);
-      border-color: #00ffa6;
-    }
-    .rf-live-pill-flow-buy {
-      background: rgba(0, 255, 166, 0.1);
-      border-color: #00ffa6;
-      color: #00ffa6;
-    }
-    .rf-live-pill-flow-sell {
-      background: rgba(255, 77, 77, 0.1);
-      border-color: #ff4d4d;
-      color: #ff4d4d;
-    }
-    .rf-live-pill-risk-low {
-      color: #00ffa6;
-    }
-    .rf-live-pill-risk-mid {
-      color: #ffc800;
-    }
-    .rf-live-pill-risk-high {
-      color: #ff4d4d;
-    }
-    </style>
-    """
-
-# ========== FLASK ROUTES ==========
-@app.route("/")
-def dashboard():
-    # ... (full dashboard HTML – same as previous version)
-    # For brevity, we include the full dashboard HTML from the original code.
-    # It uses DASHBOARD_STATE, MEMORY, etc.
-    # (Full HTML is included in the actual code; omitted here for readability, but present in the final version)
-    pass
-
-@app.route("/data")
-def data():
-    # ... (same as previous version, now includes waiting_list)
-    # Returns JSON with all metrics including waiting_list.
-    pass
-
-@app.route("/decision")
-def decision_endpoint():
-    # ... (same as previous)
-    pass
-
-@app.route("/trade", methods=["POST"])
-def manual_trade():
-    # ... (same as previous)
-    pass
-
-@app.route("/close", methods=["POST"])
-def manual_close():
-    # ... (same as previous)
-    pass
-
-@app.route("/health")
-def health():
-    return jsonify({"ok": True})
-
-@app.route("/narrative-debug")
-def narrative_debug_route():
-    return narrative_debug()
-
-# ========== KEEP ALIVE ==========
-def keep_alive():
-    while True:
-        time.sleep(KEEP_ALIVE_INTERVAL)
-        try:
-            requests.get(f"http://localhost:{os.environ.get('PORT', 8000)}/health", timeout=5)
-        except:
-            pass
-
-# ========== MAIN ENTRY POINT ==========
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=safe_main_loop, daemon=True).start()
