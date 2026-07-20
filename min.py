@@ -511,7 +511,7 @@ MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
-LEVERAGE = 5
+LEVERAGE = 10
 
 USE_PPE = True
 
