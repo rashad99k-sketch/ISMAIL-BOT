@@ -21,7 +21,6 @@ import threading
 import traceback
 import math
 import gc
-from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
@@ -499,18 +498,7 @@ def tg_sl_hit(symbol, pnl_pct):
 
 def tg_close(symbol, pnl_pct, duration_min, side):
     icon = "✅" if pnl_pct >= 0 else "❌"
-    thesis = STATE.get("institutional_thesis", "")
-    profile = STATE.get("trade_profile", "STANDARD")
-    grade = STATE.get("institutional_grade", "N/A")
-    confluence = STATE.get("confluence_score", 0)
-    exit_price = STATE.get("mark_price", 0.0)
-    exit_reason = STATE.get("exit_reason", STATE.get("trade_state", "strategy exit"))
-    send_once(
-        f"{icon} <b>{'WIN' if pnl_pct >= 0 else 'LOSS'} — CLOSE</b>\n"
-        f"{symbol} | {side}\nEntry: {STATE.get('entry', 0):.4f} | Exit: {exit_price:.4f}\n"
-        f"PnL: {pnl_pct:.2f}% | ROE: {STATE.get('roe_pct', pnl_pct):.2f}% | Time: {duration_min:.0f} min\n"
-        f"Profile: {profile} | Grade: {grade} | Confluence: {confluence}\n"
-        f"Exit thesis: {exit_reason}\nTrade story: {thesis[:180]}", f"close_{symbol}", 10)
+    send_once(f"{icon} <b>CLOSE</b> {symbol} ({side})\nPnL: {pnl_pct:.2f}%\n⏱ {duration_min:.0f} min", f"close_{symbol}", 10)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
@@ -518,8 +506,7 @@ def tg_error(err_msg, error_type="EXECUTION"):
 # ========== CONFIGURATION ==========
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
-# Safe default: run paper trading unless the operator explicitly sets False.
-PAPER_MODE = os.getenv("PAPER_MODE", "True").strip().lower() == "true"
+PAPER_MODE = os.getenv("PAPER_MODE", "True") == "False"
 MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
@@ -3871,14 +3858,7 @@ STATE = {
     "tp1_hold_score": 10,
     "exit_warning": 0,
     "runner_mode": False,
-    "entry_atr": 0.0,
-    "institutional_score": 0,
-    "confluence_score": 0,
-    "institutional_grade": "N/A",
-    "trade_profile": "STANDARD",
-    "institutional_thesis": "",
-    "trade_phase": "IDLE",
-    "exit_reason": ""
+    "entry_atr": 0.0
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
@@ -4080,238 +4060,6 @@ def dynamic_spread_tolerance(symbol):
     return MAX_SPREAD_PERCENT_DEFAULT
 
 # ========== RF SCANNER (UNCHANGED) ==========
-@dataclass
-class InstitutionalOpportunity:
-    """A validated zone; validation and entry timing intentionally remain separate."""
-    symbol: str
-    side: str
-    zone_low: float
-    zone_high: float
-    fresh: bool
-    liquidity_sweep: bool
-    bos_mss: bool
-    institutional_volume: bool
-    trend_score: int
-    structure_score: int
-    volume_score: int
-    liquidity_score: int
-    ob_score: int
-    explosion_probability: int
-    distance_percent: float
-    status: str
-    grade: str
-    created_at: float = field(default_factory=time.time)
-    timing_reason: str = "Waiting for confirmation"
-    readiness_reasons: List[str] = field(default_factory=list)
-    confluence_score: int = 0
-    lifecycle_stage: str = "RADAR"
-    institutional_thesis: str = ""
-    priority: int = 0
-    trade_profile: str = "INSTITUTIONAL_REVERSAL"
-
-    def dashboard_row(self):
-        return {
-            "symbol": self.symbol, "zone": f"{'Bullish' if self.side == 'BUY' else 'Bearish'} OB",
-            "ob_strength": self.ob_score, "structure": self.structure_score,
-            "liquidity": self.liquidity_score, "volume": self.volume_score,
-            "explosion": self.explosion_probability, "distance": round(self.distance_percent, 3),
-            "status": self.status, "grade": self.grade, "stars": "★" * (5 if self.explosion_probability >= 90 else 4 if self.explosion_probability >= 78 else 3 if self.explosion_probability >= 64 else 2 if self.explosion_probability >= 50 else 1),
-            "fresh": self.fresh, "sweep": self.liquidity_sweep, "bos_mss": self.bos_mss,
-            "timing": self.timing_reason, "readiness_reasons": self.readiness_reasons
-            , "institutional_score": self.explosion_probability, "confluence_score": self.confluence_score,
-            "lifecycle": self.lifecycle_stage, "thesis": self.institutional_thesis,
-            "estimated_readiness": max(0, min(100, self.explosion_probability - len(self.readiness_reasons) * 7)),
-            "priority": self.priority, "trade_profile": self.trade_profile
-        }
-
-
-class InstitutionalOpportunityEngine:
-    """Scanner -> waiting list -> zone validation -> entry timing.
-
-    This layer only qualifies an opportunity. It never calls execute_entry;
-    the existing execution and live TradeManager remain the sole order owners.
-    """
-    def __init__(self):
-        self.waiting_list = {}
-        self.radar_candidates = []
-        self.processing_queue = deque()
-
-    @staticmethod
-    def _clamp(value):
-        return int(max(0, min(100, round(float(value)))))
-
-    def _order_block(self, df, side):
-        """Find the latest opposite candle preceding a genuine displacement."""
-        if df is None or len(df) < 45:
-            return None
-        avg_vol = float(df['volume'].iloc[-31:-1].mean())
-        start = max(2, len(df) - 35)
-        for i in range(len(df) - 3, start - 1, -1):
-            base, impulse = df.iloc[i], df.iloc[i + 1]
-            impulse_body = abs(float(impulse['close'] - impulse['open']))
-            impulse_range = max(float(impulse['high'] - impulse['low']), 1e-12)
-            displacement = impulse_body / impulse_range >= .58 and float(impulse['volume']) >= avg_vol * 1.15
-            if not displacement:
-                continue
-            if side == 'BUY' and impulse['close'] > impulse['open'] and base['close'] < base['open']:
-                return i, float(base['low']), float(base['high'])
-            if side == 'SELL' and impulse['close'] < impulse['open'] and base['close'] > base['open']:
-                return i, float(base['low']), float(base['high'])
-        return None
-
-    def validate_zone(self, symbol, side, df):
-        block = self._order_block(df, side)
-        if block is None:
-            return None
-        index, zone_low, zone_high = block
-        price = float(df['close'].iloc[-1])
-        prior = df.iloc[max(0, index - 12):index]
-        later = df.iloc[index + 2:-1]  # last candle is reserved for Entry Timing.
-        fresh = not any(float(c['low']) <= zone_high and float(c['high']) >= zone_low for _, c in later.iterrows())
-        impulse = df.iloc[index + 1]
-        if prior.empty:
-            return None
-        if side == 'BUY':
-            liquidity_sweep = float(impulse['low']) < float(prior['low'].min()) and float(impulse['close']) > float(impulse['low'])
-            bos_mss = float(df['high'].iloc[index + 1:index + 5].max()) > float(prior['high'].max())
-            trend_aligned = float(df['close'].iloc[-8:].mean()) > float(df['close'].iloc[-30:].mean())
-        else:
-            liquidity_sweep = float(impulse['high']) > float(prior['high'].max()) and float(impulse['close']) < float(impulse['high'])
-            bos_mss = float(df['low'].iloc[index + 1:index + 5].min()) < float(prior['low'].min())
-            trend_aligned = float(df['close'].iloc[-8:].mean()) < float(df['close'].iloc[-30:].mean())
-        vol_ratio = float(impulse['volume']) / max(float(df['volume'].iloc[-31:-1].mean()), 1e-12)
-        institutional_volume = vol_ratio >= 1.25
-        trend_score = 84 if trend_aligned else 45
-        structure_score = 90 if bos_mss else 48
-        volume_score = self._clamp(45 + vol_ratio * 25)
-        liquidity_score = 92 if liquidity_sweep else 55
-        midpoint = (zone_low + zone_high) / 2
-        distance = abs(price - midpoint) / max(price, 1e-12) * 100
-        ob_score = self._clamp((100 if fresh else 30) * .55 + trend_score * .25 + max(0, 100 - distance * 20) * .20)
-        explosion = self._clamp(ob_score * .27 + structure_score * .25 + liquidity_score * .20 + volume_score * .18 + trend_score * .10)
-        fvg = (float(df['low'].iloc[-2]) > float(df['high'].iloc[-4])) if side == 'BUY' else (float(df['high'].iloc[-2]) < float(df['low'].iloc[-4]))
-        sfp = liquidity_sweep and ((float(df['close'].iloc[-1]) > float(df['open'].iloc[-1])) if side == 'BUY' else (float(df['close'].iloc[-1]) < float(df['open'].iloc[-1])))
-        smart = SmartMoneyEngine.analyze_smart_money(df)
-        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-        sm_aligned = smart.get('institutional_bias') == side
-        mom_aligned = momentum.get('flow_bias') == side
-        confluence = self._clamp(
-            ob_score * .22 + structure_score * .18 + liquidity_score * .16 + volume_score * .12 +
-            trend_score * .12 + (90 if fvg else 45) * .06 + (90 if sfp else 45) * .05 +
-            (85 if sm_aligned else 45) * .05 + (85 if mom_aligned else 45) * .04
-        )
-        explosion = self._clamp(explosion * .55 + confluence * .45)
-        if explosion >= 88 and fresh and bos_mss and institutional_volume and distance <= .35:
-            status = 'READY'
-        elif explosion >= 80 and fresh and distance <= .80:
-            status = 'ALMOST READY'
-        elif explosion >= 68 and fresh:
-            status = 'PREPARE'
-        else:
-            status = 'WATCH'
-        grade = 'Institutional Grade A' if explosion >= 88 else ('Institutional Grade B' if explosion >= 72 else 'Institutional Grade C')
-        reasons = []
-        if not fresh:
-            reasons.append('Order Block already mitigated')
-        if not liquidity_sweep:
-            reasons.append('Waiting for Liquidity Sweep')
-        if not bos_mss:
-            reasons.append('Waiting for BOS / MSS')
-        if not institutional_volume:
-            reasons.append('Waiting for Volume Confirmation')
-        if distance > .80:
-            reasons.append('Price too far from Order Block')
-        if status in ('ALMOST READY', 'READY'):
-            reasons.append('Waiting for confirmation candle and RF Signal')
-        if fvg:
-            reasons.append('FVG aligned')
-        if not sm_aligned:
-            reasons.append('Waiting for Smart Money Alignment')
-        if not mom_aligned:
-            reasons.append('Waiting for Momentum Alignment')
-        profile = 'EXPLOSIVE' if explosion >= 92 and institutional_volume and fvg else ('TREND_CONTINUATION' if trend_aligned and sm_aligned else 'INSTITUTIONAL_REVERSAL')
-        thesis = f"{profile}: {'fresh' if fresh else 'mitigated'} {'bullish' if side == 'BUY' else 'bearish'} OB; " \
-                 f"sweep={'yes' if liquidity_sweep else 'pending'}, structure={'confirmed' if bos_mss else 'pending'}, FVG={'yes' if fvg else 'no'}"
-        return InstitutionalOpportunity(symbol, side, zone_low, zone_high, fresh, liquidity_sweep, bos_mss,
-                                        institutional_volume, trend_score, structure_score, volume_score,
-                                        liquidity_score, ob_score, explosion, distance, status, grade,
-                                        readiness_reasons=reasons, confluence_score=confluence,
-                                        lifecycle_stage='ZONE_VALIDATED', institutional_thesis=thesis,
-                                        priority=confluence, trade_profile=profile)
-
-    def refresh(self, symbols=None):
-        """Global Scanner phase: add/update waiting-list zones without trading."""
-        symbols = symbols or get_usdt_perp_symbols()[:150]
-        next_list = {}
-        for symbol in symbols:
-            try:
-                df = get_ohlcv_safe(symbol, 150)
-                if df is None or not validate_dataframe(df, 45):
-                    continue
-                for side in ('BUY', 'SELL'):
-                    item = self.validate_zone(symbol, side, df)
-                    if item is not None:
-                        next_list[f'{symbol}:{side}'] = item
-            except Exception:
-                continue
-        ranked = sorted(next_list.values(), key=lambda x: (x.confluence_score, x.explosion_probability), reverse=True)[:70]
-        self.radar_candidates = ranked
-        self.processing_queue = deque(ranked)
-        self.waiting_list = {}
-        self.process_queue(8)
-        MEMORY['institutional_radar_buy'] = [item.dashboard_row() for item in ranked if item.side == 'BUY'][:35]
-        MEMORY['institutional_radar_sell'] = [item.dashboard_row() for item in ranked if item.side == 'SELL'][:35]
-        MEMORY['institutional_last_scan'] = time.time()
-        log_execution(f"[INSTITUTIONAL] Radar scanned {len(symbols)} pairs; ranked {len(ranked)} candidates; queue started", 'INFO', 'institutional_scan', 60)
-        return self.waiting_list
-
-    def process_queue(self, batch_size=8):
-        """Waiting List phase: analyze a bounded batch, prune stale zones, rotate new radar candidates."""
-        now = time.time()
-        stale = [key for key, item in self.waiting_list.items() if not item.fresh or now - item.created_at > 60 * 60 * 6 or item.distance_percent > 3.5]
-        for key in stale:
-            self.waiting_list.pop(key, None)
-        for _ in range(min(batch_size, len(self.processing_queue))):
-            item = self.processing_queue.popleft()
-            item.lifecycle_stage = 'WAITING_LIST' if item.status in ('WATCH', 'PREPARE') else ('ALMOST_READY' if item.status == 'ALMOST READY' else 'READY_FOR_TIMING')
-            self.waiting_list[f'{item.symbol}:{item.side}'] = item
-        ordered = sorted(self.waiting_list.values(), key=lambda x: (x.priority, x.explosion_probability), reverse=True)
-        MEMORY['institutional_waiting_list'] = [item.dashboard_row() for item in ordered]
-        MEMORY['institutional_queue_remaining'] = len(self.processing_queue)
-        return ordered
-
-    def entry_timing(self, symbol, side, df):
-        """Entry Timing phase: confirmation only; reject a late displacement."""
-        item = self.waiting_list.get(f'{symbol}:{side}')
-        if item is None or item.status != 'READY' or df is None or len(df) < 25:
-            return False, 'Zone is not READY'
-        last, prior = df.iloc[-1], df.iloc[-2]
-        touched = float(last['low']) <= item.zone_high and float(last['high']) >= item.zone_low
-        directional = float(last['close']) >= float(last['open']) if side == 'BUY' else float(last['close']) <= float(last['open'])
-        avg_range = float((df['high'].iloc[-21:-1] - df['low'].iloc[-21:-1]).mean())
-        not_late = float(last['high'] - last['low']) <= avg_range * 1.8
-        break_or_reject = float(last['close']) > float(prior['high']) if side == 'BUY' else float(last['close']) < float(prior['low'])
-        rf = RFEngine(20, 3.5).compute(df)
-        indicator_aligned = rf.get('signal') == side
-        if touched and directional and not_late and break_or_reject and indicator_aligned:
-            item.timing_reason = 'Confirmation candle + RF signal + fresh zone touch'
-            item.readiness_reasons = []
-            item.lifecycle_stage = 'ENTRY_CONFIRMED'
-            return True, item.timing_reason
-        missing = []
-        if not touched: missing.append('zone touch')
-        if not directional: missing.append('directional candle')
-        if not not_late: missing.append('late long candle')
-        if not break_or_reject: missing.append('break/rejection')
-        if not indicator_aligned: missing.append('indicator signal')
-        item.timing_reason = 'Waiting: ' + ', '.join(missing)
-        base_reasons = [reason for reason in item.readiness_reasons if reason != 'Waiting for confirmation candle and RF Signal']
-        item.readiness_reasons = base_reasons + [f'Waiting for {reason}' for reason in missing]
-        return False, item.timing_reason
-
-
-INSTITUTIONAL_ENGINE = InstitutionalOpportunityEngine()
-
 def get_usdt_perp_symbols():
     try:
         ex.load_markets()
@@ -6320,10 +6068,6 @@ def render_live_supervisor_panel():
         <div class="rf-live-card"><div class="rf-live-metric-icon">⚙️</div><div class="rf-live-metric-label">Trade State</div><div class="rf-live-metric-value" id="rf-sup-state">-</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">📏</div><div class="rf-live-metric-label">Trail Mult</div><div class="rf-live-metric-value" id="rf-sup-trail-mult">-</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">⏰</div><div class="rf-live-metric-label">Delay TP1</div><div class="rf-live-metric-value" id="rf-sup-delay-tp1">❌</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🏦</div><div class="rf-live-metric-label">Institutional Grade</div><div class="rf-live-metric-value" id="rf-sup-grade">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🧩</div><div class="rf-live-metric-label">Confluence</div><div class="rf-live-metric-value" id="rf-sup-confluence">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🚀</div><div class="rf-live-metric-label">Trade Profile</div><div class="rf-live-metric-value" id="rf-sup-profile">-</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🔒</div><div class="rf-live-metric-label">Profit Lock</div><div class="rf-live-metric-value" id="rf-sup-profit-lock">❌</div></div>
       </div>
       <div class="rf-live-status-row">
         <span id="rf-pill-thesis" class="rf-live-pill rf-live-pill-active">🧠 THESIS ACTIVE</span>
@@ -6473,21 +6217,6 @@ def dashboard():
     </div>
     </div>
     """
-
-    institutional_rows = "".join(
-        f"<tr><td>{x.get('symbol','')}</td><td>{x.get('zone','')}</td><td>{x.get('stars','')}</td>"
-        f"<td>{x.get('structure',0)}</td><td>{x.get('liquidity',0)}</td><td>{x.get('volume',0)}</td>"
-        f"<td>{x.get('explosion',0)}%</td><td>{x.get('distance',0)}%</td><td>{x.get('status','WATCH')}</td>"
-        f"<td>{' | '.join(x.get('readiness_reasons', [])) or x.get('timing','Ready for timing')}</td></tr>"
-        for x in MEMORY.get('institutional_waiting_list', [])[:30]
-    )
-    institutional_section = f"""
-    <div class="section smart-layer"><div class="title">Institutional Opportunity Engine — Zone Validation + Entry Timing</div>
-    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
-    <tr><th>Symbol</th><th>Zone</th><th>OB</th><th>Structure</th><th>Liquidity</th><th>Volume</th><th>Explosion</th><th>Distance</th><th>Status</th><th>Why not ready</th></tr>
-    {institutional_rows or '<tr><td colspan="10">No qualified institutional zones yet</td></tr>'}
-    </table></div></div>
-    """
     
     decision_panel_html = """
     <div id="decision-panel" style="padding:12px; border:1px solid #2c3e50; margin-bottom:16px; border-radius:8px; background:#0a0c10;">
@@ -6612,7 +6341,6 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="header">🔥 RF v28 Fixed Live Supervisor</div>
 {decision_panel_html}
 {scanner_v2_section}
-{institutional_section}
 {supervisor_panel_html}
 {flow_section_html}
 {continuation_panel_html}
@@ -6724,10 +6452,6 @@ function updateUI(d) {{
         document.getElementById("rf-sup-state").innerText = sup.trade_state || "RANGE_CHOP";
         document.getElementById("rf-sup-trail-mult").innerText = sup.trail_multiplier || "1.5";
         document.getElementById("rf-sup-delay-tp1").innerHTML = sup.delay_tp1 ? "✅" : "❌";
-        document.getElementById("rf-sup-grade").innerText = sup.institutional_grade || "-";
-        document.getElementById("rf-sup-confluence").innerText = sup.confluence_score || "-";
-        document.getElementById("rf-sup-profile").innerText = sup.trade_profile || "-";
-        document.getElementById("rf-sup-profit-lock").innerHTML = sup.profit_lock ? "✅" : "❌";
         const reclaim = sup.reclaim_risk || 0;
         let reclaimClass = "rf-live-pill-risk-low";
         if (reclaim > 0.6) reclaimClass = "rf-live-pill-risk-high";
@@ -6922,14 +6646,7 @@ def data():
                 "continuation_pressure": STATE.get("continuation_pressure", 50),
                 "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False),
-                "institutional_grade": STATE.get("institutional_grade", "N/A"),
-                "institutional_score": STATE.get("institutional_score", 0),
-                "confluence_score": STATE.get("confluence_score", 0),
-                "trade_profile": STATE.get("trade_profile", "STANDARD"),
-                "trade_phase": STATE.get("trade_phase", "ACTIVE"),
-                "profit_lock": STATE.get("profit_lock_activated", False),
-                "exit_thesis": STATE.get("exit_reason", "")
+                "delay_tp1": STATE.get("delay_tp1", False)
             }
         else:
             pos = DASHBOARD_STATE["position"]
@@ -7014,11 +6731,6 @@ def data():
             "last_trade": perf["last_trade"],
             "scanner_v2_buy": MEMORY.get("scanner_v2_buy", []),
             "scanner_v2_sell": MEMORY.get("scanner_v2_sell", []),
-            "institutional_waiting_list": MEMORY.get("institutional_waiting_list", [])[:30],
-            "institutional_radar_buy": MEMORY.get("institutional_radar_buy", [])[:35],
-            "institutional_radar_sell": MEMORY.get("institutional_radar_sell", [])[:35],
-            "institutional_queue_remaining": MEMORY.get("institutional_queue_remaining", 0),
-            "institutional_last_scan": MEMORY.get("institutional_last_scan", 0),
             "watchlist": watchlist_data,
             "no_entry_feed": no_entry_feed,
             "continuation_probability": STATE.get("continuation_probability", 0.5),
@@ -7461,17 +7173,11 @@ MEMORY = {
     "log_debounce": {},
     "watchlist": {},
     "no_entry_feed": [],
-    "decision_log": [],
-    "institutional_waiting_list": [],
-    "institutional_radar_buy": [],
-    "institutional_radar_sell": [],
-    "institutional_queue_remaining": 0,
-    "institutional_last_scan": 0
+    "decision_log": []
 }
 
 SNIPER_MODE = True
 CANDIDATE_SCAN_INTERVAL = 15
-INSTITUTIONAL_SCAN_INTERVAL = 60 * 5
 
 def sync_position_with_exchange(symbol):
     try:
@@ -7593,31 +7299,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     log_execution(f"[SIZING]\nFree USDT: {free_bal:.2f}\nUsable (x{BALANCE_SAFETY_FACTOR}): {balance:.2f}\nType: {trade_type_label}\nMargin: {margin:.2f}\nLeverage: {LEVERAGE}X\nNotional: {notional:.2f}\nFinal Qty: {qty:.6f}", "INFO")
 
     df = get_ohlcv_safe(symbol, 100)
-    # All automatic engines must pass the separate Zone Validation + Entry
-    # Timing gates. A human Dashboard override remains explicitly manual.
-    if entry_type != "MANUAL":
-        timing_ok, timing_reason = INSTITUTIONAL_ENGINE.entry_timing(symbol, side, df)
-        if not timing_ok:
-            MEMORY.setdefault("no_entry_feed", []).append({
-                "symbol": symbol, "side": side, "reason": f"Institutional timing: {timing_reason}",
-                "score": score, "ts": time.time()
-            })
-            MEMORY["no_entry_feed"] = MEMORY["no_entry_feed"][-20:]
-            log_execution(f"[ENTRY GATE] {symbol} {side} rejected: {timing_reason}", "INFO", f"institutional_gate_{symbol}_{side}", 30)
-            return False
-    opportunity = INSTITUTIONAL_ENGINE.waiting_list.get(f"{symbol}:{side}")
-    if opportunity is not None:
-        profile_trail = {"TREND_CONTINUATION": 2.0, "EXPLOSIVE": 2.4, "INSTITUTIONAL_REVERSAL": 1.15}
-        STATE.update({
-            "institutional_score": opportunity.explosion_probability,
-            "confluence_score": opportunity.confluence_score,
-            "institutional_grade": opportunity.grade,
-            "trade_profile": opportunity.trade_profile,
-            "institutional_thesis": opportunity.institutional_thesis,
-            "smart_trail_mult": profile_trail.get(opportunity.trade_profile, 1.5),
-            "trade_phase": "ENTRY_CONFIRMED",
-            "exit_reason": ""
-        })
     # Entry intelligence remains same (delegated to council)
     plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
     di_dominance = False
@@ -7802,7 +7483,6 @@ def main_loop_sniper():
     last_radar_refresh = 0
     last_candidate_scan = 0
     last_flow_update = 0
-    last_institutional_scan = 0
     last_universe_build = 0
     watchlist_rotation = None
     try:
@@ -7812,8 +7492,6 @@ def main_loop_sniper():
         log_execution(f"Failed to load markets: {e}", "ERROR")
     tg_start(get_balance_safe(), "LIVE" if MODE_LIVE else "PAPER")
     run_scanner_v2()
-    INSTITUTIONAL_ENGINE.refresh()
-    last_institutional_scan = time.time()
     log_execution("[SCANNER] Initial scanner v2 run completed", "INFO")
     updater_thread = threading.Thread(target=live_institutional_updater, daemon=True, name="live_institutional_updater")
     updater_thread.start()
@@ -7863,9 +7541,6 @@ def main_loop_sniper():
                 if now - last_scanner_v2 >= SCANNER_V2_INTERVAL:
                     run_scanner_v2()
                     last_scanner_v2 = now
-                if now - last_institutional_scan >= INSTITUTIONAL_SCAN_INTERVAL:
-                    INSTITUTIONAL_ENGINE.refresh()
-                    last_institutional_scan = now
                 if SNIPER_MODE:
                     if now - last_radar_scan >= SCAN_INTERVAL:
                         rebuild_radar_watchlist()
@@ -7875,7 +7550,6 @@ def main_loop_sniper():
                         last_radar_refresh = now
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        INSTITUTIONAL_ENGINE.process_queue(8)
                         if watchlist_rotation and watchlist_rotation.should_rotate():
                             batch = watchlist_rotation.get_next_batch()
                             for sym in batch:
