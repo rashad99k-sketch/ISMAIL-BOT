@@ -12,6 +12,9 @@
 # 6. Dashboard shows each opportunity with ✅/❌ per condition
 # 7. Legacy entry preserved as fallback (USE_LEGACY_ENTRY)
 # ====================================================================
+# FIXES APPLIED (2026-07-23):
+# - Fixed ambiguous Series truth value in OrderBlockDetector.detect
+# ====================================================================
 
 import os
 import time
@@ -106,7 +109,7 @@ class OrderBlockDetector:
             # Bearish OB: strong up move, then rejection, then down move
             up_move = curr_candle['close'] - prev_candle['close']
             if up_move > atr * 0.5 and curr_candle['close'] > curr_candle['open']:
-                if next_candle and next_candle['close'] < next_candle['open']:
+                if next_candle is not None and next_candle['close'] < next_candle['open']:
                     # Check if recent price retested this zone
                     fresh = True
                     recent_prices = df['close'].iloc[-10:]
@@ -153,7 +156,7 @@ class OrderBlockDetector:
             
             down_move = prev_candle['close'] - curr_candle['close']
             if down_move > atr * 0.5 and curr_candle['close'] < curr_candle['open']:
-                if next_candle and next_candle['close'] > next_candle['open']:
+                if next_candle is not None and next_candle['close'] > next_candle['open']:
                     fresh = True
                     recent_prices = df['close'].iloc[-10:]
                     if any(abs(p - low) / price < 0.002 for p in recent_prices):
