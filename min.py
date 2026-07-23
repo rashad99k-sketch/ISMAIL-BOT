@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
 from collections import deque
 import queue
+import random
 
 import ccxt
 import pandas as pd
@@ -6059,6 +6060,20 @@ def dashboard():
     """
     
     supervisor_panel_html = render_live_supervisor_panel()
+
+    # Discovery Scanner Section
+    discovery_html = """
+    <div class="section smart-layer">
+      <div class="title">🔍 Global Discovery Scanner</div>
+      <div class="grid">
+        <div class="card">Last Scan<div id="discovery_last_scan">-</div></div>
+        <div class="card">Symbols Scanned<div id="discovery_symbols">-</div></div>
+        <div class="card">Watchlist Size<div id="discovery_size">-</div></div>
+        <div class="card">API Calls<div id="discovery_api">-</div></div>
+      </div>
+      <div id="discovery_top5" style="font-size:13px; margin-top:8px;"></div>
+    </div>
+    """
     
     html = f"""
 <!DOCTYPE html>
@@ -6086,6 +6101,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="header">🔥 RF v28 Optimized Live Supervisor</div>
 {decision_panel_html}
 {scanner_v2_section}
+{discovery_html}
 {supervisor_panel_html}
 {flow_section_html}
 {continuation_panel_html}
@@ -6310,6 +6326,20 @@ function updateUI(d) {{
         document.getElementById("flow-greed").innerHTML = flow.greed_state ? "🚨 Yes" : "✅ No";
         document.getElementById("flow-dom").innerHTML = flow.smart_money_dominant ? "✅ Yes" : "❌ No";
     }}
+    // Discovery Scanner
+    if(d.discovery_stats) {{
+        document.getElementById("discovery_last_scan").innerHTML = d.discovery_stats.last_scan ? new Date(d.discovery_stats.last_scan*1000).toLocaleTimeString() : "-";
+        document.getElementById("discovery_symbols").innerHTML = d.discovery_stats.symbols_scanned || "-";
+        document.getElementById("discovery_size").innerHTML = d.discovery_stats.watchlist_size || "-";
+        document.getElementById("discovery_api").innerHTML = d.discovery_stats.api_calls || "-";
+        let top5Html = "";
+        if(d.discovery_stats.top5) {{
+            d.discovery_stats.top5.forEach(item => {{
+                top5Html += `<div>${{item[0]}} – ${{item[1].toFixed(1)}}</div>`;
+            }});
+        }}
+        document.getElementById("discovery_top5").innerHTML = top5Html ? "<b>Top 5 Ignition Scores</b><br>" + top5Html : "";
+    }}
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
 async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
@@ -6452,6 +6482,12 @@ def data():
                 "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
             }
 
+        # Discovery stats
+        discovery_stats = MEMORY.get("discovery_stats", {})
+        if discovery_scheduler and hasattr(discovery_scheduler.scanner, 'scan_stats'):
+            discovery_stats.update(discovery_scheduler.scanner.scan_stats)
+        discovery_stats["top5"] = MEMORY.get("discovery_top5", [])
+
         payload = {
             "balance": bal,
             "free_balance": free_bal,
@@ -6488,6 +6524,7 @@ def data():
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
+            "discovery_stats": discovery_stats,
             **live_data
         }
         safe_payload = safe_json(payload)
@@ -6538,6 +6575,10 @@ def manual_close():
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+@app.route("/decision")
+def decision():
+    return jsonify({"data": MEMORY.get("decision_log", [])})
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
@@ -6912,7 +6953,12 @@ MEMORY = {
     "radar_top5": [],
     "log_debounce": {},
     "watchlist": {},
-    "no_entry_feed": []
+    "no_entry_feed": [],
+    "decision_log": [],
+    "discovery_stats": {},
+    "discovery_last_success": 0,
+    "discovery_backup": [],
+    "discovery_top5": []
 }
 
 SNIPER_MODE = True
@@ -7007,6 +7053,401 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
+# ====================================================================
+# GLOBAL DISCOVERY SCANNER – INDEPENDENT LAYER
+# ====================================================================
+ENABLE_DISCOVERY_SCANNER = os.getenv("ENABLE_DISCOVERY_SCANNER", "True") == "True"
+DISCOVERY_SCAN_INTERVAL = int(os.getenv("DISCOVERY_SCAN_INTERVAL", 1200))   # 20 minutes
+DISCOVERY_MIN_LIQUIDITY_USDT = int(os.getenv("DISCOVERY_MIN_LIQUIDITY_USDT", 1_000_000))
+DISCOVERY_WATCHLIST_SIZE = 50
+DISCOVERY_TOP_COUNT = 40
+DISCOVERY_RANDOM_COUNT = 10
+
+class DiscoveryCache:
+    def __init__(self, ttl_seconds=DISCOVERY_SCAN_INTERVAL):
+        self._cache = {}
+        self._ttl = ttl_seconds
+        self._lock = threading.RLock()
+        self._stats = {"hits": 0, "misses": 0, "api_calls": 0}
+
+    def get_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
+        with self._lock:
+            now = time.time()
+            entry = self._cache.get(symbol)
+            if entry and (now - entry["ts"]) < self._ttl:
+                self._stats["hits"] += 1
+                return entry["df"]
+        df = fetch_ohlcv(symbol, limit=100)
+        if df is not None:
+            with self._lock:
+                self._cache[symbol] = {"df": df, "ts": time.time()}
+                self._stats["misses"] += 1
+                self._stats["api_calls"] += 1
+        else:
+            with self._lock:
+                entry = self._cache.get(symbol)
+                if entry:
+                    self._stats["hits"] += 1
+                    return entry["df"]
+        return df
+
+    def get_stats(self):
+        with self._lock:
+            return self._stats.copy()
+
+    def clear_old(self, max_age=2 * DISCOVERY_SCAN_INTERVAL):
+        with self._lock:
+            now = time.time()
+            to_delete = [k for k, v in self._cache.items() if now - v["ts"] > max_age]
+            for k in to_delete:
+                del self._cache[k]
+
+discovery_cache = DiscoveryCache()
+
+class DiscoveryMetrics:
+    @staticmethod
+    def price_change(df, periods=4):
+        if len(df) < periods + 1:
+            return 0.0
+        return abs((df['close'].iloc[-1] - df['close'].iloc[-periods-1]) / df['close'].iloc[-periods-1]) * 100
+
+    @staticmethod
+    def volume_expansion(df, period=20):
+        if len(df) < period + 1:
+            return 0.0
+        vol = df['volume']
+        avg = vol.iloc[-period-1:-1].mean()
+        if avg == 0:
+            return 0.0
+        ratio = vol.iloc[-1] / avg
+        return min(ratio, 3.0) / 3.0
+
+    @staticmethod
+    def atr_expansion(df, period=14):
+        if len(df) < period + 1:
+            return 0.0
+        atr_series = compute_atr(df, period)
+        if atr_series is None or len(atr_series) < period + 1:
+            return 0.0
+        atr_current = atr_series.iloc[-1]
+        atr_avg = atr_series.iloc[-period-1:-1].mean()
+        if atr_avg == 0:
+            return 0.0
+        ratio = atr_current / atr_avg
+        return min(ratio, 2.0) / 2.0
+
+    @staticmethod
+    def compression_breakout(df, lookback=10):
+        if len(df) < lookback + 2:
+            return 0.0
+        high = df['high']
+        low = df['low']
+        recent_range = high.iloc[-lookback:].max() - low.iloc[-lookback:].min()
+        prev_range = high.iloc[-lookback-1:-1].max() - low.iloc[-lookback-1:-1].min()
+        if prev_range == 0:
+            return 0.0
+        expansion = recent_range / prev_range
+        if expansion < 1.2:
+            return 0.0
+        price = df['close'].iloc[-1]
+        recent_high = high.iloc[-lookback-1:-1].max()
+        recent_low = low.iloc[-lookback-1:-1].min()
+        if price > recent_high or price < recent_low:
+            return min(expansion, 2.0) / 2.0
+        return 0.0
+
+    @staticmethod
+    def liquidity_ok(df):
+        if len(df) < 1:
+            return 0.0
+        vol = df['volume'].iloc[-1]
+        price = df['close'].iloc[-1]
+        usdt_volume = vol * price
+        return 1.0 if usdt_volume >= DISCOVERY_MIN_LIQUIDITY_USDT else 0.0
+
+    @staticmethod
+    def volatility(df, period=20):
+        if len(df) < period + 1:
+            return 0.0
+        returns = df['close'].pct_change().iloc[-period:]
+        std = returns.std()
+        return min(std * 100, 2.0) / 2.0
+
+    @staticmethod
+    def adx_trend(df, period=14):
+        adx_series = compute_adx(df, period)
+        if adx_series is None or len(adx_series) < 3:
+            return 0.0
+        adx_current = adx_series.iloc[-1]
+        adx_prev = adx_series.iloc[-2]
+        slope = adx_current - adx_prev
+        if slope > 0.5:
+            return 1.0
+        elif slope < -0.5:
+            return 0.0
+        else:
+            return 0.5
+
+    @staticmethod
+    def liquidity_sweep(df, lookback=5):
+        if len(df) < lookback + 1:
+            return 0.0
+        for i in range(1, lookback+1):
+            idx = -i
+            candle = df.iloc[idx]
+            prev = df.iloc[idx-1] if idx-1 >= -len(df) else None
+            if prev is None:
+                continue
+            if candle['low'] < prev['low'] and candle['close'] > candle['low']:
+                return 1.0
+            if candle['high'] > prev['high'] and candle['close'] < candle['high']:
+                return 1.0
+        return 0.0
+
+    @staticmethod
+    def displacement(df, atr):
+        if len(df) < 1:
+            return 0.0
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        if atr == 0:
+            return 0.0
+        return 1.0 if body > 0.8 * atr else 0.0
+
+    @staticmethod
+    def range_expansion(df, period=10):
+        if len(df) < period + 1:
+            return 0.0
+        high = df['high']
+        low = df['low']
+        current_range = high.iloc[-1] - low.iloc[-1]
+        avg_range = (high.iloc[-period-1:-1] - low.iloc[-period-1:-1]).mean()
+        if avg_range == 0:
+            return 0.0
+        ratio = current_range / avg_range
+        return min(ratio, 1.5) / 1.5
+
+    @staticmethod
+    def fresh_breakout(df, lookback=5):
+        if len(df) < lookback + 1:
+            return 0.0
+        price = df['close'].iloc[-1]
+        recent_high = df['high'].iloc[-lookback-1:-1].max()
+        recent_low = df['low'].iloc[-lookback-1:-1].min()
+        if price > recent_high or price < recent_low:
+            return 1.0
+        return 0.0
+
+    @staticmethod
+    def relative_volume(df, lookback=5):
+        if len(df) < lookback + 1:
+            return 0.0
+        vol = df['volume']
+        current = vol.iloc[-1]
+        avg = vol.iloc[-lookback-1:-1].mean()
+        if avg == 0:
+            return 0.0
+        ratio = current / avg
+        return min(ratio, 3.0) / 3.0
+
+    @staticmethod
+    def expansion_velocity(df, period=10):
+        if len(df) < period + 1:
+            return 0.0
+        atr_series = compute_atr(df, 14)
+        if atr_series is None or len(atr_series) < period + 1:
+            return 0.0
+        recent = atr_series.iloc[-period:].values
+        if len(recent) < 2:
+            return 0.0
+        velocity = (recent[-1] - recent[0]) / (recent[0] + 1e-9)
+        return min(max(velocity, 0.0), 1.0)
+
+class DiscoveryScorer:
+    WEIGHTS = {
+        "price_change": 0.15,
+        "volume_expansion": 0.20,
+        "atr_expansion": 0.15,
+        "compression_breakout": 0.10,
+        "liquidity": 0.10,
+        "volatility": 0.10,
+        "adx_trend": 0.05,
+        "liquidity_sweep": 0.05,
+        "displacement": 0.05,
+        "range_expansion": 0.05,
+        "fresh_breakout": 0.05,
+        "relative_volume": 0.05,
+        "expansion_velocity": 0.05,
+    }
+
+    @staticmethod
+    def compute_score(df) -> float:
+        metrics = DiscoveryMetrics()
+        score = 0.0
+        atr = compute_atr(df).iloc[-1] if len(df) > 14 else 0.0
+
+        score += metrics.price_change(df) / 5.0 * DiscoveryScorer.WEIGHTS["price_change"]
+        score += metrics.volume_expansion(df) * DiscoveryScorer.WEIGHTS["volume_expansion"]
+        score += metrics.atr_expansion(df) * DiscoveryScorer.WEIGHTS["atr_expansion"]
+        score += metrics.compression_breakout(df) * DiscoveryScorer.WEIGHTS["compression_breakout"]
+        score += metrics.liquidity_ok(df) * DiscoveryScorer.WEIGHTS["liquidity"]
+        score += metrics.volatility(df) * DiscoveryScorer.WEIGHTS["volatility"]
+        score += metrics.adx_trend(df) * DiscoveryScorer.WEIGHTS["adx_trend"]
+        score += metrics.liquidity_sweep(df) * DiscoveryScorer.WEIGHTS["liquidity_sweep"]
+        score += metrics.displacement(df, atr) * DiscoveryScorer.WEIGHTS["displacement"]
+        score += metrics.range_expansion(df) * DiscoveryScorer.WEIGHTS["range_expansion"]
+        score += metrics.fresh_breakout(df) * DiscoveryScorer.WEIGHTS["fresh_breakout"]
+        score += metrics.relative_volume(df) * DiscoveryScorer.WEIGHTS["relative_volume"]
+        score += metrics.expansion_velocity(df) * DiscoveryScorer.WEIGHTS["expansion_velocity"]
+
+        return min(score * 100, 100.0)
+
+class GlobalDiscoveryScanner:
+    def __init__(self):
+        self.cache = discovery_cache
+        self.last_scan_time = 0
+        self.last_watchlist = []
+        self.scan_stats = {}
+
+    def scan(self) -> List[str]:
+        log_execution("[DISCOVERY] Global Scan Started", "INFO")
+        start_time = time.time()
+        symbols = get_usdt_perp_symbols()
+        if not symbols:
+            log_execution("[DISCOVERY] No symbols retrieved", "ERROR")
+            return self.last_watchlist
+
+        scored = []
+        for sym in symbols[:200]:
+            try:
+                df = self.cache.get_ohlcv(sym)
+                if df is None or not validate_dataframe(df, 60):
+                    continue
+                vol = df['volume'].iloc[-1]
+                price = df['close'].iloc[-1]
+                if vol * price < DISCOVERY_MIN_LIQUIDITY_USDT * 0.5:
+                    continue
+                score = DiscoveryScorer.compute_score(df)
+                scored.append((sym, score))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:DISCOVERY_TOP_COUNT]
+        top_symbols = [s[0] for s in top]
+
+        remaining = [s for s in symbols if s not in top_symbols][:200]
+        random.shuffle(remaining)
+        random_picks = remaining[:DISCOVERY_RANDOM_COUNT]
+
+        new_watchlist = top_symbols + random_picks
+        if len(new_watchlist) < DISCOVERY_WATCHLIST_SIZE:
+            extra = [s for s in symbols if s not in new_watchlist][:DISCOVERY_WATCHLIST_SIZE - len(new_watchlist)]
+            new_watchlist.extend(extra)
+
+        self.last_scan_time = time.time()
+        self.scan_stats = {
+            "symbols_scanned": len(symbols),
+            "candidates_evaluated": len(scored),
+            "top_score": top[0][1] if top else 0,
+            "duration": time.time() - start_time,
+            "api_calls": self.cache._stats["api_calls"]
+        }
+        # Store top5 for dashboard
+        MEMORY["discovery_top5"] = top[:5]
+
+        if sync_discovery_watchlist(new_watchlist):
+            log_execution(f"[DISCOVERY] Scan Finished. Watchlist updated ({len(new_watchlist)} symbols)", "SUCCESS")
+            self.last_watchlist = new_watchlist
+            tg_discovery_summary(len(symbols), len(scored), top[:5])
+            return new_watchlist
+        else:
+            log_execution("[DISCOVERY] Validation failed, keeping previous watchlist", "WARN")
+            return self.last_watchlist
+
+_discovery_lock = threading.RLock()
+
+def sync_discovery_watchlist(new_watchlist: List[str]) -> bool:
+    with _discovery_lock:
+        if len(new_watchlist) < DISCOVERY_WATCHLIST_SIZE:
+            return False
+        if len(set(new_watchlist)) != len(new_watchlist):
+            return False
+        for sym in new_watchlist[:5]:
+            df = discovery_cache.get_ohlcv(sym)
+            if df is None:
+                return False
+            vol = df['volume'].iloc[-1]
+            price = df['close'].iloc[-1]
+            if vol * price < DISCOVERY_MIN_LIQUIDITY_USDT * 0.3:
+                return False
+        MEMORY["discovery_backup"] = MEMORY.get("radar_watchlist", [])
+        MEMORY["radar_watchlist"] = new_watchlist
+        MEMORY["radar_top5"] = new_watchlist[:5]
+        MEMORY["rf_watchlist"] = new_watchlist
+        MEMORY["discovery_last_success"] = time.time()
+        MEMORY["discovery_stats"] = {
+            "watchlist_size": len(new_watchlist),
+            "last_scan": time.time(),
+            "symbols_scanned": MEMORY.get("discovery_stats", {}).get("symbols_scanned", 0),
+            "api_calls": MEMORY.get("discovery_stats", {}).get("api_calls", 0)
+        }
+        return True
+
+def rollback_discovery():
+    with _discovery_lock:
+        backup = MEMORY.get("discovery_backup", [])
+        if backup:
+            MEMORY["radar_watchlist"] = backup
+            MEMORY["radar_top5"] = backup[:5]
+            MEMORY["rf_watchlist"] = backup
+            log_execution("[DISCOVERY] Rollback to previous watchlist", "WARN")
+
+def tg_discovery_summary(total_scanned, candidates, top5):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    msg = f"🔍 <b>Global Discovery Scan</b>\n"
+    msg += f"📊 Scanned: {total_scanned} symbols\n"
+    msg += f"🧮 Evaluated: {candidates} candidates\n"
+    if top5:
+        msg += "🏆 <b>Top 5</b>:\n"
+        for sym, score in top5[:5]:
+            msg += f"  • {sym} – {score:.1f}\n"
+    send_once(msg, "discovery_scan", 3600)
+
+class DiscoveryScheduler:
+    def __init__(self):
+        self.scanner = GlobalDiscoveryScanner()
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True, name="DiscoveryScheduler")
+        self.thread.start()
+
+    def _run(self):
+        while self.running:
+            try:
+                if ENABLE_DISCOVERY_SCANNER:
+                    self.scanner.scan()
+                else:
+                    time.sleep(60)
+                    continue
+            except Exception as e:
+                log_execution(f"[DISCOVERY] Scheduler error: {e}", "ERROR")
+                rollback_discovery()
+            for _ in range(DISCOVERY_SCAN_INTERVAL // 10):
+                if not self.running:
+                    break
+                time.sleep(10)
+
+discovery_scheduler = None
+if ENABLE_DISCOVERY_SCANNER:
+    discovery_scheduler = DiscoveryScheduler()
+    log_execution("[DISCOVERY] Scheduler started", "INFO")
+else:
+    log_execution("[DISCOVERY] Scheduler disabled", "INFO")
+
+# ====================================================================
+# MODIFIED MAIN LOOP
+# ====================================================================
 def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL
     last_scan = 0
@@ -7021,8 +7462,16 @@ def main_loop_sniper():
     except Exception as e:
         log_execution(f"Failed to load markets: {e}", "ERROR")
     tg_start(get_balance_safe(), "LIVE" if MODE_LIVE else "PAPER")
-    run_scanner_v2()
-    log_execution("[SCANNER] Initial scanner v2 run completed", "INFO")
+
+    # Initial run of v2 scanner only if discovery is disabled
+    if not ENABLE_DISCOVERY_SCANNER:
+        run_scanner_v2()
+        log_execution("[SCANNER] Initial scanner v2 run completed", "INFO")
+    else:
+        # With discovery enabled, we still run v2 scanner on the watchlist
+        run_scanner_v2()  # it will operate on the watchlist (which is now the discovery watchlist)
+        log_execution("[SCANNER] Initial scanner v2 run completed (using discovery watchlist)", "INFO")
+
     updater_thread = threading.Thread(target=live_institutional_updater, daemon=True, name="live_institutional_updater")
     updater_thread.start()
     while True:
@@ -7044,28 +7493,36 @@ def main_loop_sniper():
                 if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
                     time.sleep(1)
                     continue
-                if now - last_scan >= GLOBAL_SCAN_INTERVAL:
-                    cands = scan_market_rf(top_n=40)
-                    MEMORY["top_candidates"] = cands
-                    MEMORY["rf_watchlist"] = cands[:30]
-                    build_rf_dashboard()
-                    MEMORY["last_scan"] = now
-                    MEMORY["scanned_count"] = len(cands)
-                    log_execution(f"RF Scanner: {len(cands)} candidates", "INFO")
-                    last_scan = now
-                if now - last_scanner_v2 >= SCANNER_V2_INTERVAL:
-                    run_scanner_v2()
-                    last_scanner_v2 = now
-                if SNIPER_MODE:
-                    if now - last_radar_scan >= SCAN_INTERVAL:
-                        rebuild_radar_watchlist()
-                        last_radar_scan = now
-                    if now - last_radar_refresh >= WATCHLIST_REFRESH:
-                        refresh_radar_watchlist()
-                        last_radar_refresh = now
-                if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
+                if ENABLE_DISCOVERY_SCANNER:
+                    # No heavy global scans, just use watchlist
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
                         smart_opportunity_selection()
+                        last_candidate_scan = now
+                else:
+                    # Old behavior
+                    if now - last_scan >= GLOBAL_SCAN_INTERVAL:
+                        cands = scan_market_rf(top_n=40)
+                        MEMORY["top_candidates"] = cands
+                        MEMORY["rf_watchlist"] = cands[:30]
+                        build_rf_dashboard()
+                        MEMORY["last_scan"] = now
+                        MEMORY["scanned_count"] = len(cands)
+                        log_execution(f"RF Scanner: {len(cands)} candidates", "INFO")
+                        last_scan = now
+                    if now - last_scanner_v2 >= SCANNER_V2_INTERVAL:
+                        run_scanner_v2()
+                        last_scanner_v2 = now
+                    if SNIPER_MODE:
+                        if now - last_radar_scan >= SCAN_INTERVAL:
+                            rebuild_radar_watchlist()
+                            last_radar_scan = now
+                        if now - last_radar_refresh >= WATCHLIST_REFRESH:
+                            refresh_radar_watchlist()
+                            last_radar_refresh = now
+                if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
+                    # Always call radar_entry_scan which uses the watchlist
+                    if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
+                        radar_entry_scan()
                         last_candidate_scan = now
                     time.sleep(1)
                 else:
