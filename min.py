@@ -3,6 +3,7 @@
 # RF LIQUIDITY ENGINE v28 - CRITICAL FORENSIC FIX PACK + PIPELINE
 # [PRODUCTION READY] Enhanced Entry Intelligence + Fixed Trade Management
 # + Institutional Opportunity Pipeline (Watch → Waiting → Entry)
+# + Institutional Waiting List Dashboard Page
 # ====================================================================
 # FIXES APPLIED (2026-06-09):
 # 1. LIVE_SUPERVISOR as single source of truth - centralized state management
@@ -15,6 +16,7 @@
 # 8. Added forensic logs for trade management and order verification
 # 9. Preserved all existing strategy, RF, Scanner, Dashboard UI, Telegram
 # 10. Added Institutional Opportunity Pipeline (watch → waiting → entry)
+# 11. Added Institutional Waiting List Dashboard Page with full details
 # ====================================================================
 
 import os
@@ -6277,7 +6279,7 @@ def global_scan():
     PIPELINE["last_global_scan"] = time.time()
 
 def promote_to_waiting_list():
-    """Move high-score entries from watch list to waiting list."""
+    """Move high-score entries from watch list to waiting list with full details."""
     with PIPELINE["lock"]:
         now = time.time()
         promoted = 0
@@ -6285,13 +6287,60 @@ def promote_to_waiting_list():
             if entry.get("entered", False):
                 continue
             if entry["score"] >= PROMOTION_THRESHOLD:
-                # Check if already in waiting list
                 if key not in PIPELINE["waiting_list"]:
-                    # Copy entry
                     waiting_entry = entry.copy()
                     waiting_entry["promoted_at"] = now
                     waiting_entry["entry_ready"] = False
                     waiting_entry["entry_attempted"] = False
+                    # Compute additional fields
+                    score = waiting_entry["score"]
+                    waiting_entry["confidence"] = min(100, score * 10)
+                    # Grade
+                    if score >= 9:
+                        grade = "★★★★★"
+                    elif score >= 8:
+                        grade = "★★★★"
+                    elif score >= 7:
+                        grade = "★★★"
+                    elif score >= 6:
+                        grade = "★★"
+                    else:
+                        grade = "★"
+                    waiting_entry["grade"] = grade
+                    # Entry status (will be updated in analyze)
+                    waiting_entry["entry_status"] = "WATCH"
+                    # Additional flags from details
+                    details = waiting_entry.get("details", {})
+                    waiting_entry["strong_order_block"] = None
+                    if details.get("zone_strength", 0) > 6:
+                        if waiting_entry["side"] == "BUY":
+                            waiting_entry["strong_order_block"] = "Bullish OB"
+                        else:
+                            waiting_entry["strong_order_block"] = "Bearish OB"
+                    waiting_entry["fresh_zone"] = details.get("zone_strength", 0) > 5
+                    waiting_entry["liquidity_sweep"] = details.get("sweep", False)
+                    waiting_entry["liquidity_grab"] = details.get("sweep", False) and details.get("choch", False)
+                    waiting_entry["bos"] = details.get("choch", False)  # we treat choch as BOS/MSS
+                    waiting_entry["mss"] = details.get("choch", False)
+                    waiting_entry["choch"] = details.get("choch", False)
+                    waiting_entry["smart_money_alignment"] = details.get("smart_money", "") == "aligned"
+                    waiting_entry["institutional_volume"] = details.get("volume", "") in ("expansion", "spike")
+                    waiting_entry["trend_alignment"] = details.get("trend_strength", "") in ("strong", "moderate")
+                    waiting_entry["rf_alignment"] = details.get("rf", "") == "aligned"
+                    waiting_entry["support_resistance_strength"] = details.get("zone_strength", 0)
+                    # Distance to entry
+                    price = waiting_entry.get("price", 0)
+                    zone_price = waiting_entry.get("zone_price", None)
+                    if zone_price and price:
+                        dist = abs(price - zone_price) / price * 100
+                        waiting_entry["distance_to_entry"] = dist
+                    else:
+                        waiting_entry["distance_to_entry"] = None
+                    # Risk/Reward (placeholder)
+                    waiting_entry["explosion_probability"] = "Medium"
+                    # Last update
+                    waiting_entry["last_update"] = time.time()
+                    # Set status later in analyze_waiting_entry
                     PIPELINE["waiting_list"][key] = waiting_entry
                     promoted += 1
                     log_execution(f"[PIPELINE] Promoted {key} to waiting list (score={entry['score']:.1f})", "INFO")
@@ -6300,7 +6349,7 @@ def promote_to_waiting_list():
     PIPELINE["last_promotion"] = time.time()
 
 def analyze_waiting_entry(symbol, side):
-    """Detailed analysis of a waiting entry, update readiness."""
+    """Detailed analysis of a waiting entry, update readiness and status."""
     key = f"{symbol}_{side}"
     with PIPELINE["lock"]:
         entry = PIPELINE["waiting_list"].get(key)
@@ -6326,6 +6375,7 @@ def analyze_waiting_entry(symbol, side):
         if dist_pct > 0.003:
             entry["entry_ready"] = False
             entry["reason"] = "price outside zone"
+            entry["entry_status"] = "PREPARE"
             return
 
     # 2. Confirmation candle (rejection or displacement)
@@ -6334,6 +6384,7 @@ def analyze_waiting_entry(symbol, side):
     if not (rejection or displacement):
         entry["entry_ready"] = False
         entry["reason"] = "no confirmation candle"
+        entry["entry_status"] = "PREPARE"
         return
 
     # 3. RF alignment
@@ -6341,6 +6392,7 @@ def analyze_waiting_entry(symbol, side):
     if rf["signal"] != side or abs(rf["distance"]) > 0.003:
         entry["entry_ready"] = False
         entry["reason"] = "RF not aligned"
+        entry["entry_status"] = "ALMOST_READY"
         return
 
     # 4. Volume
@@ -6348,6 +6400,7 @@ def analyze_waiting_entry(symbol, side):
     if vol_state not in ("expansion", "spike"):
         entry["entry_ready"] = False
         entry["reason"] = "volume not expanding"
+        entry["entry_status"] = "ALMOST_READY"
         return
 
     # All conditions met
@@ -6356,6 +6409,7 @@ def analyze_waiting_entry(symbol, side):
     entry["atr"] = atr
     entry["zone_price"] = zone_price
     entry["reason"] = "ready"
+    entry["entry_status"] = "READY"
     entry["last_update"] = time.time()
     log_execution(f"[PIPELINE] {key} now ready for entry at {price:.4f}", "INFO")
 
@@ -6846,14 +6900,54 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="card">Errors<div id="errCount">0</div></div>
 <div class="card">Bot Status<div id="botStatus">-</div></div>
 </div></div>
-<div class="section smart-layer"><div class="title">🏛️ INSTITUTIONAL PIPELINE</div><div class="grid">
-<div class="card">Watch List<div id="pipeline_watch_count">0</div></div>
-<div class="card">Waiting List<div id="pipeline_waiting_count">0</div></div>
-<div class="card">Last Global Scan<div id="pipeline_last_scan">-</div></div>
-<div class="card">Promotion Threshold<div id="pipeline_threshold">{PROMOTION_THRESHOLD}</div></div>
+
+<!-- ========== NEW INSTITUTIONAL WAITING LIST SECTION ========== -->
+<div class="section smart-layer" style="border-top: 2px solid #9b59b6; margin-top: 20px;">
+    <div class="title" style="color: #9b59b6; font-size: 20px;">🟣 Institutional Waiting List</div>
+    <div class="grid" style="grid-template-columns: repeat(4,1fr); margin-bottom: 12px;">
+        <div class="card">Waiting Count<div id="wl_count">0</div></div>
+        <div class="card">Promotion Threshold<div id="wl_threshold">{PROMOTION_THRESHOLD}</div></div>
+        <div class="card">Last Promotion<div id="wl_last_promo">-</div></div>
+        <div class="card">Status<div id="wl_status">Monitoring</div></div>
+    </div>
+    <div id="waiting-list-table-container" style="max-height:600px; overflow:auto; background:#0f1724; border-radius:8px; padding:8px;">
+        <table id="waiting-list-table" style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead style="position:sticky; top:0; background:#1a2332; z-index:10;">
+                <tr>
+                    <th style="padding:6px; text-align:left;">Symbol</th>
+                    <th style="padding:6px; text-align:left;">Side</th>
+                    <th style="padding:6px; text-align:left;">Type</th>
+                    <th style="padding:6px; text-align:left;">Score</th>
+                    <th style="padding:6px; text-align:left;">Conf%</th>
+                    <th style="padding:6px; text-align:left;">Grade</th>
+                    <th style="padding:6px; text-align:left;">OB</th>
+                    <th style="padding:6px; text-align:left;">Fresh</th>
+                    <th style="padding:6px; text-align:left;">Sweep</th>
+                    <th style="padding:6px; text-align:left;">Grab</th>
+                    <th style="padding:6px; text-align:left;">BOS</th>
+                    <th style="padding:6px; text-align:left;">MSS</th>
+                    <th style="padding:6px; text-align:left;">CHoCH</th>
+                    <th style="padding:6px; text-align:left;">SM</th>
+                    <th style="padding:6px; text-align:left;">Vol</th>
+                    <th style="padding:6px; text-align:left;">Trend</th>
+                    <th style="padding:6px; text-align:left;">RF</th>
+                    <th style="padding:6px; text-align:left;">S/R Str</th>
+                    <th style="padding:6px; text-align:left;">Dist%</th>
+                    <th style="padding:6px; text-align:left;">R:R</th>
+                    <th style="padding:6px; text-align:left;">Explosion</th>
+                    <th style="padding:6px; text-align:left;">Status</th>
+                    <th style="padding:6px; text-align:left;">Reason</th>
+                    <th style="padding:6px; text-align:left;">Last Update</th>
+                </tr>
+            </thead>
+            <tbody id="waiting-list-body">
+                <!-- rows inserted by JS -->
+            </tbody>
+        </table>
+    </div>
 </div>
-<div id="pipeline_waiting_list" style="font-size:12px; margin-top:8px;"></div>
-</div>
+<!-- ========== END NEW SECTION ========== -->
+
 <script>
 let lastFetch = 0;
 let cachedData = null;
@@ -7048,6 +7142,68 @@ function updateUI(d) {{
         }}
         document.getElementById("pipeline_waiting_list").innerHTML = wlHtml || "No waiting candidates";
     }}
+
+    // ========== Update Waiting List Table ==========
+    if (d.waiting_list_detailed) {{
+        document.getElementById("wl_count").innerText = d.waiting_list_detailed.length;
+        document.getElementById("wl_last_promo").innerText = d.pipeline && d.pipeline.last_scan ? new Date(d.pipeline.last_scan*1000).toLocaleTimeString() : "-";
+        let tableBody = document.getElementById("waiting-list-body");
+        tableBody.innerHTML = "";
+        if (d.waiting_list_detailed.length === 0) {{
+            tableBody.innerHTML = "<tr><td colspan='24' style='text-align:center; padding:20px; color:#9ca3af;'>No candidates currently in Waiting List</td></tr>";
+        }} else {{
+            // Sort by status priority: READY first, then ALMOST_READY, PREPARE, WATCH, INVALID
+            const statusOrder = {{"READY":0, "ALMOST_READY":1, "PREPARE":2, "WATCH":3, "INVALID":4}};
+            d.waiting_list_detailed.sort((a,b) => (statusOrder[a.entry_status] || 99) - (statusOrder[b.entry_status] || 99));
+            for (let item of d.waiting_list_detailed) {{
+                let row = document.createElement("tr");
+                // Row color based on status
+                let bgColor = "";
+                let statusColor = "";
+                switch(item.entry_status) {{
+                    case "READY": bgColor = "rgba(0,255,0,0.15)"; statusColor = "#2ecc71"; break;
+                    case "ALMOST_READY": bgColor = "rgba(255,255,0,0.15)"; statusColor = "#f1c40f"; break;
+                    case "PREPARE": bgColor = "rgba(255,165,0,0.15)"; statusColor = "#e67e22"; break;
+                    case "WATCH": bgColor = "rgba(52,152,219,0.15)"; statusColor = "#3498db"; break;
+                    case "INVALID": bgColor = "rgba(255,0,0,0.15)"; statusColor = "#e74c3c"; break;
+                    default: bgColor = "transparent"; statusColor = "#95a5a6";
+                }}
+                row.style.backgroundColor = bgColor;
+                let sideIcon = item.side === "BUY" ? "🟢" : "🔴";
+                let gradeStars = item.grade || "★";
+                let statusText = `<span style="color:${{statusColor}}; font-weight:bold;">${{item.entry_status || 'WATCH'}}</span>`;
+                let reasonText = item.reason || (item.entry_ready ? "Ready" : "Awaiting conditions");
+                let lastUpdate = item.last_update ? new Date(item.last_update*1000).toLocaleTimeString() : "-";
+                row.innerHTML = `
+                    <td style="padding:4px;"><b>${{item.symbol}}</b></td>
+                    <td style="padding:4px;">${{sideIcon}} ${{item.side}}</td>
+                    <td style="padding:4px;">${{item.opportunity_type || 'NEUTRAL'}}</td>
+                    <td style="padding:4px;">${{item.score ? item.score.toFixed(1) : '-'}}</td>
+                    <td style="padding:4px;">${{item.confidence !== undefined ? item.confidence.toFixed(0) + '%' : '-'}}</td>
+                    <td style="padding:4px;">${{gradeStars}}</td>
+                    <td style="padding:4px;">${{item.strong_order_block || '-'}}</td>
+                    <td style="padding:4px;">${{item.fresh_zone ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.liquidity_sweep ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.liquidity_grab ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.bos ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.mss ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.choch ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.smart_money_alignment ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.institutional_volume ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.trend_alignment ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.rf_alignment ? '✅' : '❌'}}</td>
+                    <td style="padding:4px;">${{item.support_resistance_strength !== undefined ? item.support_resistance_strength.toFixed(1) : '-'}}</td>
+                    <td style="padding:4px;">${{item.distance_to_entry !== undefined && item.distance_to_entry !== null ? item.distance_to_entry.toFixed(2) + '%' : '-'}}</td>
+                    <td style="padding:4px;">-</td>
+                    <td style="padding:4px;">${{item.explosion_probability || '-'}}</td>
+                    <td style="padding:4px;">${{statusText}}</td>
+                    <td style="padding:4px; font-size:11px;">${{reasonText}}</td>
+                    <td style="padding:4px; font-size:11px;">${{lastUpdate}}</td>
+                `;
+                tableBody.appendChild(row);
+            }}
+        }}
+    }}
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
 async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
@@ -7213,6 +7369,40 @@ def data():
                     } for key, entry in PIPELINE["waiting_list"].items()
                 }
             }
+            # Detailed waiting list for the new table
+            waiting_list_detailed = []
+            for key, entry in PIPELINE["waiting_list"].items():
+                # Ensure all fields exist
+                details = entry.get("details", {})
+                waiting_list_detailed.append({
+                    "symbol": entry["symbol"],
+                    "side": entry["side"],
+                    "opportunity_type": entry.get("opportunity_type", "NEUTRAL"),
+                    "score": entry["score"],
+                    "confidence": entry.get("confidence", entry["score"]*10),
+                    "grade": entry.get("grade", "★"),
+                    "strong_order_block": entry.get("strong_order_block", None),
+                    "fresh_zone": entry.get("fresh_zone", False),
+                    "liquidity_sweep": entry.get("liquidity_sweep", False),
+                    "liquidity_grab": entry.get("liquidity_grab", False),
+                    "bos": entry.get("bos", False),
+                    "mss": entry.get("mss", False),
+                    "choch": entry.get("choch", False),
+                    "smart_money_alignment": entry.get("smart_money_alignment", False),
+                    "institutional_volume": entry.get("institutional_volume", False),
+                    "trend_alignment": entry.get("trend_alignment", False),
+                    "rf_alignment": entry.get("rf_alignment", False),
+                    "support_resistance_strength": entry.get("support_resistance_strength", 0),
+                    "distance_to_entry": entry.get("distance_to_entry", None),
+                    "explosion_probability": entry.get("explosion_probability", "Medium"),
+                    "entry_status": entry.get("entry_status", "WATCH"),
+                    "reason": entry.get("reason", "Awaiting conditions"),
+                    "last_update": entry.get("last_update", time.time()),
+                    "entry_ready": entry.get("entry_ready", False),
+                    "price": entry.get("price", 0),
+                    "zone_price": entry.get("zone_price", 0),
+                    "atr": entry.get("atr", 0)
+                })
 
         payload = {
             "balance": bal,
@@ -7251,6 +7441,7 @@ def data():
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "pipeline": pipeline_stats,
+            "waiting_list_detailed": waiting_list_detailed,  # new
             **live_data
         }
         safe_payload = safe_json(payload)
