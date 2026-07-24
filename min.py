@@ -7333,19 +7333,19 @@ function updateUI(d) {{
             else if (c.state === "INVALIDATED" || c.state === "RETURNED_WATCHLIST") stateColor = "#95a5a6";
             else stateColor = "#ecf0f1";
             tr.innerHTML = `
-                <td><b>${c.symbol}</b></td>
-                <td style="color:${c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}">${c.side}</td>
-                <td style="font-weight:bold; color:${c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}">${c.zone_score.toFixed(1)}</td>
-                <td>${c.ob_score.toFixed(0)}</td>
-                <td>${c.zone_strength.toFixed(0)}</td>
-                <td>${c.liquidity.toFixed(0)}</td>
-                <td>${c.institutional.toFixed(0)}</td>
-                <td>${c.structure.toFixed(0)}</td>
-                <td>${c.timing.toFixed(0)}</td>
-                <td>${c.trend.toFixed(0)}</td>
-                <td>${c.risk.toFixed(0)}</td>
-                <td style="font-size:10px;">${c.opportunity_type}</td>
-                <td style="color:${stateColor}; font-weight:bold;">${c.state}</td>
+                <td><b>${{c.symbol}}</b></td>
+                <td style="color:${{c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}}">${{c.side}}</td>
+                <td style="font-weight:bold; color:${{c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}}">${{c.zone_score.toFixed(1)}}</td>
+                <td>${{c.ob_score.toFixed(0)}}</td>
+                <td>${{c.zone_strength.toFixed(0)}}</td>
+                <td>${{c.liquidity.toFixed(0)}}</td>
+                <td>${{c.institutional.toFixed(0)}}</td>
+                <td>${{c.structure.toFixed(0)}}</td>
+                <td>${{c.timing.toFixed(0)}}</td>
+                <td>${{c.trend.toFixed(0)}}</td>
+                <td>${{c.risk.toFixed(0)}}</td>
+                <td style="font-size:10px;">${{c.opportunity_type}}</td>
+                <td style="color:${{stateColor}}; font-weight:bold;">${{c.state}}</td>
             `;
             body.appendChild(tr);
         }});
