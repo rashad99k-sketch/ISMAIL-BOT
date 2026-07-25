@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ====================================================================
 # RF LIQUIDITY ENGINE v28 - PRODUCTION (FIXED & STABLE)
-# [RESTORED DASHBOARD + WAITING LIST INTEGRATED + INSTITUTIONAL THESIS]
+# [RESTORED DASHBOARD + WAITING LIST INTEGRATED]
 # ====================================================================
 # تم إصلاح:
 # - استعادة لوحة التحكم الأصلية مع إضافة Waiting List.
@@ -10,8 +10,6 @@
 # - إصلاح NameError و KeyError في update_waiting_list.
 # - دمج Waiting List كطبقة فوق المنطق الحالي.
 # - التحقق من عدم وجود تضارب في منظومة الإدارة والأرباح.
-# - إضافة Institutional Thesis مع شرح أسباب القرار.
-# - إضافة تفسير كل درجة وكل تغيير في Trigger.
 # ====================================================================
 
 import os
@@ -478,7 +476,7 @@ def send_once(msg, key, cooldown=60):
         _tg_send(msg)
 
 def tg_start(balance, mode):
-    send_once(f"🚀 <b>RF v28 Professional Edition (FIXED + WAITING LIST + THESIS)</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nEntry Engine: ADX flexible + Sweep + MSS required for reversals", "startup", 86400)
+    send_once(f"🚀 <b>RF v28 Professional Edition (FIXED + WAITING LIST)</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nEntry Engine: ADX flexible + Sweep + MSS required for reversals", "startup", 86400)
 
 def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
     side_emoji = "🟢" if side == "BUY" else "🔴"
@@ -3305,6 +3303,9 @@ def decision_engine(scenario, rf_signal, adx):
         return "STRONG"
     return "SKIP"
 
+# ========== REMOVED LEGACY FUNCTIONS (not used) ==========
+# manage_take_profit, council_exit, trailing_stop_new have been removed.
+
 # ========== REMAINING LEGACY FUNCTIONS ==========
 def detect_liquidity_context(df, lookback=10):
     sweeps = []
@@ -4226,8 +4227,9 @@ def smart_scanner_v2():
     sell_sorted = sorted(sell_candidates, key=lambda x: x["score"], reverse=True)[:10]
     return buy_sorted, sell_sorted
 
-# ========== FIXED: run_scanner_v2 ==========
+# ========== FIXED: run_scanner_v2 (added missing function) ==========
 def run_scanner_v2():
+    """Run smart_scanner_v2 and store results in MEMORY."""
     buy, sell = smart_scanner_v2()
     MEMORY["scanner_v2_buy"] = buy
     MEMORY["scanner_v2_sell"] = sell
@@ -4374,124 +4376,18 @@ def get_smart_zones(symbol, df, ob):
     zones["sell_zones"].sort(key=lambda x: x["strength"], reverse=True)
     return zones
 
-# ========== WAITING LIST INTEGRATION WITH THESIS ==========
+# ========== WAITING LIST INTEGRATION ==========
 WAITING_LIST_MAX = 70
 WATCHLIST_SIZE = 8
 WAITING_TTL = 86400
 INVALIDATED_TTL = 1800
 
-# ========== دالة توليد النص التفسيري المؤسسي ==========
-def generate_institutional_thesis(symbol, side, narrative, opp_type, smart_money=None, momentum=None, zone_price=None, market_state=None):
-    """
-    توليد نص تفسيري مؤسسي للمرشح.
-    يعيد قاموساً يحتوي على:
-    - thesis_text: نص كامل مع نقاط
-    - drivers: قائمة النقاط
-    - summary: ملخص قصير
-    """
-    bullet_points = []
-    if side == "BUY":
-        thesis_type = "Bullish"
-    else:
-        thesis_type = "Bearish"
-    classification = narrative.get("classification", "")
-    if "REVERSAL" in classification:
-        thesis_type += " Reversal"
-    elif "TREND_CONTINUATION" in classification:
-        thesis_type += " Continuation"
-    else:
-        thesis_type += " Setup"
-
-    # بناء النقاط بناءً على البيانات المتاحة
-    if side == "BUY":
-        if narrative.get("sweep", False):
-            bullet_points.append("Liquidity sweep below recent lows completed")
-        if narrative.get("choch_bos", False):
-            bullet_points.append("CHoCH/BOS confirmed")
-        if narrative.get("retest", False):
-            bullet_points.append("Price retesting key support zone")
-        if narrative.get("rejection", False):
-            bullet_points.append("Bullish rejection candle formed")
-        if narrative.get("displacement", False):
-            bullet_points.append("Bullish displacement detected")
-        if narrative.get("volume_confirmation", False):
-            bullet_points.append("Volume expansion confirming buying pressure")
-        if narrative.get("rf_alignment", False):
-            bullet_points.append("RF aligned with bullish direction")
-        if smart_money:
-            if smart_money.get("smart_money_dominant", False):
-                bullet_points.append("Smart money accumulation detected")
-            if smart_money.get("institutional_bias") == "BUY":
-                bullet_points.append("Institutional bias: BUY")
-        if momentum:
-            if momentum.get("trend_expansion", False):
-                bullet_points.append("Momentum expanding in bullish direction")
-        if zone_price:
-            bullet_points.append(f"Key zone: {zone_price:.4f}")
-    else:  # SELL
-        if narrative.get("sweep", False):
-            bullet_points.append("Liquidity sweep above recent highs completed")
-        if narrative.get("choch_bos", False):
-            bullet_points.append("CHoCH/BOS confirmed")
-        if narrative.get("retest", False):
-            bullet_points.append("Price retesting key resistance zone")
-        if narrative.get("rejection", False):
-            bullet_points.append("Bearish rejection candle formed")
-        if narrative.get("displacement", False):
-            bullet_points.append("Bearish displacement detected")
-        if narrative.get("volume_confirmation", False):
-            bullet_points.append("Volume expansion confirming selling pressure")
-        if narrative.get("rf_alignment", False):
-            bullet_points.append("RF aligned with bearish direction")
-        if smart_money:
-            if smart_money.get("smart_money_dominant", False):
-                bullet_points.append("Smart money distribution detected")
-            if smart_money.get("institutional_bias") == "SELL":
-                bullet_points.append("Institutional bias: SELL")
-        if momentum:
-            if momentum.get("trend_expansion", False):
-                bullet_points.append("Momentum expanding in bearish direction")
-        if zone_price:
-            bullet_points.append(f"Key zone: {zone_price:.4f}")
-
-    # إضافة نقاط إضافية من narrative reasons إذا وجدت
-    for reason in narrative.get("reasons", [])[:3]:
-        if reason not in bullet_points:
-            bullet_points.append(reason)
-
-    summary = f"{thesis_type}: {opp_type}"
-    if classification:
-        summary += f" ({classification})"
-    thesis_text = summary + "\n- " + "\n- ".join(bullet_points) if bullet_points else summary
-
-    return {
-        "thesis_text": thesis_text,
-        "drivers": bullet_points,
-        "summary": summary
-    }
-
-# ========== تعديل دوال Waiting List ==========
 def create_waiting_entry(symbol, side, data):
     now = time.time()
-    narrative = data.get("narrative", {})
-    opp_type = data.get("opportunity_type", "UNKNOWN")
-    smart_money = data.get("smart_money", {})
-    momentum = data.get("momentum", {})
-    zone_price = data.get("key_levels", {}).get("zone_price", None)
-
-    thesis_data = generate_institutional_thesis(
-        symbol, side,
-        narrative=narrative,
-        opp_type=opp_type,
-        smart_money=smart_money,
-        momentum=momentum,
-        zone_price=zone_price
-    )
-
     entry = {
         "symbol": symbol,
         "side": side,
-        "opportunity_type": opp_type,
+        "opportunity_type": data.get("opportunity_type", "TREND_CONTINUATION"),
         "current_stage": "DISCOVERED",
         "score": data.get("score", 0.0),
         "priority": 3,
@@ -4500,7 +4396,7 @@ def create_waiting_entry(symbol, side, data):
         "metadata": data.get("metadata", {}),
         "thesis": {
             "summary": data.get("thesis_summary", "Institutional setup detected"),
-            "narrative": narrative,
+            "narrative": data.get("narrative", {}),
             "key_levels": data.get("key_levels", {}),
             "required_events": data.get("required_events", []),
             "missing_conditions": data.get("missing_conditions", []),
@@ -4513,16 +4409,11 @@ def create_waiting_entry(symbol, side, data):
                 "trail_mult": 1.5,
                 "hold_score": 10,
                 "profile_type": "STANDARD"
-            }),
-            "smart_money": smart_money,
-            "momentum": momentum
+            })
         },
         "history": [
             {"time": now, "from": "CREATED", "to": "DISCOVERED", "reason": "Entry created"}
-        ],
-        "thesis_text": thesis_data["thesis_text"],
-        "thesis_drivers": thesis_data["drivers"],
-        "thesis_summary": thesis_data["summary"]
+        ]
     }
     return entry
 
@@ -4537,13 +4428,13 @@ def update_waiting_entry(entry, df, ob, atr, price):
     missing, next_event = evaluate_missing_conditions(entry, df, ob, atr, price)
     entry["thesis"]["missing_conditions"] = missing
     entry["thesis"]["next_expected_event"] = next_event
-    new_stage, reason = determine_stage(entry)
+    new_stage = determine_stage(entry)
     if new_stage != entry["current_stage"]:
         entry["history"].append({
             "time": now,
             "from": entry["current_stage"],
             "to": new_stage,
-            "reason": reason
+            "reason": f"Thesis health {health:.1f}, missing {len(missing)} conditions"
         })
         entry["current_stage"] = new_stage
     entry["priority"] = compute_priority(entry)
@@ -4553,99 +4444,7 @@ def update_waiting_entry(entry, df, ob, atr, price):
     entry["metadata"]["atr"] = atr
     entry["metadata"]["price"] = price
     entry["metadata"]["volume_ratio"] = df['volume'].iloc[-1] / df['volume'].iloc[-10:-1].mean() if df is not None and len(df) > 10 else 1.0
-
-    # تحديث النص التفسيري بناءً على المعطيات الجديدة
-    thesis_data = generate_institutional_thesis(
-        entry["symbol"], side,
-        narrative=entry["thesis"].get("narrative", {}),
-        opp_type=entry.get("opportunity_type", "UNKNOWN"),
-        smart_money=entry["thesis"].get("smart_money", {}),
-        momentum=entry["thesis"].get("momentum", {}),
-        zone_price=entry["thesis"].get("key_levels", {}).get("zone_price", None)
-    )
-    entry["thesis_text"] = thesis_data["thesis_text"]
-    entry["thesis_drivers"] = thesis_data["drivers"]
-    entry["thesis_summary"] = thesis_data["summary"]
     return entry
-
-def determine_stage(entry):
-    health = entry["thesis"]["thesis_health"]
-    missing = entry["thesis"]["missing_conditions"]
-    prob = entry["thesis"]["execution_probability"]
-    stage = entry["current_stage"]
-    if health < 30:
-        return "INVALIDATED", "Health below 30%"
-    if stage == "INVALIDATED":
-        if time.time() - entry["last_analysis"] > INVALIDATED_TTL:
-            return "ARCHIVED", "Invalidated and TTL expired"
-        if health > 50:
-            return "WAITING", "Health recovered above 50"
-        return "INVALIDATED", "Still invalidated"
-    if stage == "ARCHIVED":
-        return "ARCHIVED", "Archived"
-    if stage in ("EXECUTED", "CLOSED"):
-        return stage, "Already executed or closed"
-    if health >= 85 and len(missing) == 0 and prob >= 80:
-        return "READY", "All conditions met, ready for execution"
-    elif health >= 70 and len(missing) <= 1 and prob >= 60:
-        return "ALMOST_READY", f"One condition missing: {missing[0] if missing else 'volume/ADX'}"
-    elif health >= 50:
-        return "WAITING", f"Waiting for: {', '.join(missing[:2]) if missing else 'improvement'}"
-    elif health >= 30:
-        return "ANALYZING", "Health below 50, monitoring"
-    else:
-        return "INVALIDATED", "Health below 30, invalidated"
-
-def evaluate_missing_conditions(entry, df, ob, atr, price):
-    side = entry["side"]
-    missing = []
-    next_event = ""
-    key_levels = entry["thesis"]["key_levels"]
-    zone_price = key_levels.get("zone_price", None)
-    if zone_price:
-        dist_pct = abs(price - zone_price) / price
-        if dist_pct > 0.003:
-            missing.append(f"Price not at zone (dist {dist_pct*100:.2f}%)")
-            next_event = f"Wait for price to retest {zone_price:.4f}"
-        else:
-            next_event = "Zone reached, waiting for confirmation"
-    else:
-        missing.append("No key zone identified")
-        next_event = "Identify key zone"
-    vol_ratio = entry["metadata"].get("volume_ratio", 1.0)
-    if vol_ratio < 1.2:
-        missing.append(f"Volume below threshold (ratio {vol_ratio:.2f})")
-        if not next_event:
-            next_event = "Wait for volume expansion"
-    adx = compute_adx(df).iloc[-1] if df is not None else 0
-    if adx < 20:
-        missing.append(f"ADX too low ({adx:.1f})")
-        if not next_event:
-            next_event = "Wait for ADX to rise above 20"
-    plus_di, minus_di, _, _ = get_di_components(df)
-    if plus_di is not None and minus_di is not None:
-        di_spread = abs(plus_di - minus_di)
-        if side == "BUY" and plus_di <= minus_di:
-            missing.append("DI not bullish (DI- > DI+)")
-            if not next_event:
-                next_event = "Wait for DI+ to cross above DI-"
-        elif side == "SELL" and minus_di <= plus_di:
-            missing.append("DI not bearish (DI+ > DI-)")
-            if not next_event:
-                next_event = "Wait for DI- to cross above DI+"
-    bos_up, bos_down = detect_bos(df)
-    struct_shift = detect_structure_shift(df)
-    if side == "BUY" and not (bos_up or struct_shift == "bullish_shift"):
-        missing.append("No bullish BOS/CHoCH")
-        if not next_event:
-            next_event = "Wait for bullish structure break"
-    elif side == "SELL" and not (bos_down or struct_shift == "bearish_shift"):
-        missing.append("No bearish BOS/CHoCH")
-        if not next_event:
-            next_event = "Wait for bearish structure break"
-    if not missing:
-        next_event = "Ready for execution"
-    return missing, next_event
 
 def compute_thesis_health(entry, df, ob, atr, price):
     score = 0.0
@@ -4734,6 +4533,85 @@ def compute_execution_probability(entry, df, ob, atr, price):
         prob -= 30
     return max(0, min(100, prob))
 
+def evaluate_missing_conditions(entry, df, ob, atr, price):
+    side = entry["side"]
+    missing = []
+    next_event = ""
+    key_levels = entry["thesis"]["key_levels"]
+    zone_price = key_levels.get("zone_price", None)
+    if zone_price:
+        dist_pct = abs(price - zone_price) / price
+        if dist_pct > 0.003:
+            missing.append(f"Price not at zone (dist {dist_pct*100:.2f}%)")
+            next_event = f"Wait for price to retest {zone_price:.4f}"
+        else:
+            next_event = "Zone reached, waiting for confirmation"
+    else:
+        missing.append("No key zone identified")
+        next_event = "Identify key zone"
+    vol_ratio = entry["metadata"].get("volume_ratio", 1.0)
+    if vol_ratio < 1.2:
+        missing.append(f"Volume below threshold (ratio {vol_ratio:.2f})")
+        if not next_event:
+            next_event = "Wait for volume expansion"
+    adx = compute_adx(df).iloc[-1] if df is not None else 0
+    if adx < 20:
+        missing.append(f"ADX too low ({adx:.1f})")
+        if not next_event:
+            next_event = "Wait for ADX to rise above 20"
+    plus_di, minus_di, _, _ = get_di_components(df)
+    if plus_di is not None and minus_di is not None:
+        di_spread = abs(plus_di - minus_di)
+        if side == "BUY" and plus_di <= minus_di:
+            missing.append("DI not bullish (DI- > DI+)")
+            if not next_event:
+                next_event = "Wait for DI+ to cross above DI-"
+        elif side == "SELL" and minus_di <= plus_di:
+            missing.append("DI not bearish (DI+ > DI-)")
+            if not next_event:
+                next_event = "Wait for DI- to cross above DI+"
+    bos_up, bos_down = detect_bos(df)
+    struct_shift = detect_structure_shift(df)
+    if side == "BUY" and not (bos_up or struct_shift == "bullish_shift"):
+        missing.append("No bullish BOS/CHoCH")
+        if not next_event:
+            next_event = "Wait for bullish structure break"
+    elif side == "SELL" and not (bos_down or struct_shift == "bearish_shift"):
+        missing.append("No bearish BOS/CHoCH")
+        if not next_event:
+            next_event = "Wait for bearish structure break"
+    if not missing:
+        next_event = "Ready for execution"
+    return missing, next_event
+
+def determine_stage(entry):
+    health = entry["thesis"]["thesis_health"]
+    missing = entry["thesis"]["missing_conditions"]
+    prob = entry["thesis"]["execution_probability"]
+    stage = entry["current_stage"]
+    if health < 30:
+        return "INVALIDATED"
+    if stage == "INVALIDATED":
+        if time.time() - entry["last_analysis"] > INVALIDATED_TTL:
+            return "ARCHIVED"
+        if health > 50:
+            return "WAITING"
+        return "INVALIDATED"
+    if stage == "ARCHIVED":
+        return "ARCHIVED"
+    if stage in ("EXECUTED", "CLOSED"):
+        return stage
+    if health >= 85 and len(missing) == 0 and prob >= 80:
+        return "READY"
+    elif health >= 70 and len(missing) <= 1 and prob >= 60:
+        return "ALMOST_READY"
+    elif health >= 50:
+        return "WAITING"
+    elif health >= 30:
+        return "ANALYZING"
+    else:
+        return "INVALIDATED"
+
 def update_waiting_list():
     now = time.time()
     candidates = []
@@ -4810,12 +4688,7 @@ def update_waiting_list():
             ob = get_orderbook_cached(sym, 10)
             atr = compute_atr(df).iloc[-1]
             price = df['close'].iloc[-1]
-
-            # حساب narrative و smart_money و momentum
             narrative = classify_market_narrative(df, ob, atr, side, side)
-            smart_money = SmartMoneyEngine.analyze_smart_money(df)
-            momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-
             opp_type = "TREND_CONTINUATION"
             pools = build_liquidity_pools(df)
             swept_h, swept_l = detect_sweep(df, pools)
@@ -4856,9 +4729,7 @@ def update_waiting_list():
                 "required_events": required_events,
                 "missing_conditions": ["Initial analysis pending"],
                 "next_expected_event": "Analyzing conditions",
-                "management_profile": mgmt_profile,
-                "smart_money": smart_money,
-                "momentum": momentum
+                "management_profile": mgmt_profile
             }
             entry = create_waiting_entry(sym, side, data)
             update_waiting_entry(entry, df, ob, atr, price)
@@ -4944,6 +4815,676 @@ def rotate_watchlist():
             log_execution(f"[WATCHLIST] Removed {sym} due to rotation", "INFO")
     MEMORY["watchlist"] = new_watchlist
 
+# ========== NARRATIVE + CONTEXT ENGINE v1 ==========
+def get_di_components(df, period=14):
+    if df is None or len(df) < period*2:
+        return None, None, None, 0.0
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = rma(tr, period)
+    atr = atr.clip(lower=1e-9)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+    plus_di = 100 * rma(plus_dm, period) / (atr + 1e-9)
+    minus_di = 100 * rma(minus_dm, period) / (atr + 1e-9)
+    adx_series = compute_adx(df, period)
+    adx_current = adx_series.iloc[-1] if len(adx_series) > 0 else 20.0
+    adx_prev = adx_series.iloc[-2] if len(adx_series) > 1 else adx_current
+    adx_slope = adx_current - adx_prev
+    return plus_di.iloc[-1], minus_di.iloc[-1], adx_current, adx_slope
+
+def get_vwap_narrative(df):
+    vwap = compute_vwap(df)
+    price = df['close'].iloc[-1]
+    vwap_last = vwap.iloc[-1]
+    vwap_prev = vwap.iloc[-2] if len(vwap) > 1 else vwap_last
+    distance = (price - vwap_last) / vwap_last if vwap_last != 0 else 0.0
+    above = price > vwap_last
+    below = price < vwap_last
+    prev_above = df['close'].iloc[-2] > vwap_prev if len(df) > 1 else above
+    reclaim = (not prev_above) and above
+    reject = prev_above and (not above)
+    return {
+        "vwap": vwap_last,
+        "distance": distance,
+        "above": above,
+        "below": below,
+        "reclaim": reclaim,
+        "reject": reject,
+        "slope": vwap_last - vwap_prev
+    }
+
+def compute_enhanced_zone_strength(df, level, zone_type, atr, ob, sweep_detected=False):
+    price = df['close'].iloc[-1]
+    touches = 0
+    rejection_count = 0
+    volume_at_touches = []
+    for i in range(max(0, len(df)-60), len(df)):
+        candle_high = df['high'].iloc[i]
+        candle_low = df['low'].iloc[i]
+        if zone_type == "support":
+            if abs(candle_low - level) < atr * 0.5:
+                touches += 1
+                if i < len(df)-1:
+                    next_close = df['close'].iloc[i+1]
+                    if next_close > df['close'].iloc[i]:
+                        rejection_count += 1
+                        volume_at_touches.append(df['volume'].iloc[i])
+        else:
+            if abs(candle_high - level) < atr * 0.5:
+                touches += 1
+                if i < len(df)-1:
+                    next_close = df['close'].iloc[i+1]
+                    if next_close < df['close'].iloc[i]:
+                        rejection_count += 1
+                        volume_at_touches.append(df['volume'].iloc[i])
+    vol_score = 0.0
+    if volume_at_touches:
+        avg_vol_touch = sum(volume_at_touches) / len(volume_at_touches)
+        avg_vol_overall = df['volume'].iloc[-60:].mean()
+        if avg_vol_overall > 0:
+            vol_score = min(3.0, avg_vol_touch / avg_vol_overall)
+    strength = touches * 1.5 + rejection_count * 2.0 + vol_score
+    if sweep_detected:
+        strength += 2.0
+    last = df.iloc[-1]
+    body, range_, upper_wick, lower_wick = candle_metrics(last)
+    if zone_type == "support" and lower_wick > body * 1.5 and abs(last['low'] - level) < atr:
+        strength += 2.0
+    elif zone_type == "resistance" and upper_wick > body * 1.5 and abs(last['high'] - level) < atr:
+        strength += 2.0
+    return min(10.0, strength)
+
+def classify_market_narrative(df, ob, atr, side, rf_signal):
+    reasons = []
+    score = 0.0
+    plus_di, minus_di, adx, adx_slope = get_di_components(df)
+    if plus_di is not None:
+        if side == "BUY" and plus_di > minus_di:
+            score += 2.0
+            reasons.append("DI+ dominance")
+        elif side == "SELL" and minus_di > plus_di:
+            score += 2.0
+            reasons.append("DI- dominance")
+        elif abs(plus_di - minus_di) < 5:
+            reasons.append("DI tangled")
+    if adx_slope > 1.5:
+        score += 1.5
+        reasons.append(f"ADX rising ({adx_slope:.1f})")
+    elif adx_slope < -1.5:
+        score -= 1.0
+        reasons.append("ADX falling")
+    vwap_n = get_vwap_narrative(df)
+    if side == "BUY":
+        if vwap_n["above"]:
+            score += 1.5
+            reasons.append("VWAP above")
+        elif vwap_n["reclaim"]:
+            score += 2.0
+            reasons.append("VWAP reclaim")
+    else:
+        if vwap_n["below"]:
+            score += 1.5
+            reasons.append("VWAP below")
+        elif vwap_n["reject"]:
+            score += 2.0
+            reasons.append("VWAP reject")
+    pools = build_liquidity_pools(df)
+    swept_h, swept_l = detect_sweep(df, pools)
+    sweep_detected = (side == "BUY" and swept_l) or (side == "SELL" and swept_h)
+    if sweep_detected:
+        score += 2.5
+        reasons.append("Liquidity sweep")
+    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
+    zone_strength = 0.0
+    if side == "BUY" and supports:
+        nearest_sup = max([s for s in supports if s <= df['close'].iloc[-1]], default=None)
+        if nearest_sup:
+            zone_strength = compute_enhanced_zone_strength(df, nearest_sup, "support", atr, ob, sweep_detected)
+            score += zone_strength * 0.5
+            reasons.append(f"Zone strength {zone_strength:.1f}")
+    elif side == "SELL" and resistances:
+        nearest_res = min([r for r in resistances if r >= df['close'].iloc[-1]], default=None)
+        if nearest_res:
+            zone_strength = compute_enhanced_zone_strength(df, nearest_res, "resistance", atr, ob, sweep_detected)
+            score += zone_strength * 0.5
+            reasons.append(f"Zone strength {zone_strength:.1f}")
+    bos_up, bos_down = detect_bos(df)
+    struct_shift = detect_structure_shift(df)
+    if (side == "BUY" and (bos_up or struct_shift == "bullish_shift")):
+        score += 2.0
+        reasons.append("Bullish structure")
+    elif (side == "SELL" and (bos_down or struct_shift == "bearish_shift")):
+        score += 2.0
+        reasons.append("Bearish structure")
+    vol_state = classify_volume(df)
+    if vol_state in ("expansion", "spike"):
+        score += 1.5
+        reasons.append("Volume expansion")
+    elif vol_state == "exhaustion":
+        score -= 1.0
+        reasons.append("Volume exhaustion")
+    if candle_rejection(df, side):
+        score += 1.5
+        reasons.append("Rejection candle")
+    if detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False):
+        score += 1.5
+        reasons.append("Displacement")
+    if rf_signal == side:
+        score += 1.5
+        reasons.append("RF aligned")
+    if adx is not None and adx < 18 and plus_di is not None and abs(plus_di - minus_di) < 6:
+        score = 0
+        reasons = ["CHOP market (ADX<18 + DI tangled)"]
+    if score >= 9.0:
+        classification = "REVERSAL_SNIPER" if (sweep_detected or zone_strength > 5) else "TREND_CONTINUATION"
+        confidence = "HIGH"
+    elif score >= 7.0:
+        classification = "TREND_CONTINUATION" if (bos_up or bos_down or struct_shift) else "ACCUMULATION_LONG" if side == "BUY" else "DISTRIBUTION_SHORT"
+        confidence = "MEDIUM"
+    elif score >= 5.0:
+        classification = "FAKE_BREAKOUT" if not sweep_detected else "LOW_CONFIDENCE"
+        confidence = "LOW"
+    else:
+        classification = "CHOP_NO_TRADE"
+        confidence = "NO_TRADE"
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "narrative_score": round(score, 2),
+        "reasons": reasons,
+        "sweep": sweep_detected,
+        "zone_strength": zone_strength,
+        "di_dominance": ("BUY" if plus_di > minus_di else "SELL") if plus_di is not None else "NEUTRAL",
+        "adx_slope": adx_slope,
+        "vwap_reclaim": vwap_n["reclaim"],
+        "vwap_reject": vwap_n["reject"]
+    }
+
+def detect_market_regime(df):
+    if len(df) < 50:
+        return "RANGE"
+    try:
+        adx = compute_adx(df).iloc[-1]
+        plus_di, minus_di, _, _ = get_di_components(df)
+        vwap_n = get_vwap_narrative(df)
+        atr = compute_atr(df).iloc[-1]
+        atr_avg = compute_atr(df).rolling(20).mean().iloc[-1] if len(compute_atr(df))>=20 else atr
+        atr_ratio = atr / atr_avg if atr_avg else 1.0
+        ema20 = ema(df['close'], 20).iloc[-1]
+        ema50 = ema(df['close'], 50).iloc[-1] if len(df)>=50 else ema20
+        price = df['close'].iloc[-1]
+        di_delta = abs(plus_di - minus_di)
+        if adx < 18 and di_delta < 6:
+            return "CHOP"
+        if adx > 20 and di_delta > 5:
+            struct = detect_structure_shift(df)
+            bullish_aligned = plus_di > minus_di and ema20 > ema50 and price > ema20
+            bearish_aligned = minus_di > plus_di and ema20 < ema50 and price < ema20
+            if bullish_aligned or bearish_aligned:
+                return "TREND"
+            if struct == "bullish_shift" and plus_di > minus_di:
+                return "TREND"
+            if struct == "bearish_shift" and minus_di > plus_di:
+                return "TREND"
+        if adx > 20 and atr_ratio > 1.4:
+            return "EXPANSION"
+        if atr_ratio < 0.7 and adx < 25:
+            return "COMPRESSION"
+        return "RANGE"
+    except:
+        return "RANGE"
+
+def get_trend_direction(df):
+    try:
+        plus_di, minus_di, _, _ = get_di_components(df)
+        ema20 = ema(df['close'], 20).iloc[-1]
+        ema50 = ema(df['close'], 50).iloc[-1] if len(df)>=50 else ema20
+        price = df['close'].iloc[-1]
+        struct = detect_structure_shift(df)
+        if (plus_di > minus_di and ema20 > ema50 and price > ema20) or struct == "bullish_shift":
+            return "BULLISH"
+        elif (minus_di > plus_di and ema20 < ema50 and price < ema20) or struct == "bearish_shift":
+            return "BEARISH"
+        return "NEUTRAL"
+    except:
+        return "NEUTRAL"
+
+def adjust_narrative_confidence(narrative, regime, side, trend_direction):
+    orig_conf = narrative["confidence"]
+    score = narrative["narrative_score"]
+    side_aligned = False
+    if (trend_direction == "BULLISH" and side == "BUY") or (trend_direction == "BEARISH" and side == "SELL"):
+        side_aligned = True
+    final_conf = orig_conf
+    final_class = narrative["classification"]
+    if regime == "CHOP":
+        return "NO_TRADE", "CHOP_NO_TRADE"
+    if orig_conf == "NO_TRADE" or score < 5.0:
+        return "NO_TRADE", "CHOP_NO_TRADE"
+    if regime == "TREND":
+        if side_aligned:
+            if orig_conf == "HIGH":
+                final_conf = "HIGH"
+                final_class = "SNIPER"
+            elif orig_conf == "MEDIUM":
+                final_conf = "MEDIUM"
+                final_class = "TREND"
+            elif orig_conf == "LOW":
+                if score >= 5.0:
+                    final_conf = "MEDIUM"
+                    final_class = "TREND"
+                else:
+                    final_conf = "NO_TRADE"
+                    final_class = "NO_TRADE"
+        else:
+            if orig_conf == "HIGH":
+                final_conf = "HIGH"
+                final_class = "SNIPER"
+            else:
+                final_conf = "NO_TRADE"
+                final_class = "NO_TRADE"
+    elif regime in ("EXPANSION", "COMPRESSION"):
+        if orig_conf == "HIGH":
+            final_conf = "HIGH"
+            final_class = "SNIPER"
+        else:
+            final_conf = "NO_TRADE"
+            final_class = "NO_TRADE"
+    else:
+        if orig_conf == "HIGH":
+            final_conf = "HIGH"
+            final_class = "SNIPER"
+        elif orig_conf == "MEDIUM" and side_aligned:
+            final_conf = "NO_TRADE"
+            final_class = "NO_TRADE"
+        else:
+            final_conf = "NO_TRADE"
+            final_class = "NO_TRADE"
+    return final_conf, final_class
+
+def evaluate_with_narrative(symbol, side, price, atr_val, df, ob, rf_signal, existing_score=0):
+    regime = detect_market_regime(df)
+    trend_dir = get_trend_direction(df)
+    narrative = classify_market_narrative(df, ob, atr_val, side, rf_signal)
+    final_conf, final_class = adjust_narrative_confidence(narrative, regime, side, trend_dir)
+    narrative["confidence"] = final_conf
+    narrative["classification"] = final_class
+    narrative["regime"] = regime
+    MEMORY[f"last_narrative_{symbol}"] = {**narrative, "timestamp": time.time(), "side": side}
+    should_enter = final_conf in ("HIGH", "MEDIUM")
+    if not should_enter:
+        reason = f"{final_class} ({final_conf}) Regime={regime} Score={narrative['narrative_score']:.1f}"
+        MEMORY.setdefault("no_entry_feed", []).append({
+            "time": time.time(),
+            "symbol": symbol,
+            "side": side,
+            "reason": reason,
+            "score": narrative["narrative_score"]
+        })
+        if len(MEMORY["no_entry_feed"]) > 20:
+            MEMORY["no_entry_feed"] = MEMORY["no_entry_feed"][-20:]
+        return False, None, narrative
+    STATE["narrative_classification"] = final_class
+    STATE["narrative_confidence"] = narrative["narrative_score"]
+    STATE["confidence_level"] = final_conf
+    return True, final_class, narrative
+
+def narrative_debug():
+    debug_data = []
+    for key, val in MEMORY.items():
+        if key.startswith("last_narrative_"):
+            debug_data.append({
+                "symbol": key.replace("last_narrative_", ""),
+                "side": val.get("side"),
+                "classification": val.get("classification"),
+                "confidence": val.get("confidence"),
+                "score": val.get("narrative_score"),
+                "reasons": val.get("reasons"),
+                "timestamp": val.get("timestamp")
+            })
+    radar_candidates = MEMORY.get("radar_top5", [])
+    for cand in radar_candidates:
+        sym = cand["symbol"]
+        if not any(d["symbol"] == sym for d in debug_data):
+            df = get_ohlcv_safe(sym, 100)
+            if df is not None:
+                ob = get_orderbook_cached(sym, 10)
+                atr = compute_atr(df).iloc[-1] if len(df) > 14 else df['close'].iloc[-1] * 0.01
+                side = "BUY"
+                narrative = classify_market_narrative(df, ob, atr, side, None)
+                debug_data.append({
+                    "symbol": sym,
+                    "side": "analysis",
+                    "classification": narrative["classification"],
+                    "confidence": narrative["confidence"],
+                    "score": narrative["narrative_score"],
+                    "reasons": narrative["reasons"][:5],
+                    "timestamp": time.time()
+                })
+    return jsonify({"narrative_debug": debug_data})
+
+# ========== SMART INSTITUTIONAL ENTRY ENGINE ==========
+def check_institutional_entry(symbol, side, df, ob, atr, price):
+    reasons = []
+    pools = build_liquidity_pools(df)
+    swept_high, swept_low = detect_sweep(df, pools)
+    sweep_ok = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
+    if not sweep_ok:
+        return False, None, "No liquidity sweep"
+    reasons.append("Sweep")
+    zones = get_smart_zones(symbol, df, ob)
+    zone_ok = False
+    zone_price = None
+    if side == "BUY":
+        if zones["buy_zones"] and zones["buy_zones"][0]["strength"] >= 5:
+            zone_price = zones["buy_zones"][0]["price"]
+            if abs(price - zone_price) / price < 0.003:
+                zone_ok = True
+                reasons.append(f"Buy zone {zone_price:.4f} (strength {zones['buy_zones'][0]['strength']})")
+    else:
+        if zones["sell_zones"] and zones["sell_zones"][0]["strength"] >= 5:
+            zone_price = zones["sell_zones"][0]["price"]
+            if abs(price - zone_price) / price < 0.003:
+                zone_ok = True
+                reasons.append(f"Sell zone {zone_price:.4f} (strength {zones['sell_zones'][0]['strength']})")
+    if not zone_ok:
+        fvg = detect_fvg(df)
+        if side == "BUY" and fvg and fvg[0] == "bullish":
+            if price >= fvg[1] and price <= fvg[2]:
+                zone_ok = True
+                reasons.append("Bullish FVG")
+        elif side == "SELL" and fvg and fvg[0] == "bearish":
+            if price >= fvg[1] and price <= fvg[2]:
+                zone_ok = True
+                reasons.append("Bearish FVG")
+    if not zone_ok:
+        ob_level = detect_order_block(df, side)
+        if side == "BUY" and ob_level:
+            if abs(price - ob_level["low"]) / price < 0.003:
+                zone_ok = True
+                reasons.append("Bullish OB")
+        elif side == "SELL" and ob_level:
+            if abs(price - ob_level["high"]) / price < 0.003:
+                zone_ok = True
+                reasons.append("Bearish OB")
+    if not zone_ok:
+        return False, None, "No strong zone tap"
+    struct_shift = detect_structure_shift(df)
+    bos_up, bos_down = detect_bos(df)
+    choch_ok = False
+    if side == "BUY" and (struct_shift == "bullish_shift" or bos_up):
+        choch_ok = True
+        reasons.append("Bullish MSS/CHoCH")
+    elif side == "SELL" and (struct_shift == "bearish_shift" or bos_down):
+        choch_ok = True
+        reasons.append("Bearish MSS/CHoCH")
+    if sweep_ok and not choch_ok:
+        return False, None, "Reversal requires MSS/CHoCH confirmation"
+    elif not sweep_ok and not choch_ok:
+        reasons.append("No MSS/CHoCH (trend continuation, optional)")
+    rejection_ok = candle_rejection(df, side)
+    vol_state = classify_volume(df)
+    displacement_ok = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
+    if not (rejection_ok or displacement_ok):
+        return False, None, "No rejection/displacement candle"
+    if rejection_ok:
+        reasons.append("Rejection candle")
+    if displacement_ok:
+        reasons.append("Displacement")
+    volume_ok = vol_state in ("expansion", "spike")
+    if not volume_ok:
+        return False, None, "No volume expansion"
+    reasons.append(f"Volume {vol_state}")
+    adx_series = compute_adx(df)
+    if len(adx_series) < 3:
+        return False, None, "Insufficient ADX data"
+    adx_now = adx_series.iloc[-1]
+    adx_prev = adx_series.iloc[-2]
+    adx_slope = adx_now - adx_prev
+    plus_di, minus_di, _, _ = get_di_components(df)
+    di_spread = (plus_di - minus_di) if side == "BUY" else (minus_di - plus_di)
+    if adx_now < 18:
+        return False, None, f"ADX too low ({adx_now:.1f})"
+    if adx_now > 50:
+        if adx_slope > 0 and di_spread > 8:
+            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f} DI_spread={di_spread:.1f}")
+        else:
+            return False, None, f"Exhaustion risk: ADX>50 but slope={adx_slope:.1f} DI_spread={di_spread:.1f}"
+    elif adx_now > 35:
+        if adx_slope > 0:
+            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f}")
+        else:
+            return False, None, f"ADX high but falling slope ({adx_now:.1f} slope={adx_slope:.1f})"
+    else:
+        if adx_slope > 0:
+            reasons.append(f"Healthy ADX={adx_now:.1f} rising")
+        else:
+            return False, None, f"ADX not rising ({adx_now:.1f} slope={adx_slope:.1f})"
+    rf = RFEngine(20, 3.5).compute(df)
+    if rf["signal"] != side:
+        return False, None, f"RF signal {rf['signal']} does not match {side}"
+    if abs(rf["distance"]) > 0.003:
+        return False, None, f"RF distance {rf['distance']:.4f} too far"
+    reasons.append("RF aligned")
+    if zone_price:
+        move_from_zone = abs(price - zone_price) / zone_price * 100
+        if move_from_zone > 0.5:
+            return False, None, f"Price moved {move_from_zone:.2f}% from zone, too late"
+    last_candle = df.iloc[-1]
+    candle_range_pct = (last_candle['high'] - last_candle['low']) / last_candle['close'] * 100
+    if candle_range_pct > 1.5 * (atr / price * 100):
+        return False, None, "Large displacement candle already occurred, too late"
+    reason_str = " | ".join(reasons)
+    return True, "INSTITUTIONAL_SNIPER", reason_str
+
+# ========== DECISION FUNCTIONS ==========
+def decision_score_v1(df, ob, atr_val, side):
+    es, reasons = early_score(df, ob, atr_val, side)
+    ctx = detect_liquidity_context(df)
+    scenario = "TREND"
+    direction = side
+    if ctx == "sell_side_taken" and side == "BUY":
+        scenario = "REVERSAL"
+    elif ctx == "buy_side_taken" and side == "SELL":
+        scenario = "REVERSAL"
+    total_score = min(10, max(0, es + 2 if scenario == "REVERSAL" else es))
+    return total_score, scenario, direction, reasons
+
+def apply_overrides_v1(df, atr_val, score):
+    if is_late_move(df, atr_val):
+        score = max(0, score - 3)
+    return score
+
+def decide_and_execute_v1(symbol, side, total_score, reasons, price, sl, tp1, tp2):
+    if total_score < 5:
+        return False
+    df = get_ohlcv_safe(symbol, 100)
+    if df is None:
+        return False
+    ob = get_orderbook_cached(symbol, 10)
+    atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+    should_enter, classification, narrative = evaluate_with_narrative(symbol, side, price, atr_val, df, ob, side)
+    if not should_enter:
+        return False
+    reason_str = f"DECISION_V1 score={total_score} reasons={reasons} | NARR={narrative['classification']}"
+    return execute_entry(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                         trade_type="DECISION_V1", entry_type="V1", classification=classification)
+
+def decision_score(df, ob, atr_val, side):
+    vol_state = classify_volume(df)
+    scenario = advanced_detect_scenario(df, side, atr_val, vol_state)
+    es, reasons = early_score(df, ob, atr_val, side)
+    total = es
+    if scenario == "TRAP_REVERSAL":
+        total += 3
+    elif scenario == "TREND_CONTINUATION":
+        total += 2
+    total = min(10, max(0, total))
+    direction = side
+    return total, scenario, direction, reasons
+
+def near_key_zone(df, price):
+    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
+    for s in supports:
+        if abs(price - s) / price < 0.003:
+            return True
+    for r in resistances:
+        if abs(price - r) / price < 0.003:
+            return True
+    return False
+
+# ========== MONITOR WATCHLIST (not called) ==========
+def monitor_watchlist():
+    watchlist = MEMORY.get("rf_watchlist", [])
+    for c in watchlist:
+        sym = c["symbol"]
+        df = get_ohlcv_safe(sym, 150)
+        if df is None or not validate_dataframe(df, 100):
+            continue
+        ob = get_orderbook_cached(sym, limit=10)
+        if ob is not None:
+            price = df['close'].iloc[-1]
+            atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+            for side_try in ("BUY", "SELL"):
+                should_enter, classification, reason_str = check_institutional_entry(sym, side_try, df, ob, atr_val, price)
+                if should_enter:
+                    should_enter_narr, final_class, narrative = evaluate_with_narrative(sym, side_try, price, atr_val, df, ob, side_try)
+                    if not should_enter_narr:
+                        continue
+                    sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
+                    ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
+                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
+                    if ok:
+                        return True
+            decision, dec_side, dec_info = smart_decision(df, ob, sym)
+            if decision == "STOP_HUNT":
+                price = df['close'].iloc[-1]
+                atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+                should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
+                if not should_enter:
+                    continue
+                sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
+                reason_str = f"SMART_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
+                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
+                if ok:
+                    return True
+            elif decision == "EXHAUSTION_ENTRY":
+                price = df['close'].iloc[-1]
+                atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+                should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
+                if not should_enter:
+                    continue
+                sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
+                reason_str = f"SMART_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
+                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
+                if ok:
+                    return True
+        rf_engine = RFEngine(period=20, multiplier=3.5)
+        rf = rf_engine.compute(df)
+        if not rf["triggered"]:
+            continue
+        side = rf["signal"]
+        if side is None:
+            continue
+        price = df['close'].iloc[-1]
+        atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+        adx_series = compute_adx(df)
+        adx_val = adx_series.iloc[-1] if adx_series is not None else 20.0
+        volume_state = classify_volume(df)
+        should_enter, classification, narrative = evaluate_with_narrative(sym, side, price, atr_val, df, ob, side)
+        if not should_enter:
+            continue
+        if is_late_entry(df, side):
+            continue
+        ob_v1 = get_orderbook_cached(sym, limit=10)
+        if ob_v1 is not None:
+            total_v1, scn_v1, dir_v1, reasons_v1 = decision_score_v1(df, ob_v1, atr_val, side)
+            total_v1 = apply_overrides_v1(df, atr_val, total_v1)
+            if dir_v1 and total_v1 >= 5:
+                sl_v1, tp1_v1, tp2_v1 = compute_sl_tp(price, dir_v1,
+                                                       "REVERSAL" if scn_v1 in ("TRAP","REVERSAL") else "EARLY_TREND",
+                                                       atr_val, df)
+                ok = decide_and_execute_v1(sym, dir_v1, total_v1, reasons_v1, price, sl_v1, tp1_v1, tp2_v1)
+                if ok:
+                    return True
+        ob = get_orderbook_cached(sym, limit=10)
+        if ob is not None:
+            total_score, scenario_name, scenario_dir, all_reasons = decision_score(df, ob, atr_val, side)
+            if total_score >= 7:
+                sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "REVERSAL" if scenario_name=="REVERSAL" else "EARLY_TREND", atr_val, df)
+                reason_str = f"UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
+                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
+                if ok:
+                    return True
+            elif total_score >= 5:
+                sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
+                reason_str = f"UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
+                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
+                if ok:
+                    return True
+        ob = get_orderbook_cached(sym, limit=10)
+        if ob is None:
+            continue
+        else:
+            early_score_val, early_reasons = early_score(df, ob, atr_val, side)
+            if early_score_val >= 6:
+                sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
+                reason_str = f"EARLY_SNIPER ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
+                if ok:
+                    return True
+            elif early_score_val >= 4:
+                sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
+                reason_str = f"EARLY_ENTRY ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
+                if ok:
+                    return True
+        supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
+        location = detect_location(df, price, supports, resistances, threshold=0.003)
+        if side == "BUY" and location != "LOW":
+            continue
+        if side == "SELL" and location != "HIGH":
+            continue
+        scenario = advanced_detect_scenario(df, side, atr_val, volume_state)
+        if scenario == "NONE":
+            continue
+        decision, adv_class = advanced_decision_engine(scenario, adx_val, volume_state, location)
+        if decision != "ENTER":
+            continue
+        if scenario == "TRAP_REVERSAL":
+            leg_class = "REVERSAL"
+        elif scenario == "TREND_CONTINUATION":
+            leg_class = "EARLY_TREND"
+        else:
+            leg_class = "TREND_CONTINUATION"
+        sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr_val, df)
+        reason_str = f"ADV SMC {adv_class} | {scenario} | RF {side} | Loc {location} | NARR={narrative['classification']}"
+        trade_type = "SMC_ADV"
+        TRADE_STATE["zone"] = "support" if side=="BUY" else "resistance"
+        TRADE_STATE["location"] = location
+        TRADE_STATE["reason"] = [scenario, adv_class, location, narrative['classification']]
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
+        if ok:
+            return True
+    return False
+
+# ========== SMART OPPORTUNITY SELECTION (with Waiting List first) ==========
 def smart_opportunity_selection():
     best = select_best_ready()
     if best:
@@ -4959,9 +5500,8 @@ def smart_opportunity_selection():
                 should_enter_narr, final_class, narrative = evaluate_with_narrative(symbol, side, price, atr, df, ob, side)
                 if should_enter_narr:
                     sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL" if "REVERSAL" in classification else "EARLY_TREND", atr, df)
-                    thesis_text = best.get("thesis_text", "Institutional setup")
-                    log_execution(f"[WAITING_LIST] Executing READY entry: {symbol} {side} - {thesis_text}", "SUCCESS")
-                    ok = execute_entry(side, symbol, price, sl, tp1, tp2, best["score"], reason + " | " + thesis_text, atr,
+                    log_execution(f"[WAITING_LIST] Executing READY entry: {symbol} {side}", "SUCCESS")
+                    ok = execute_entry(side, symbol, price, sl, tp1, tp2, best["score"], reason, atr,
                                        trade_type="INSTITUTIONAL", entry_type="WAITING_LIST", classification=classification)
                     if ok:
                         if symbol in MEMORY.get("waiting_list", {}):
@@ -4970,7 +5510,7 @@ def smart_opportunity_selection():
                                 "time": time.time(),
                                 "from": "READY",
                                 "to": "EXECUTED",
-                                "reason": "Entry executed with thesis: " + thesis_text
+                                "reason": "Entry executed"
                             })
                         return True
                 else:
@@ -6062,675 +6602,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     else:
         return False
 
-# ========== NARRATIVE + CONTEXT ENGINE v1 ==========
-def get_di_components(df, period=14):
-    if df is None or len(df) < period*2:
-        return None, None, None, 0.0
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = rma(tr, period)
-    atr = atr.clip(lower=1e-9)
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = pd.Series(plus_dm, index=df.index)
-    minus_dm = pd.Series(minus_dm, index=df.index)
-    plus_di = 100 * rma(plus_dm, period) / (atr + 1e-9)
-    minus_di = 100 * rma(minus_dm, period) / (atr + 1e-9)
-    adx_series = compute_adx(df, period)
-    adx_current = adx_series.iloc[-1] if len(adx_series) > 0 else 20.0
-    adx_prev = adx_series.iloc[-2] if len(adx_series) > 1 else adx_current
-    adx_slope = adx_current - adx_prev
-    return plus_di.iloc[-1], minus_di.iloc[-1], adx_current, adx_slope
-
-def get_vwap_narrative(df):
-    vwap = compute_vwap(df)
-    price = df['close'].iloc[-1]
-    vwap_last = vwap.iloc[-1]
-    vwap_prev = vwap.iloc[-2] if len(vwap) > 1 else vwap_last
-    distance = (price - vwap_last) / vwap_last if vwap_last != 0 else 0.0
-    above = price > vwap_last
-    below = price < vwap_last
-    prev_above = df['close'].iloc[-2] > vwap_prev if len(df) > 1 else above
-    reclaim = (not prev_above) and above
-    reject = prev_above and (not above)
-    return {
-        "vwap": vwap_last,
-        "distance": distance,
-        "above": above,
-        "below": below,
-        "reclaim": reclaim,
-        "reject": reject,
-        "slope": vwap_last - vwap_prev
-    }
-
-def compute_enhanced_zone_strength(df, level, zone_type, atr, ob, sweep_detected=False):
-    price = df['close'].iloc[-1]
-    touches = 0
-    rejection_count = 0
-    volume_at_touches = []
-    for i in range(max(0, len(df)-60), len(df)):
-        candle_high = df['high'].iloc[i]
-        candle_low = df['low'].iloc[i]
-        if zone_type == "support":
-            if abs(candle_low - level) < atr * 0.5:
-                touches += 1
-                if i < len(df)-1:
-                    next_close = df['close'].iloc[i+1]
-                    if next_close > df['close'].iloc[i]:
-                        rejection_count += 1
-                        volume_at_touches.append(df['volume'].iloc[i])
-        else:
-            if abs(candle_high - level) < atr * 0.5:
-                touches += 1
-                if i < len(df)-1:
-                    next_close = df['close'].iloc[i+1]
-                    if next_close < df['close'].iloc[i]:
-                        rejection_count += 1
-                        volume_at_touches.append(df['volume'].iloc[i])
-    vol_score = 0.0
-    if volume_at_touches:
-        avg_vol_touch = sum(volume_at_touches) / len(volume_at_touches)
-        avg_vol_overall = df['volume'].iloc[-60:].mean()
-        if avg_vol_overall > 0:
-            vol_score = min(3.0, avg_vol_touch / avg_vol_overall)
-    strength = touches * 1.5 + rejection_count * 2.0 + vol_score
-    if sweep_detected:
-        strength += 2.0
-    last = df.iloc[-1]
-    body, range_, upper_wick, lower_wick = candle_metrics(last)
-    if zone_type == "support" and lower_wick > body * 1.5 and abs(last['low'] - level) < atr:
-        strength += 2.0
-    elif zone_type == "resistance" and upper_wick > body * 1.5 and abs(last['high'] - level) < atr:
-        strength += 2.0
-    return min(10.0, strength)
-
-def classify_market_narrative(df, ob, atr, side, rf_signal):
-    reasons = []
-    score = 0.0
-    plus_di, minus_di, adx, adx_slope = get_di_components(df)
-    if plus_di is not None:
-        if side == "BUY" and plus_di > minus_di:
-            score += 2.0
-            reasons.append("DI+ dominance")
-        elif side == "SELL" and minus_di > plus_di:
-            score += 2.0
-            reasons.append("DI- dominance")
-        elif abs(plus_di - minus_di) < 5:
-            reasons.append("DI tangled")
-    if adx_slope > 1.5:
-        score += 1.5
-        reasons.append(f"ADX rising ({adx_slope:.1f})")
-    elif adx_slope < -1.5:
-        score -= 1.0
-        reasons.append("ADX falling")
-    vwap_n = get_vwap_narrative(df)
-    if side == "BUY":
-        if vwap_n["above"]:
-            score += 1.5
-            reasons.append("VWAP above")
-        elif vwap_n["reclaim"]:
-            score += 2.0
-            reasons.append("VWAP reclaim")
-    else:
-        if vwap_n["below"]:
-            score += 1.5
-            reasons.append("VWAP below")
-        elif vwap_n["reject"]:
-            score += 2.0
-            reasons.append("VWAP reject")
-    pools = build_liquidity_pools(df)
-    swept_h, swept_l = detect_sweep(df, pools)
-    sweep_detected = (side == "BUY" and swept_l) or (side == "SELL" and swept_h)
-    if sweep_detected:
-        score += 2.5
-        reasons.append("Liquidity sweep")
-    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
-    zone_strength = 0.0
-    if side == "BUY" and supports:
-        nearest_sup = max([s for s in supports if s <= df['close'].iloc[-1]], default=None)
-        if nearest_sup:
-            zone_strength = compute_enhanced_zone_strength(df, nearest_sup, "support", atr, ob, sweep_detected)
-            score += zone_strength * 0.5
-            reasons.append(f"Zone strength {zone_strength:.1f}")
-    elif side == "SELL" and resistances:
-        nearest_res = min([r for r in resistances if r >= df['close'].iloc[-1]], default=None)
-        if nearest_res:
-            zone_strength = compute_enhanced_zone_strength(df, nearest_res, "resistance", atr, ob, sweep_detected)
-            score += zone_strength * 0.5
-            reasons.append(f"Zone strength {zone_strength:.1f}")
-    bos_up, bos_down = detect_bos(df)
-    struct_shift = detect_structure_shift(df)
-    if (side == "BUY" and (bos_up or struct_shift == "bullish_shift")):
-        score += 2.0
-        reasons.append("Bullish structure")
-    elif (side == "SELL" and (bos_down or struct_shift == "bearish_shift")):
-        score += 2.0
-        reasons.append("Bearish structure")
-    vol_state = classify_volume(df)
-    if vol_state in ("expansion", "spike"):
-        score += 1.5
-        reasons.append("Volume expansion")
-    elif vol_state == "exhaustion":
-        score -= 1.0
-        reasons.append("Volume exhaustion")
-    if candle_rejection(df, side):
-        score += 1.5
-        reasons.append("Rejection candle")
-    if detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False):
-        score += 1.5
-        reasons.append("Displacement")
-    if rf_signal == side:
-        score += 1.5
-        reasons.append("RF aligned")
-    if adx is not None and adx < 18 and plus_di is not None and abs(plus_di - minus_di) < 6:
-        score = 0
-        reasons = ["CHOP market (ADX<18 + DI tangled)"]
-    if score >= 9.0:
-        classification = "REVERSAL_SNIPER" if (sweep_detected or zone_strength > 5) else "TREND_CONTINUATION"
-        confidence = "HIGH"
-    elif score >= 7.0:
-        classification = "TREND_CONTINUATION" if (bos_up or bos_down or struct_shift) else "ACCUMULATION_LONG" if side == "BUY" else "DISTRIBUTION_SHORT"
-        confidence = "MEDIUM"
-    elif score >= 5.0:
-        classification = "FAKE_BREAKOUT" if not sweep_detected else "LOW_CONFIDENCE"
-        confidence = "LOW"
-    else:
-        classification = "CHOP_NO_TRADE"
-        confidence = "NO_TRADE"
-    return {
-        "classification": classification,
-        "confidence": confidence,
-        "narrative_score": round(score, 2),
-        "reasons": reasons,
-        "sweep": sweep_detected,
-        "zone_strength": zone_strength,
-        "di_dominance": ("BUY" if plus_di > minus_di else "SELL") if plus_di is not None else "NEUTRAL",
-        "adx_slope": adx_slope,
-        "vwap_reclaim": vwap_n["reclaim"],
-        "vwap_reject": vwap_n["reject"]
-    }
-
-def detect_market_regime(df):
-    if len(df) < 50:
-        return "RANGE"
-    try:
-        adx = compute_adx(df).iloc[-1]
-        plus_di, minus_di, _, _ = get_di_components(df)
-        vwap_n = get_vwap_narrative(df)
-        atr = compute_atr(df).iloc[-1]
-        atr_avg = compute_atr(df).rolling(20).mean().iloc[-1] if len(compute_atr(df))>=20 else atr
-        atr_ratio = atr / atr_avg if atr_avg else 1.0
-        ema20 = ema(df['close'], 20).iloc[-1]
-        ema50 = ema(df['close'], 50).iloc[-1] if len(df)>=50 else ema20
-        price = df['close'].iloc[-1]
-        di_delta = abs(plus_di - minus_di)
-        if adx < 18 and di_delta < 6:
-            return "CHOP"
-        if adx > 20 and di_delta > 5:
-            struct = detect_structure_shift(df)
-            bullish_aligned = plus_di > minus_di and ema20 > ema50 and price > ema20
-            bearish_aligned = minus_di > plus_di and ema20 < ema50 and price < ema20
-            if bullish_aligned or bearish_aligned:
-                return "TREND"
-            if struct == "bullish_shift" and plus_di > minus_di:
-                return "TREND"
-            if struct == "bearish_shift" and minus_di > plus_di:
-                return "TREND"
-        if adx > 20 and atr_ratio > 1.4:
-            return "EXPANSION"
-        if atr_ratio < 0.7 and adx < 25:
-            return "COMPRESSION"
-        return "RANGE"
-    except:
-        return "RANGE"
-
-def get_trend_direction(df):
-    try:
-        plus_di, minus_di, _, _ = get_di_components(df)
-        ema20 = ema(df['close'], 20).iloc[-1]
-        ema50 = ema(df['close'], 50).iloc[-1] if len(df)>=50 else ema20
-        price = df['close'].iloc[-1]
-        struct = detect_structure_shift(df)
-        if (plus_di > minus_di and ema20 > ema50 and price > ema20) or struct == "bullish_shift":
-            return "BULLISH"
-        elif (minus_di > plus_di and ema20 < ema50 and price < ema20) or struct == "bearish_shift":
-            return "BEARISH"
-        return "NEUTRAL"
-    except:
-        return "NEUTRAL"
-
-def adjust_narrative_confidence(narrative, regime, side, trend_direction):
-    orig_conf = narrative["confidence"]
-    score = narrative["narrative_score"]
-    side_aligned = False
-    if (trend_direction == "BULLISH" and side == "BUY") or (trend_direction == "BEARISH" and side == "SELL"):
-        side_aligned = True
-    final_conf = orig_conf
-    final_class = narrative["classification"]
-    if regime == "CHOP":
-        return "NO_TRADE", "CHOP_NO_TRADE"
-    if orig_conf == "NO_TRADE" or score < 5.0:
-        return "NO_TRADE", "CHOP_NO_TRADE"
-    if regime == "TREND":
-        if side_aligned:
-            if orig_conf == "HIGH":
-                final_conf = "HIGH"
-                final_class = "SNIPER"
-            elif orig_conf == "MEDIUM":
-                final_conf = "MEDIUM"
-                final_class = "TREND"
-            elif orig_conf == "LOW":
-                if score >= 5.0:
-                    final_conf = "MEDIUM"
-                    final_class = "TREND"
-                else:
-                    final_conf = "NO_TRADE"
-                    final_class = "NO_TRADE"
-        else:
-            if orig_conf == "HIGH":
-                final_conf = "HIGH"
-                final_class = "SNIPER"
-            else:
-                final_conf = "NO_TRADE"
-                final_class = "NO_TRADE"
-    elif regime in ("EXPANSION", "COMPRESSION"):
-        if orig_conf == "HIGH":
-            final_conf = "HIGH"
-            final_class = "SNIPER"
-        else:
-            final_conf = "NO_TRADE"
-            final_class = "NO_TRADE"
-    else:
-        if orig_conf == "HIGH":
-            final_conf = "HIGH"
-            final_class = "SNIPER"
-        elif orig_conf == "MEDIUM" and side_aligned:
-            final_conf = "NO_TRADE"
-            final_class = "NO_TRADE"
-        else:
-            final_conf = "NO_TRADE"
-            final_class = "NO_TRADE"
-    return final_conf, final_class
-
-def evaluate_with_narrative(symbol, side, price, atr_val, df, ob, rf_signal, existing_score=0):
-    regime = detect_market_regime(df)
-    trend_dir = get_trend_direction(df)
-    narrative = classify_market_narrative(df, ob, atr_val, side, rf_signal)
-    final_conf, final_class = adjust_narrative_confidence(narrative, regime, side, trend_dir)
-    narrative["confidence"] = final_conf
-    narrative["classification"] = final_class
-    narrative["regime"] = regime
-    MEMORY[f"last_narrative_{symbol}"] = {**narrative, "timestamp": time.time(), "side": side}
-    should_enter = final_conf in ("HIGH", "MEDIUM")
-    if not should_enter:
-        reason = f"{final_class} ({final_conf}) Regime={regime} Score={narrative['narrative_score']:.1f}"
-        MEMORY.setdefault("no_entry_feed", []).append({
-            "time": time.time(),
-            "symbol": symbol,
-            "side": side,
-            "reason": reason,
-            "score": narrative["narrative_score"]
-        })
-        if len(MEMORY["no_entry_feed"]) > 20:
-            MEMORY["no_entry_feed"] = MEMORY["no_entry_feed"][-20:]
-        return False, None, narrative
-    STATE["narrative_classification"] = final_class
-    STATE["narrative_confidence"] = narrative["narrative_score"]
-    STATE["confidence_level"] = final_conf
-    return True, final_class, narrative
-
-def narrative_debug():
-    debug_data = []
-    for key, val in MEMORY.items():
-        if key.startswith("last_narrative_"):
-            debug_data.append({
-                "symbol": key.replace("last_narrative_", ""),
-                "side": val.get("side"),
-                "classification": val.get("classification"),
-                "confidence": val.get("confidence"),
-                "score": val.get("narrative_score"),
-                "reasons": val.get("reasons"),
-                "timestamp": val.get("timestamp")
-            })
-    radar_candidates = MEMORY.get("radar_top5", [])
-    for cand in radar_candidates:
-        sym = cand["symbol"]
-        if not any(d["symbol"] == sym for d in debug_data):
-            df = get_ohlcv_safe(sym, 100)
-            if df is not None:
-                ob = get_orderbook_cached(sym, 10)
-                atr = compute_atr(df).iloc[-1] if len(df) > 14 else df['close'].iloc[-1] * 0.01
-                side = "BUY"
-                narrative = classify_market_narrative(df, ob, atr, side, None)
-                debug_data.append({
-                    "symbol": sym,
-                    "side": "analysis",
-                    "classification": narrative["classification"],
-                    "confidence": narrative["confidence"],
-                    "score": narrative["narrative_score"],
-                    "reasons": narrative["reasons"][:5],
-                    "timestamp": time.time()
-                })
-    return jsonify({"narrative_debug": debug_data})
-
-# ========== SMART INSTITUTIONAL ENTRY ENGINE ==========
-def check_institutional_entry(symbol, side, df, ob, atr, price):
-    reasons = []
-    pools = build_liquidity_pools(df)
-    swept_high, swept_low = detect_sweep(df, pools)
-    sweep_ok = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
-    if not sweep_ok:
-        return False, None, "No liquidity sweep"
-    reasons.append("Sweep")
-    zones = get_smart_zones(symbol, df, ob)
-    zone_ok = False
-    zone_price = None
-    if side == "BUY":
-        if zones["buy_zones"] and zones["buy_zones"][0]["strength"] >= 5:
-            zone_price = zones["buy_zones"][0]["price"]
-            if abs(price - zone_price) / price < 0.003:
-                zone_ok = True
-                reasons.append(f"Buy zone {zone_price:.4f} (strength {zones['buy_zones'][0]['strength']})")
-    else:
-        if zones["sell_zones"] and zones["sell_zones"][0]["strength"] >= 5:
-            zone_price = zones["sell_zones"][0]["price"]
-            if abs(price - zone_price) / price < 0.003:
-                zone_ok = True
-                reasons.append(f"Sell zone {zone_price:.4f} (strength {zones['sell_zones'][0]['strength']})")
-    if not zone_ok:
-        fvg = detect_fvg(df)
-        if side == "BUY" and fvg and fvg[0] == "bullish":
-            if price >= fvg[1] and price <= fvg[2]:
-                zone_ok = True
-                reasons.append("Bullish FVG")
-        elif side == "SELL" and fvg and fvg[0] == "bearish":
-            if price >= fvg[1] and price <= fvg[2]:
-                zone_ok = True
-                reasons.append("Bearish FVG")
-    if not zone_ok:
-        ob_level = detect_order_block(df, side)
-        if side == "BUY" and ob_level:
-            if abs(price - ob_level["low"]) / price < 0.003:
-                zone_ok = True
-                reasons.append("Bullish OB")
-        elif side == "SELL" and ob_level:
-            if abs(price - ob_level["high"]) / price < 0.003:
-                zone_ok = True
-                reasons.append("Bearish OB")
-    if not zone_ok:
-        return False, None, "No strong zone tap"
-    struct_shift = detect_structure_shift(df)
-    bos_up, bos_down = detect_bos(df)
-    choch_ok = False
-    if side == "BUY" and (struct_shift == "bullish_shift" or bos_up):
-        choch_ok = True
-        reasons.append("Bullish MSS/CHoCH")
-    elif side == "SELL" and (struct_shift == "bearish_shift" or bos_down):
-        choch_ok = True
-        reasons.append("Bearish MSS/CHoCH")
-    if sweep_ok and not choch_ok:
-        return False, None, "Reversal requires MSS/CHoCH confirmation"
-    elif not sweep_ok and not choch_ok:
-        reasons.append("No MSS/CHoCH (trend continuation, optional)")
-    rejection_ok = candle_rejection(df, side)
-    vol_state = classify_volume(df)
-    displacement_ok = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
-    if not (rejection_ok or displacement_ok):
-        return False, None, "No rejection/displacement candle"
-    if rejection_ok:
-        reasons.append("Rejection candle")
-    if displacement_ok:
-        reasons.append("Displacement")
-    volume_ok = vol_state in ("expansion", "spike")
-    if not volume_ok:
-        return False, None, "No volume expansion"
-    reasons.append(f"Volume {vol_state}")
-    adx_series = compute_adx(df)
-    if len(adx_series) < 3:
-        return False, None, "Insufficient ADX data"
-    adx_now = adx_series.iloc[-1]
-    adx_prev = adx_series.iloc[-2]
-    adx_slope = adx_now - adx_prev
-    plus_di, minus_di, _, _ = get_di_components(df)
-    di_spread = (plus_di - minus_di) if side == "BUY" else (minus_di - plus_di)
-    if adx_now < 18:
-        return False, None, f"ADX too low ({adx_now:.1f})"
-    if adx_now > 50:
-        if adx_slope > 0 and di_spread > 8:
-            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f} DI_spread={di_spread:.1f}")
-        else:
-            return False, None, f"Exhaustion risk: ADX>50 but slope={adx_slope:.1f} DI_spread={di_spread:.1f}"
-    elif adx_now > 35:
-        if adx_slope > 0:
-            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f}")
-        else:
-            return False, None, f"ADX high but falling slope ({adx_now:.1f} slope={adx_slope:.1f})"
-    else:
-        if adx_slope > 0:
-            reasons.append(f"Healthy ADX={adx_now:.1f} rising")
-        else:
-            return False, None, f"ADX not rising ({adx_now:.1f} slope={adx_slope:.1f})"
-    rf = RFEngine(20, 3.5).compute(df)
-    if rf["signal"] != side:
-        return False, None, f"RF signal {rf['signal']} does not match {side}"
-    if abs(rf["distance"]) > 0.003:
-        return False, None, f"RF distance {rf['distance']:.4f} too far"
-    reasons.append("RF aligned")
-    if zone_price:
-        move_from_zone = abs(price - zone_price) / zone_price * 100
-        if move_from_zone > 0.5:
-            return False, None, f"Price moved {move_from_zone:.2f}% from zone, too late"
-    last_candle = df.iloc[-1]
-    candle_range_pct = (last_candle['high'] - last_candle['low']) / last_candle['close'] * 100
-    if candle_range_pct > 1.5 * (atr / price * 100):
-        return False, None, "Large displacement candle already occurred, too late"
-    reason_str = " | ".join(reasons)
-    return True, "INSTITUTIONAL_SNIPER", reason_str
-
-# ========== DECISION FUNCTIONS ==========
-def decision_score_v1(df, ob, atr_val, side):
-    es, reasons = early_score(df, ob, atr_val, side)
-    ctx = detect_liquidity_context(df)
-    scenario = "TREND"
-    direction = side
-    if ctx == "sell_side_taken" and side == "BUY":
-        scenario = "REVERSAL"
-    elif ctx == "buy_side_taken" and side == "SELL":
-        scenario = "REVERSAL"
-    total_score = min(10, max(0, es + 2 if scenario == "REVERSAL" else es))
-    return total_score, scenario, direction, reasons
-
-def apply_overrides_v1(df, atr_val, score):
-    if is_late_move(df, atr_val):
-        score = max(0, score - 3)
-    return score
-
-def decide_and_execute_v1(symbol, side, total_score, reasons, price, sl, tp1, tp2):
-    if total_score < 5:
-        return False
-    df = get_ohlcv_safe(symbol, 100)
-    if df is None:
-        return False
-    ob = get_orderbook_cached(symbol, 10)
-    atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-    should_enter, classification, narrative = evaluate_with_narrative(symbol, side, price, atr_val, df, ob, side)
-    if not should_enter:
-        return False
-    reason_str = f"DECISION_V1 score={total_score} reasons={reasons} | NARR={narrative['classification']}"
-    return execute_entry(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                         trade_type="DECISION_V1", entry_type="V1", classification=classification)
-
-def decision_score(df, ob, atr_val, side):
-    vol_state = classify_volume(df)
-    scenario = advanced_detect_scenario(df, side, atr_val, vol_state)
-    es, reasons = early_score(df, ob, atr_val, side)
-    total = es
-    if scenario == "TRAP_REVERSAL":
-        total += 3
-    elif scenario == "TREND_CONTINUATION":
-        total += 2
-    total = min(10, max(0, total))
-    direction = side
-    return total, scenario, direction, reasons
-
-def near_key_zone(df, price):
-    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
-    for s in supports:
-        if abs(price - s) / price < 0.003:
-            return True
-    for r in resistances:
-        if abs(price - r) / price < 0.003:
-            return True
-    return False
-
-# ========== MONITOR WATCHLIST (not called) ==========
-def monitor_watchlist():
-    watchlist = MEMORY.get("rf_watchlist", [])
-    for c in watchlist:
-        sym = c["symbol"]
-        df = get_ohlcv_safe(sym, 150)
-        if df is None or not validate_dataframe(df, 100):
-            continue
-        ob = get_orderbook_cached(sym, limit=10)
-        if ob is not None:
-            price = df['close'].iloc[-1]
-            atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-            for side_try in ("BUY", "SELL"):
-                should_enter, classification, reason_str = check_institutional_entry(sym, side_try, df, ob, atr_val, price)
-                if should_enter:
-                    should_enter_narr, final_class, narrative = evaluate_with_narrative(sym, side_try, price, atr_val, df, ob, side_try)
-                    if not should_enter_narr:
-                        continue
-                    sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
-                    ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
-                    if ok:
-                        return True
-            decision, dec_side, dec_info = smart_decision(df, ob, sym)
-            if decision == "STOP_HUNT":
-                price = df['close'].iloc[-1]
-                atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-                should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
-                if not should_enter:
-                    continue
-                sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
-                reason_str = f"SMART_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
-                if ok:
-                    return True
-            elif decision == "EXHAUSTION_ENTRY":
-                price = df['close'].iloc[-1]
-                atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-                should_enter, classification, narrative = evaluate_with_narrative(sym, dec_side, price, atr_val, df, ob, dec_side)
-                if not should_enter:
-                    continue
-                sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
-                reason_str = f"SMART_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
-                if ok:
-                    return True
-        rf_engine = RFEngine(period=20, multiplier=3.5)
-        rf = rf_engine.compute(df)
-        if not rf["triggered"]:
-            continue
-        side = rf["signal"]
-        if side is None:
-            continue
-        price = df['close'].iloc[-1]
-        atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-        adx_series = compute_adx(df)
-        adx_val = adx_series.iloc[-1] if adx_series is not None else 20.0
-        volume_state = classify_volume(df)
-        should_enter, classification, narrative = evaluate_with_narrative(sym, side, price, atr_val, df, ob, side)
-        if not should_enter:
-            continue
-        if is_late_entry(df, side):
-            continue
-        ob_v1 = get_orderbook_cached(sym, limit=10)
-        if ob_v1 is not None:
-            total_v1, scn_v1, dir_v1, reasons_v1 = decision_score_v1(df, ob_v1, atr_val, side)
-            total_v1 = apply_overrides_v1(df, atr_val, total_v1)
-            if dir_v1 and total_v1 >= 5:
-                sl_v1, tp1_v1, tp2_v1 = compute_sl_tp(price, dir_v1,
-                                                       "REVERSAL" if scn_v1 in ("TRAP","REVERSAL") else "EARLY_TREND",
-                                                       atr_val, df)
-                ok = decide_and_execute_v1(sym, dir_v1, total_v1, reasons_v1, price, sl_v1, tp1_v1, tp2_v1)
-                if ok:
-                    return True
-        ob = get_orderbook_cached(sym, limit=10)
-        if ob is not None:
-            total_score, scenario_name, scenario_dir, all_reasons = decision_score(df, ob, atr_val, side)
-            if total_score >= 7:
-                sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "REVERSAL" if scenario_name=="REVERSAL" else "EARLY_TREND", atr_val, df)
-                reason_str = f"UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
-                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
-                if ok:
-                    return True
-            elif total_score >= 5:
-                sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
-                reason_str = f"UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
-                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
-                if ok:
-                    return True
-        ob = get_orderbook_cached(sym, limit=10)
-        if ob is None:
-            continue
-        else:
-            early_score_val, early_reasons = early_score(df, ob, atr_val, side)
-            if early_score_val >= 6:
-                sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
-                reason_str = f"EARLY_SNIPER ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
-                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
-                if ok:
-                    return True
-            elif early_score_val >= 4:
-                sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
-                reason_str = f"EARLY_ENTRY ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
-                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
-                if ok:
-                    return True
-        supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
-        location = detect_location(df, price, supports, resistances, threshold=0.003)
-        if side == "BUY" and location != "LOW":
-            continue
-        if side == "SELL" and location != "HIGH":
-            continue
-        scenario = advanced_detect_scenario(df, side, atr_val, volume_state)
-        if scenario == "NONE":
-            continue
-        decision, adv_class = advanced_decision_engine(scenario, adx_val, volume_state, location)
-        if decision != "ENTER":
-            continue
-        if scenario == "TRAP_REVERSAL":
-            leg_class = "REVERSAL"
-        elif scenario == "TREND_CONTINUATION":
-            leg_class = "EARLY_TREND"
-        else:
-            leg_class = "TREND_CONTINUATION"
-        sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr_val, df)
-        reason_str = f"ADV SMC {adv_class} | {scenario} | RF {side} | Loc {location} | NARR={narrative['classification']}"
-        trade_type = "SMC_ADV"
-        TRADE_STATE["zone"] = "support" if side=="BUY" else "resistance"
-        TRADE_STATE["location"] = location
-        TRADE_STATE["reason"] = [scenario, adv_class, location, narrative['classification']]
-        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
-        if ok:
-            return True
-    return False
-
 # ========== MAIN LOOP ==========
 def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL
@@ -7148,24 +7019,19 @@ def dashboard():
             <div>Climax Risk: ${flow.climax_risk || 0}%</div>
             <div>Greed State: ${flow.greed_state ? 'YES' : 'NO'}</div>
           `;
-          // Waiting List with thesis
+          // Waiting List
           let wlHtml = '';
           if (data.waiting_list && data.waiting_list.length) {
             data.waiting_list.forEach(item => {
               const stageColor = item.stage === 'READY' ? '#00ffa6' : item.stage === 'WAITING' ? '#ffc800' : '#ff4d4d';
-              wlHtml += `<div style="padding: 8px 0; border-bottom: 1px solid #2c3e50; display: flex; flex-direction: column; gap: 4px;">
-                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                  <span><strong>${item.symbol}</strong> ${item.side}</span>
-                  <span style="color: ${stageColor};">${item.stage}</span>
-                  <span>Health: ${item.health}%</span>
-                  <span>Prob: ${item.probability}%</span>
-                  <span>Priority: ${item.priority}</span>
-                  <span>Type: ${item.opportunity_type}</span>
-                  <span style="color: #ffc800;">${item.missing_conditions ? '⚠️ ' + item.missing_conditions.slice(0, 2).join(', ') : '✅ Ready'}</span>
-                </div>
-                <div style="font-size: 11px; color: #9ca3af;">${item.thesis_summary}</div>
-                <div style="font-size: 11px; color: #e6edf3;">Drivers: ${item.thesis_drivers ? item.thesis_drivers.join(', ') : 'N/A'}</div>
-                ${item.history && item.history.length ? `<div style="font-size: 10px; color: #ffc800;">Last change: ${item.history[item.history.length-1].from} → ${item.history[item.history.length-1].to} (${item.history[item.history.length-1].reason})</div>` : ''}
+              wlHtml += `<div style="padding: 4px 0; border-bottom: 1px solid #2c3e50; display: flex; gap: 10px; flex-wrap: wrap;">
+                <span><strong>${item.symbol}</strong> ${item.side}</span>
+                <span style="color: ${stageColor};">${item.stage}</span>
+                <span>Health: ${item.health}%</span>
+                <span>Prob: ${item.probability}%</span>
+                <span>Priority: ${item.priority}</span>
+                <span>Type: ${item.opportunity_type}</span>
+                <span style="color: #ffc800;">${item.missing_conditions ? item.missing_conditions.slice(0, 2).join(', ') : 'Ready'}</span>
               </div>`;
             });
           } else {
@@ -7213,7 +7079,7 @@ def data():
     flow = DASHBOARD_STATE.get("institutional_flow", {})
     lifecycle = DASHBOARD_STATE.get("lifecycle_state", "IDLE")
     mode = "LIVE" if MODE_LIVE else "PAPER"
-    # Waiting list data with thesis
+    # Waiting list data
     waiting_list = []
     for sym, entry in MEMORY.get("waiting_list", {}).items():
         waiting_list.append({
@@ -7224,11 +7090,7 @@ def data():
             "probability": round(entry.get("thesis", {}).get("execution_probability", 0), 1),
             "priority": entry.get("priority", 0),
             "opportunity_type": entry.get("opportunity_type", "UNKNOWN"),
-            "missing_conditions": entry.get("thesis", {}).get("missing_conditions", []),
-            "thesis_text": entry.get("thesis_text", ""),
-            "thesis_drivers": entry.get("thesis_drivers", []),
-            "thesis_summary": entry.get("thesis_summary", ""),
-            "history": entry.get("history", [])[-5:]
+            "missing_conditions": entry.get("thesis", {}).get("missing_conditions", [])
         })
     return jsonify({
         "account": {"balance": bal, "free_balance": free},
