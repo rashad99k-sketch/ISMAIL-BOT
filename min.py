@@ -55,7 +55,7 @@ if 'log_execution' not in dir():
         except:
             pass
 
-# ========== INSTITUTIONAL ENGINES (UNCHANGED) ==========
+# ========== INSTITUTIONAL ENGINES ==========
 class SmartMoneyEngine:
     @staticmethod
     def _rsi(series, period=14):
@@ -225,7 +225,7 @@ class MomentumFlowEngine:
         }
 
 
-# ========== TRADE STATE MACHINE (UNCHANGED) ==========
+# ========== TRADE STATE MACHINE ==========
 class TradeStateMachine:
     STATES = {
         "ACCUMULATION": 0,
@@ -520,7 +520,7 @@ LEVERAGE = 10
 
 USE_PPE = True
 
-# === EXECUTION QUEUE CONFIGURATION (NEW) ===
+# === EXECUTION QUEUE CONFIGURATION ===
 USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
 QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
 QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
@@ -606,7 +606,7 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
     df.loc[last_idx, 'close'] = live_price
     return df
 
-# ========== DATA FETCHING (OPTIMIZED CACHE) ==========
+# ========== DATA FETCHING ==========
 def fetch_ohlcv(symbol, limit=150):
     try:
         sym = normalize_symbol(symbol)
@@ -4520,74 +4520,182 @@ def evaluate_liquidity_narrative(df, ob, atr, side):
     if narrative["rf_alignment"]: score += 2
     return narrative, score
 
-def smart_opportunity_selection():
-    candidates = []
-    for c in MEMORY.get("scanner_v2_buy", [])[:5]:
-        candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"], "source": "v2"})
-    for c in MEMORY.get("scanner_v2_sell", [])[:5]:
-        candidates.append({"symbol": c["symbol"], "side": "SELL", "score": c["score"], "source": "v2"})
-    for c in MEMORY.get("rf_watchlist", [])[:10]:
-        if c.get("rf_signal") in ("BUY", "SELL"):
-            candidates.append({"symbol": c["symbol"], "side": c["rf_signal"], "score": c["score"], "source": "rf"})
-    seen = {}
-    for cand in candidates:
-        sym = cand["symbol"]
-        if sym not in seen or cand["score"] > seen[sym]["score"]:
-            seen[sym] = cand
-    candidates = list(seen.values())
-    best_setup = None
-    best_score = -1
-    for cand in candidates[:15]:
-        try:
-            sym = cand["symbol"]
-            side = cand["side"]
-            df = get_ohlcv_safe(sym, 100)
-            if df is None or not validate_dataframe(df, 80):
-                continue
-            df.symbol = sym
-            ob = get_orderbook_cached(sym, limit=10)
-            atr = compute_atr(df).iloc[-1] if len(df) > 14 else df['close'].iloc[-1] * 0.01
-            narrative, nscore = evaluate_liquidity_narrative(df, ob, atr, side)
-            smart_money = SmartMoneyEngine.analyze_smart_money(df)
-            momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-            total_confidence_adjust = 0
-            if smart_money["smart_money_dominant"] and smart_money["institutional_bias"] == side:
-                total_confidence_adjust += 15
-            if momentum["trend_expansion"] and momentum["flow_bias"] == side:
-                total_confidence_adjust += 10
-            if smart_money["distribution_risk"] > 70:
-                total_confidence_adjust -= 15
-            if momentum["momentum_decay"]:
-                total_confidence_adjust -= 12
-            if momentum["exhaustion_risk"] > 70:
-                total_confidence_adjust -= 10
-            adjusted_nscore = nscore + (total_confidence_adjust / 10)
-            record_watchlist_entry(sym, side, narrative, adjusted_nscore, smart_money, momentum)
-            if adjusted_nscore < 7:
-                continue
-            zones = get_smart_zones(sym, df, ob)
-            zone_strength = 0
-            if side == "BUY" and zones["buy_zones"]:
-                zone_strength = zones["buy_zones"][0]["strength"]
-            elif side == "SELL" and zones["sell_zones"]:
-                zone_strength = zones["sell_zones"][0]["strength"]
-            total = adjusted_nscore + zone_strength * 0.5
-            if total > best_score:
-                best_score = total
-                best_setup = (sym, side, total, narrative, zones, df, ob, atr)
-        except Exception:
+# ========== WATCHLIST / ACTIVE CANDIDATES LAYER (INDEPENDENT) ==========
+def analyze_watchlist():
+    """
+    تحليل كل عملة في الـ Watchlist باستخدام تحليل المناطق المتقدم.
+    يتم تحديث الحالة (state) والنتيجة (zone_quality, score, votes).
+    العملات التي تصل إلى READY_FOR_INST يتم نقلها إلى ExecutionQueue.
+    """
+    if not MEMORY.get("watchlist"):
+        return
+
+    log_execution("[WATCHLIST] Starting advanced zone analysis...", "INFO")
+    now = time.time()
+    to_promote = []
+
+    for symbol, entry in list(MEMORY["watchlist"].items()):
+        # التحقق من أن العملة لا تزال صالحة (لا نعيد تحليلها كثيراً)
+        last_update = entry.get("last_analysis", 0)
+        if now - last_update < 60:  # كل دقيقة
             continue
-    if best_setup and best_score >= 9:
-        sym, side, score, narrative, zones, df, ob, atr = best_setup
+
+        # جلب البيانات
+        df = get_ohlcv_safe(symbol, 120)
+        if df is None or len(df) < 60:
+            entry["state"] = "INSUFFICIENT_DATA"
+            continue
+
         price = df['close'].iloc[-1]
-        leg_class = "REVERSAL"
-        sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr, df)
-        reason_str = f"INST_SWEEP+CHOCH+RETEST | nscore={score:.1f}"
-        ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
-                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
-        if ok:
-            return True
-    return False
+        atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+        ob = get_orderbook_cached(symbol, limit=10)
+        side = entry.get("side", "BUY")  # الافتراضي BUY
+
+        # === 1. تحليل Order Block ===
+        ob_quality = 0
+        ob_type = "WEAK"
+        ob = detect_order_block(df, side)
+        if ob:
+            # جودة الـ Order Block بناءً على حجم الشمعة وموقعها
+            candle = df.iloc[ob["idx"]]
+            body = abs(candle['close'] - candle['open'])
+            range_ = candle['high'] - candle['low']
+            if range_ > 0:
+                ratio = body / range_
+                if ratio > 0.6:
+                    ob_quality = 90
+                    ob_type = "FRESH"
+                elif ratio > 0.4:
+                    ob_quality = 70
+                    ob_type = "TESTED"
+                else:
+                    ob_quality = 50
+                    ob_type = "WEAK"
+            else:
+                ob_quality = 30
+                ob_type = "WEAK"
+        else:
+            ob_quality = 30
+
+        # === 2. تحليل Fresh Zone (دعم/مقاومة حديثة) ===
+        supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
+        zone_strength = 0
+        near_zone = False
+        if side == "BUY" and supports:
+            nearest_sup = max([s for s in supports if s <= price], default=None)
+            if nearest_sup:
+                dist_pct = abs(price - nearest_sup) / price
+                if dist_pct < 0.003:
+                    near_zone = True
+                    zone_strength = compute_enhanced_zone_strength(df, nearest_sup, "support", atr, ob, False)
+        elif side == "SELL" and resistances:
+            nearest_res = min([r for r in resistances if r >= price], default=None)
+            if nearest_res:
+                dist_pct = abs(price - nearest_res) / price
+                if dist_pct < 0.003:
+                    near_zone = True
+                    zone_strength = compute_enhanced_zone_strength(df, nearest_res, "resistance", atr, ob, False)
+
+        # === 3. تحليل Displacement ===
+        vol_state = classify_volume(df)
+        displacement = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
+
+        # === 4. تحليل Liquidity (sweeps) ===
+        pools = build_liquidity_pools(df)
+        swept_high, swept_low = detect_sweep(df, pools)
+        sweep_detected = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
+
+        # === 5. حساب النتيجة النهائية ===
+        score = 0
+        votes = 0
+        reasons = []
+
+        if ob_quality >= 70:
+            score += 2.5
+            votes += 1
+            reasons.append(f"OrderBlock {ob_type}")
+        elif ob_quality >= 50:
+            score += 1.0
+
+        if near_zone and zone_strength >= 5:
+            score += 2.5
+            votes += 1
+            reasons.append("FreshZone")
+        elif near_zone:
+            score += 1.0
+
+        if displacement:
+            score += 2.0
+            votes += 1
+            reasons.append("Displacement")
+
+        if sweep_detected:
+            score += 2.0
+            votes += 1
+            reasons.append("LiquiditySweep")
+
+        # === 6. تحديد جودة المنطقة ===
+        if score >= 7 and votes >= 3:
+            zone_quality = "STRONG_ZONE"
+            state = "READY_FOR_INST"
+        elif score >= 5 and votes >= 2:
+            zone_quality = "GOOD_ZONE"
+            state = "ANALYZING"
+        else:
+            zone_quality = "WEAK"
+            state = "DETECTED"
+
+        # تحديث الإدخال
+        entry.update({
+            "score": round(score, 2),
+            "votes": votes,
+            "reasons": reasons,
+            "zone_quality": zone_quality,
+            "state": state,
+            "last_analysis": now,
+            "ob_quality": ob_quality,
+            "zone_strength": zone_strength,
+            "displacement": displacement,
+            "sweep": sweep_detected
+        })
+
+        # إذا كانت جاهزة للتحليل المؤسسي، نضيفها للترقية
+        if state == "READY_FOR_INST":
+            to_promote.append((symbol, side, score))
+
+        log_execution(f"[WATCHLIST] {symbol} {side} | State: {state} | Score: {score:.2f} | Zone: {zone_quality} | Votes: {votes}", "INFO", debounce_key=f"watch_{symbol}", debounce_sec=120)
+
+    # === نقل العملات المؤهلة إلى ExecutionQueue ===
+    for sym, side, score in to_promote:
+        # نتحقق من وجودها بالفعل في الـ Queue
+        if sym not in queue._candidates:
+            df = get_ohlcv_safe(sym, 100)
+            if df is None:
+                continue
+            price = df['close'].iloc[-1]
+            atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+            ob = get_orderbook_cached(sym, limit=10)
+            sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
+            metrics = ZoneMetrics()
+            candidate = ExecutionCandidate(
+                symbol=sym,
+                side=side,
+                price=price,
+                entry_price=price,
+                stop_loss=sl,
+                take_profit_1=tp1,
+                take_profit_2=tp2,
+                atr=atr,
+                df=df,
+                ob=ob,
+                zone_metrics=metrics,
+                original_score=score,
+                original_reason="Promoted from Watchlist",
+                signal_type="watchlist"
+            )
+            if queue.add_candidate(candidate):
+                log_execution(f"[WATCHLIST] Promoted {sym} to ExecutionQueue (Score: {score:.2f})", "SUCCESS")
+                MEMORY["watchlist"][sym]["state"] = "IN_QUEUE"
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None):
     now = time.time()
@@ -4601,14 +4709,14 @@ def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, mom
     if narrative.get("sweep") and narrative.get("choch_bos") and narrative.get("retest") and narrative.get("rejection"):
         state = "CONFIRMED"
     reasons_list = []
-    if narrative["sweep"]: reasons_list.append("Sweep")
-    if narrative["choch_bos"]: reasons_list.append("CHoCH/BOS")
-    if narrative["retest"]: reasons_list.append("ZONE_RETEST")
-    if narrative["rejection"]: reasons_list.append("OB")
-    if narrative["displacement"]: reasons_list.append("Displacement")
-    if narrative["volume_confirmation"]: reasons_list.append("Volume")
-    if narrative["rf_alignment"]: reasons_list.append("RF")
-    trade_type = "REVERSAL" if (narrative["sweep"] or narrative["retest"]) else "TREND"
+    if narrative.get("sweep"): reasons_list.append("Sweep")
+    if narrative.get("choch_bos"): reasons_list.append("CHoCH/BOS")
+    if narrative.get("retest"): reasons_list.append("ZONE_RETEST")
+    if narrative.get("rejection"): reasons_list.append("OB")
+    if narrative.get("displacement"): reasons_list.append("Displacement")
+    if narrative.get("volume_confirmation"): reasons_list.append("Volume")
+    if narrative.get("rf_alignment"): reasons_list.append("RF")
+    trade_type = "REVERSAL" if (narrative.get("sweep") or narrative.get("retest")) else "TREND"
     strength = "WEAK"
     if score >= 7:
         strength = "STRONG"
@@ -4622,7 +4730,14 @@ def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, mom
         "reasons": reasons_list,
         "trade_type": trade_type,
         "strength": strength,
-        "last_update": now
+        "last_update": now,
+        "last_analysis": 0,
+        "zone_quality": "PENDING",
+        "votes": 0,
+        "ob_quality": 0,
+        "zone_strength": 0,
+        "displacement": False,
+        "sweep": False
     }
     if smart_money:
         entry["smart_money_bias"] = smart_money.get("institutional_bias", "NEUTRAL")
@@ -6812,7 +6927,6 @@ def global_discovery_scan():
         sym = item["symbol"]
         side = item["side"]
         # Use existing record_watchlist_entry to add/update
-        # we need a narrative dict; we can create a minimal one
         narrative = {
             "sweep": False,
             "choch_bos": False,
@@ -6822,13 +6936,6 @@ def global_discovery_scan():
             "volume_confirmation": False,
             "rf_alignment": False
         }
-        # We don't have full narrative, just assign a basic score
-        # Let's call record_watchlist_entry with dummy narrative
-        # But we want to preserve existing entries; better to update only if new score is higher
-        existing = MEMORY.get("watchlist", {}).get(sym)
-        if existing and existing.get("score", 0) >= item["score"]:
-            continue
-        # Build a simple narrative based on source
         if item["source"] == "scanner_v2":
             narrative["sweep"] = True
         elif item["source"] == "rf":
@@ -6837,7 +6944,6 @@ def global_discovery_scan():
             narrative["volume_confirmation"] = True
         record_watchlist_entry(sym, side, narrative, item["score"])
 
-    # Also update radar_top5 for compatibility
     radar_top = [{"symbol": c["symbol"], "score": c["score"]} for c in top_candidates[:5]]
     MEMORY["radar_top5"] = radar_top
 
@@ -6845,74 +6951,43 @@ def global_discovery_scan():
     log_execution(f"[DISCOVERY] Scan completed in {elapsed:.1f}s, {len(top_candidates)} candidates added to watchlist.", "INFO")
 
 def promote_to_queue():
-    """Scan watchlist and add high-potential symbols to the execution queue."""
+    """Promote candidates from Watchlist to ExecutionQueue based on zone analysis."""
     if not USE_EXECUTION_QUEUE:
         return
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         return
 
-    watchlist = []
-    # Combine from multiple watchlist sources
-    for source in (MEMORY.get("watchlist", {}).values(),
-                   MEMORY.get("rf_watchlist", []),
-                   MEMORY.get("scanner_v2_buy", []),
-                   MEMORY.get("scanner_v2_sell", [])):
-        if isinstance(source, dict):
-            # if it's a dict of entries
-            for item in source.values():
-                if isinstance(item, dict) and "symbol" in item:
-                    watchlist.append(item)
-        elif isinstance(source, list):
-            for item in source:
-                if isinstance(item, dict) and "symbol" in item:
-                    watchlist.append(item)
-
-    best_per_symbol = {}
-    for item in watchlist:
-        sym = item.get('symbol')
-        if not sym:
-            continue
-        score = item.get('score', 0)
-        side = item.get('side', 'BUY')
-        if sym not in best_per_symbol or score > best_per_symbol[sym]['score']:
-            best_per_symbol[sym] = {'score': score, 'side': side, 'source': item.get('source', 'unknown')}
-
-    sorted_items = sorted(best_per_symbol.items(), key=lambda x: x[1]['score'], reverse=True)
-
-    for sym, data in sorted_items[:30]:
-        if sym in queue._candidates:
-            continue
-
-        df = get_ohlcv_safe(sym, 100)
-        if df is None or len(df) < 30:
-            continue
-
-        price = df['close'].iloc[-1]
-        atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
-        ob = get_orderbook_cached(sym, limit=10)
-
-        side = data.get('side', 'BUY')
-        sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
-
-        metrics = ZoneMetrics()
-        candidate = ExecutionCandidate(
-            symbol=sym,
-            side=side,
-            price=price,
-            entry_price=price,
-            stop_loss=sl,
-            take_profit_1=tp1,
-            take_profit_2=tp2,
-            atr=atr,
-            df=df,
-            ob=ob,
-            zone_metrics=metrics,
-            original_score=data.get('score', 0),
-            original_reason=data.get('reason', 'Watchlist promotion'),
-            signal_type=data.get('source', 'watchlist')
-        )
-        queue.add_candidate(candidate)
-        log_execution(f"[QUEUE] Promoted {sym} {side} from watchlist", "INFO", debounce_key=f"promote_{sym}", debounce_sec=60)
+    for symbol, entry in MEMORY.get("watchlist", {}).items():
+        if entry.get("state") == "READY_FOR_INST" and symbol not in queue._candidates:
+            side = entry.get("side", "BUY")
+            score = entry.get("score", 0)
+            df = get_ohlcv_safe(symbol, 100)
+            if df is None:
+                continue
+            price = df['close'].iloc[-1]
+            atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+            ob = get_orderbook_cached(symbol, limit=10)
+            sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
+            metrics = ZoneMetrics()
+            candidate = ExecutionCandidate(
+                symbol=symbol,
+                side=side,
+                price=price,
+                entry_price=price,
+                stop_loss=sl,
+                take_profit_1=tp1,
+                take_profit_2=tp2,
+                atr=atr,
+                df=df,
+                ob=ob,
+                zone_metrics=metrics,
+                original_score=score,
+                original_reason=f"Promoted from Watchlist (Zone Score: {entry.get('zone_quality', 'UNKNOWN')})",
+                signal_type="watchlist"
+            )
+            if queue.add_candidate(candidate):
+                log_execution(f"[QUEUE] Promoted {symbol} to ExecutionQueue (Score: {score:.2f})", "SUCCESS")
+                MEMORY["watchlist"][symbol]["state"] = "IN_QUEUE"
 
 def process_queue_entry():
     """Select best candidate and attempt entry via existing execute_entry."""
@@ -7167,9 +7242,10 @@ def dashboard():
     </div>
     """
     
+    # Watchlist panel (تعرض MEMORY["watchlist"] مع كل البيانات)
     watchlist_panel_html = """
     <div class="section smart-layer">
-      <div class="title">👁 WATCHLIST / ACTIVE CANDIDATES</div>
+      <div class="title">👁 WATCHLIST / ACTIVE CANDIDATES – Zone Analysis</div>
       <div id="watchlist-panel" style="max-height:400px; overflow-y:auto; font-size:13px; background:#0f1724; padding:10px; border-radius:8px;">
         Loading...
       </div>
@@ -7255,10 +7331,10 @@ def dashboard():
     </style>
     """
     
-    # Execution Queue Panel (NEW)
+    # Execution Queue Panel
     queue_panel_html = """
     <div class="section smart-layer" id="queue-panel" style="display: none;">
-        <div class="title">🎯 EXECUTION QUEUE – Institutional Zone Analysis</div>
+        <div class="title">🎯 EXECUTION QUEUE – Institutional Analysis</div>
         <div id="queue-summary" class="grid" style="grid-template-columns: repeat(6,1fr); margin-bottom:10px;">
             <div class="card">Total<div id="q-total">0</div></div>
             <div class="card">Ready<div id="q-ready" class="green">0</div></div>
@@ -7486,6 +7562,7 @@ function updateUI(d) {{
         }});
         document.getElementById("rfSignals").innerHTML = rfHtml || "No RF signals";
     }}
+    // عرض WATCHLIST مع كل البيانات الجديدة
     if(d.watchlist) {{
         let wHtml = "";
         for (let sym in d.watchlist) {{
@@ -7494,22 +7571,29 @@ function updateUI(d) {{
             let strengthIcon = w.strength === "STRONG" ? "⚡" : (w.strength === "MEDIUM" ? "🟡" : "👁");
             let reasonsStr = (w.reasons || []).join(", ");
             let stateColor = "";
-            if (w.state === "CONFIRMED") stateColor = "#2ecc71";
-            else if (w.state === "DISPLACEMENT") stateColor = "#f1c40f";
+            if (w.state === "CONFIRMED" || w.state === "READY_FOR_INST") stateColor = "#2ecc71";
+            else if (w.state === "DISPLACEMENT" || w.state === "ANALYZING") stateColor = "#f1c40f";
             else if (w.state === "REJECTION") stateColor = "#e74c3c";
             else if (w.state === "RETEST") stateColor = "#3498db";
+            else if (w.state === "IN_QUEUE") stateColor = "#9b59b6";
             else stateColor = "#95a5a6";
             let lastUpdate = new Date(w.last_update * 1000).toLocaleTimeString();
             let extraInfo = "";
-            if (w.smart_money_bias_detailed) extraInfo += ` | Bias: ${{w.smart_money_bias_detailed}}`;
-            else if (w.smart_money_bias) extraInfo += ` | Bias: ${{w.smart_money_bias}}`;
-            if (w.distribution_risk !== undefined) extraInfo += ` | DistRisk: ${{w.distribution_risk}}`;
+            if (w.zone_quality) extraInfo += ` | Zone: ${w.zone_quality}`;
+            if (w.votes) extraInfo += ` | Votes: ${w.votes}`;
+            if (w.ob_quality) extraInfo += ` | OB: ${w.ob_quality.toFixed(0)}`;
+            if (w.zone_strength) extraInfo += ` | ZoneStr: ${w.zone_strength.toFixed(1)}`;
+            if (w.displacement) extraInfo += ` | Displ: ✅`;
+            if (w.sweep) extraInfo += ` | Sweep: ✅`;
+            if (w.smart_money_bias_detailed) extraInfo += ` | Bias: ${w.smart_money_bias_detailed}`;
+            else if (w.smart_money_bias) extraInfo += ` | Bias: ${w.smart_money_bias}`;
+            if (w.distribution_risk !== undefined) extraInfo += ` | DistRisk: ${w.distribution_risk}`;
             if (w.momentum_expansion) extraInfo += ` | 🚀`;
             if (w.momentum_decay) extraInfo += ` | 📉`;
             wHtml += `<div style="margin-bottom:8px; border-bottom:1px solid #2c3e50; padding-bottom:4px;">
-              <b>${{sideIcon}} ${{w.symbol}}</b> | Score: ${{w.score}} | <span style="color:${{stateColor}}">${{w.state}}</span> | ${{w.trade_type}} | ${{strengthIcon}} ${{w.strength}}
-              <br>Reasons: ${{reasonsStr}}
-              <br><small>Last update: ${{lastUpdate}} ${{extraInfo}}</small>
+              <b>${sideIcon} ${w.symbol}</b> | Score: ${w.score} | <span style="color:${stateColor}">${w.state}</span> | ${w.trade_type} | ${strengthIcon} ${w.strength}
+              <br>Reasons: ${reasonsStr}
+              <br><small>Last update: ${lastUpdate} ${extraInfo}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
@@ -7520,7 +7604,7 @@ function updateUI(d) {{
     if(d.no_entry_feed) {{
         d.no_entry_feed.forEach(item => {{
             let timeStr = new Date(item.time * 1000).toLocaleTimeString();
-            noEntryHtml += `<div>${{timeStr}} | ${{item.symbol}} ${{item.side}}: ${{item.reason}} (score ${{item.score}})</div>`;
+            noEntryHtml += `<div>${timeStr} | ${item.symbol} ${item.side}: ${item.reason} (score ${item.score})</div>`;
         }});
     }}
     document.getElementById("no-entry-feed").innerHTML = noEntryHtml || "No recent skips";
@@ -7539,7 +7623,7 @@ function updateUI(d) {{
         document.getElementById("flow-greed").innerHTML = flow.greed_state ? "🚨 Yes" : "✅ No";
         document.getElementById("flow-dom").innerHTML = flow.smart_money_dominant ? "✅ Yes" : "❌ No";
     }}
-    // Execution Queue panel (NEW)
+    // Execution Queue panel
     if (d.queue && d.queue.enabled !== false) {{
         document.getElementById("queue-panel").style.display = "block";
         document.getElementById("q-total").innerText = d.queue.total;
@@ -7569,20 +7653,20 @@ function updateUI(d) {{
                                triggerState === "MITIGATION" ? "#f1c40f" :
                                "#95a5a6";
             tr.innerHTML = `
-                <td><b>${{c.symbol}}</b></td>
-                <td style="color:${{c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}}">${{c.side}}</td>
-                <td style="font-weight:bold; color:${{c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}}">${{c.zone_score.toFixed(1)}}</td>
-                <td>${{c.ob_score.toFixed(0)}}</td>
-                <td>${{c.zone_strength.toFixed(0)}}</td>
-                <td>${{c.liquidity.toFixed(0)}}</td>
-                <td>${{c.institutional.toFixed(0)}}</td>
-                <td>${{c.structure.toFixed(0)}}</td>
-                <td>${{c.timing.toFixed(0)}}</td>
-                <td>${{c.trend.toFixed(0)}}</td>
-                <td>${{c.risk.toFixed(0)}}</td>
-                <td style="color:${{triggerColor}}; font-weight:bold;">${{triggerState}}</td>
-                <td style="font-size:10px;">${{c.opportunity_type}}</td>
-                <td style="color:${{stateColor}}; font-weight:bold;">${{c.state}}</td>
+                <td><b>${c.symbol}</b></td>
+                <td style="color:${c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}">${c.side}</td>
+                <td style="font-weight:bold; color:${c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}">${c.zone_score.toFixed(1)}</td>
+                <td>${c.ob_score.toFixed(0)}</td>
+                <td>${c.zone_strength.toFixed(0)}</td>
+                <td>${c.liquidity.toFixed(0)}</td>
+                <td>${c.institutional.toFixed(0)}</td>
+                <td>${c.structure.toFixed(0)}</td>
+                <td>${c.timing.toFixed(0)}</td>
+                <td>${c.trend.toFixed(0)}</td>
+                <td>${c.risk.toFixed(0)}</td>
+                <td style="color:${triggerColor}; font-weight:bold;">${triggerState}</td>
+                <td style="font-size:10px;">${c.opportunity_type}</td>
+                <td style="color:${stateColor}; font-weight:bold;">${c.state}</td>
             `;
             body.appendChild(tr);
         }});
@@ -8533,6 +8617,7 @@ def main_loop_sniper():
     last_flow_update = 0
     last_universe_build = 0
     last_discovery_scan = 0
+    last_watchlist_analysis = 0
     watchlist_rotation = None
     try:
         ex.load_markets()
@@ -8558,6 +8643,11 @@ def main_loop_sniper():
             if now - last_discovery_scan > GLOBAL_SCAN_INTERVAL:
                 global_discovery_scan()
                 last_discovery_scan = now
+
+            # ---- WATCHLIST Analysis (كل 60 ثانية) ----
+            if now - last_watchlist_analysis > 60:
+                analyze_watchlist()
+                last_watchlist_analysis = now
 
             # ---- Execution Queue integration ----
             if USE_EXECUTION_QUEUE:
