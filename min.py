@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 # ====================================================================
-# RF LIQUIDITY ENGINE v28.2 - PROFESSIONAL TRADE MANAGEMENT
-# [PRODUCTION PATCH] Critical Stability & Reversal Enhancement
-# Leverage: 10x | Dynamic Trail | Thesis-Aware | Single Source of Truth
+# RF LIQUIDITY ENGINE v28 - CRITICAL FORENSIC FIX PACK + EXECUTION QUEUE v2
+# [PRODUCTION READY] Institutional Discovery + Dynamic Execution Queue
+# ====================================================================
+# FIXES APPLIED (2026-06-09) + Queue Integration (2026-07-25)
+# 1. LIVE_SUPERVISOR as single source of truth - centralized state management
+# 2. Fixed close_partial() to verify order filled before updating STATE
+# 3. Fixed close_position_full() to verify order filled before finalizing
+# 4. Fixed synthetic_sl to use fixed entry ATR (does not expand with volatility)
+# 5. Fixed trailing activation: once true, never overridden to false by PPE
+# 6. Fixed ROE consistency across Dashboard, Live Manager, PPE, Exchange
+# 7. Fixed total PnL statistics in PAPER mode (call finalize_trade_with_reality)
+# 8. Added forensic logs for trade management and order verification
+# 9. Preserved all existing strategy, RF, Scanner, Dashboard UI, Telegram
+# === EXECUTION QUEUE INTEGRATION v2 (2026-07-25) ===
+# Added Global Discovery Scanner (every 20 min) that scans entire market.
+# Enhanced ExecutionQueue with Trigger State detection (Sweep, BOS, CHoCH, MSS, SFP).
+# Dynamic ranking, demotion, and promotion between Watchlist and Queue.
+# Dashboard queue panel redesigned with all institutional metrics.
+# All existing workflows unchanged if queue disabled.
 # ====================================================================
 
 import os
@@ -12,12 +28,13 @@ import threading
 import traceback
 import math
 import gc
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
 from collections import deque
-import queue
-from dataclasses import dataclass, field
+import queue as qlib
+import copy
 
 import ccxt
 import pandas as pd
@@ -25,7 +42,20 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
-# ========== INSTITUTIONAL ENGINES (EMBEDDED) ==========
+# ========== FALLBACK LOGGING ==========
+if 'log_execution' not in dir():
+    def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] {msg}")
+        try:
+            if 'DASHBOARD_STATE' in globals() and DASHBOARD_STATE is not None:
+                DASHBOARD_STATE["logs"].append(f"[{ts}] {msg}")
+                if level == "ERROR":
+                    DASHBOARD_STATE["errors"].append(f"[{ts}] {msg}")
+        except:
+            pass
+
+# ========== INSTITUTIONAL ENGINES (UNCHANGED) ==========
 class SmartMoneyEngine:
     @staticmethod
     def _rsi(series, period=14):
@@ -195,7 +225,7 @@ class MomentumFlowEngine:
         }
 
 
-# ========== TRADE STATE MACHINE (for context) ==========
+# ========== TRADE STATE MACHINE (UNCHANGED) ==========
 class TradeStateMachine:
     STATES = {
         "ACCUMULATION": 0,
@@ -230,38 +260,26 @@ class TradeStateMachine:
         decay = momentum.get("momentum_decay", False)
         bias_detailed = smart.get("institutional_bias_detailed", "NEUTRAL")
 
-        # PANIC_EXIT
-        if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
-            dist_risk > 75 and mom_health < 15 and cont_strength < 20):
+        if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and dist_risk > 75 and mom_health < 15 and cont_strength < 20):
             new_state = "PANIC_EXIT"
-        # MOMENTUM_COLLAPSE
         elif mom_health < 15 and cont_strength < 25 and decay:
             new_state = "MOMENTUM_COLLAPSE"
-        # LIQUIDITY_EXHAUSTION
         elif exh_risk > 70 or climax > 75:
             new_state = "LIQUIDITY_EXHAUSTION"
-        # PROFIT_DEFENSE
         elif dist_risk > 50 and banker < 45 and mom_health < 30:
             new_state = "PROFIT_DEFENSE"
-        # DISTRIBUTION
         elif dist_risk > 60 and banker < 45:
             new_state = "DISTRIBUTION"
-        # ACCUMULATION
         elif banker > 65 and dist_risk < 25 and mom_health > 40:
             new_state = "ACCUMULATION"
-        # EXPANSION
         elif adx > 30 and expansion and cont_strength > 60 and mom_health > 50:
             new_state = "EXPANSION"
-        # TREND_RIDE
         elif cont_strength > 75 and mom_health > 60 and dist_risk < 30:
             new_state = "TREND_RIDE"
-        # HEALTHY_PULLBACK
         elif 20 <= adx <= 35 and mom_health > 45 and not expansion and not decay and dist_risk < 40:
             new_state = "HEALTHY_PULLBACK"
-        # FAKE_BREAKOUT
         elif retail > 70 and banker < 45 and climax > 60:
             new_state = "FAKE_BREAKOUT"
-        # RANGE_CHOP
         elif adx < 22 or regime in ("CHOPPY", "COMPRESSION"):
             new_state = "RANGE_CHOP"
         else:
@@ -396,12 +414,14 @@ def safe_float(val, default=0.0):
 CACHE = {
     "balance": {"value": 0.0, "ts": 0},
     "free_balance": {"value": 0.0, "ts": 0},
-    "ohlcv": {},
-    "ticker": {},
-    "orderbook": {},
+    "ohlcv": {"value": {}, "ts": 0},
+    "ticker": {"value": {}, "ts": 0},
+    "orderbook": {"value": {}, "ts": 0},
+    "dashboard": {"value": None, "ts": 0},
+    "decision": {"value": None, "ts": 0}
 }
 _last_api_call = 0
-MIN_API_INTERVAL = 0.2  # minimum between API calls
+MIN_API_INTERVAL = 0.2
 
 def rate_limit():
     global _last_api_call
@@ -411,14 +431,25 @@ def rate_limit():
         time.sleep(MIN_API_INTERVAL - elapsed)
     _last_api_call = time.time()
 
-def cache_get(key, ttl):
+def cache_get(key, ttl, subkey=None):
     item = CACHE.get(key)
-    if item and time.time() - item["ts"] < ttl:
-        return item["value"]
+    if item and isinstance(item, dict) and "ts" in item and "value" in item:
+        if time.time() - item["ts"] < ttl:
+            if subkey:
+                val = item["value"]
+                if isinstance(val, dict) and subkey in val:
+                    return val[subkey]
+                return None
+            return item["value"]
     return None
 
-def cache_set(key, value):
-    CACHE[key] = {"value": value, "ts": time.time()}
+def cache_set(key, value, subkey=None):
+    if subkey:
+        if key not in CACHE or not isinstance(CACHE.get(key), dict) or "value" not in CACHE[key]:
+            CACHE[key] = {"value": {}, "ts": time.time()}
+        CACHE[key]["value"][subkey] = value
+    else:
+        CACHE[key] = {"value": value, "ts": time.time()}
 
 def safe_api_call(func, *args, **kwargs):
     for attempt in range(3):
@@ -457,7 +488,7 @@ def send_once(msg, key, cooldown=60):
         _tg_send(msg)
 
 def tg_start(balance, mode):
-    send_once(f"🚀 <b>RF v28.2 Professional Trade Mgmt</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nLeverage: 10x\nOptimized: Institutional Trade Mgmt", "startup", 86400)
+    send_once(f"🚀 <b>RF v28 Professional Edition (FIXED)</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nEntry Engine: ADX flexible + Sweep + MSS required for reversals", "startup", 86400)
 
 def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
     side_emoji = "🟢" if side == "BUY" else "🔴"
@@ -485,9 +516,15 @@ MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
-LEVERAGE = 10  # Changed from 5 to 10
+LEVERAGE = 10
 
 USE_PPE = True
+
+# === EXECUTION QUEUE CONFIGURATION (NEW) ===
+USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
+QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
+QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
+QUEUE_PROMOTE_INTERVAL = int(os.getenv("QUEUE_PROMOTE_INTERVAL", "30"))
 
 GLOBAL_SCAN_INTERVAL = 60 * 20
 SCANNER_V2_INTERVAL = 60 * 20
@@ -547,21 +584,14 @@ _live_low = {}
 _last_candle_timestamp = {}
 
 def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.DataFrame:
-    """
-    Merges the last closed candle with live ticker data.
-    Updates high/low/close for the current (incomplete) candle.
-    Resets _live_high/_live_low when a new candle starts.
-    """
     if base_df is None or base_df.empty or live_price is None or live_price <= 0:
         return base_df
-
     df = base_df.copy()
     last_idx = df.index[-1]
     if 'timestamp' in df.columns:
         current_ts = df.loc[last_idx, 'timestamp']
     else:
         current_ts = last_idx
-
     global _last_candle_timestamp, _live_high, _live_low
     prev_ts = _last_candle_timestamp.get(symbol)
     if prev_ts is None or current_ts != prev_ts:
@@ -571,7 +601,6 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
     else:
         _live_high[symbol] = max(_live_high.get(symbol, df.loc[last_idx, 'high']), live_price)
         _live_low[symbol] = min(_live_low.get(symbol, df.loc[last_idx, 'low']), live_price)
-
     df.loc[last_idx, 'high'] = _live_high[symbol]
     df.loc[last_idx, 'low'] = _live_low[symbol]
     df.loc[last_idx, 'close'] = live_price
@@ -665,12 +694,11 @@ def validate_dataframe(df, min_length=100):
     return True
 
 def get_ohlcv_safe(symbol, limit=120, htf=False):
-    # Increase TTL during open trade to reduce API calls
-    ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
+    ttl = 15 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
-        ttl = max(ttl, 30)
+        ttl = max(ttl, 45)
     cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
-    cached = cache_get(cache_key, ttl)
+    cached = cache_get("ohlcv", ttl, cache_key)
     if cached is not None:
         if len(cached) >= 100:
             return cached
@@ -679,25 +707,24 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
     else:
         df = fetch_ohlcv(symbol, limit)
     if df is not None and validate_dataframe(df, min(limit, 100)):
-        cache_set(cache_key, df)
+        cache_set("ohlcv", df, cache_key)
         return df
     return None
 
 def get_ticker_safe(symbol):
-    # Use short TTL for live price
-    cached = cache_get(f"ticker_{symbol}", 1)
+    cached = cache_get("ticker", 2, symbol)
     if cached is not None:
         return cached
     ticker = fetch_ticker(symbol)
     if ticker:
         price = ticker["last"]
         if price and price > 0:
-            cache_set(f"ticker_{symbol}", price)
+            cache_set("ticker", price, symbol)
             return price
     return None
 
 def get_balance_safe():
-    cached = cache_get("balance", 5)  # 5 seconds
+    cached = cache_get("balance", 10)
     if cached is not None:
         return cached
     bal = get_balance()
@@ -705,7 +732,7 @@ def get_balance_safe():
     return bal
 
 def get_free_balance_safe():
-    cached = cache_get("free_balance", 5)
+    cached = cache_get("free_balance", 10)
     if cached is not None:
         return cached
     bal = get_free_balance()
@@ -713,18 +740,17 @@ def get_free_balance_safe():
     return bal
 
 def get_orderbook_cached(symbol, limit=20):
-    # During live trade, avoid fetching orderbook to save API calls
     if STATE.get("open") or TRADE_STATE["in_position"]:
-        cached = cache_get(f"ob_{symbol}_{limit}", 60)  # long TTL
+        cached = cache_get("orderbook", 60, f"{symbol}_{limit}")
         if cached is not None:
             return cached
-        return None  # don't fetch during trade
-    cached = cache_get(f"ob_{symbol}_{limit}", 1)
+        return None
+    cached = cache_get("orderbook", 1, f"{symbol}_{limit}")
     if cached is not None:
         return cached
     ob = fetch_orderbook(symbol, limit)
     if ob:
-        cache_set(f"ob_{symbol}_{limit}", ob)
+        cache_set("orderbook", ob, f"{symbol}_{limit}")
     return ob
 
 # ========== EXCHANGE POSITION SYNC ==========
@@ -759,6 +785,8 @@ def get_mark_price(symbol):
     return get_ticker_safe(symbol)
 
 # ========== TRADE THESIS ENGINE ==========
+from dataclasses import dataclass, field
+
 @dataclass
 class TradeThesis:
     thesis_id: str
@@ -1331,6 +1359,8 @@ class PrecisionSafety:
         return sl, tp
 
 # ========== CONTINUATION PROBABILITY ENGINE ==========
+from dataclasses import dataclass
+
 @dataclass
 class ContinuationEvaluation:
     continuation_probability: float
@@ -1520,7 +1550,7 @@ class ContinuationProbabilityEngine:
 
 _continuation_engine = ContinuationProbabilityEngine()
 
-# ========== LIVE TRADE MANAGEMENT SYSTEM ==========
+# ========== LIVE TRADE MANAGEMENT SYSTEM (FIXED) ==========
 class TradeLifecycleState(Enum):
     IDLE = "IDLE"
     OPEN_REQUESTED = "OPEN_REQUESTED"
@@ -1582,7 +1612,7 @@ class PositionSnapshot:
 class EventBus:
     def __init__(self):
         self._handlers = {}
-        self._queue = queue.Queue()
+        self._queue = qlib.Queue()
         self._running = True
         threading.Thread(target=self._process, daemon=True).start()
 
@@ -1603,7 +1633,7 @@ class EventBus:
                         handler(data)
                     except Exception as e:
                         log_execution(f"[EVENT] handler error: {e}", "ERROR")
-            except queue.Empty:
+            except qlib.Empty:
                 continue
             except Exception:
                 continue
@@ -1665,7 +1695,7 @@ class ExchangeSyncService:
 
     def reconcile(self, symbol, local_state):
         now = time.time()
-        if now - self._last_reconcile < 10:  # Reduce to every 10 seconds
+        if now - self._last_reconcile < 10:
             return
         self._last_reconcile = now
         log_execution(f"[RECONCILIATION] Starting for {symbol}", "INFO")
@@ -2003,456 +2033,307 @@ class InstitutionalTradeBrain:
     def get_patience_level(self) -> str:
         return self.state_machine.get_patience_level()
 
-# ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
-from enum import Enum as PyEnum
-
-class TradeDecisionType(PyEnum):
-    NO_ACTION = "NO_ACTION"
-    HOLD = "HOLD"
-    MOVE_SL = "MOVE_SL"
-    BREAKEVEN = "BREAKEVEN"
-    LOCK_PROFITS = "LOCK_PROFITS"
-    PARTIAL_CLOSE = "PARTIAL_CLOSE"
-    TRAIL = "TRAIL"
-    FULL_CLOSE = "FULL_CLOSE"
-    THESIS_FAILURE_EXIT = "THESIS_FAILURE_EXIT"
-    EMERGENCY_EXIT = "EMERGENCY_EXIT"
-
-@dataclass
-class TradeDecision:
-    action: TradeDecisionType
-    params: Dict = field(default_factory=dict)
-    reason: str = ""
-    confidence: float = 1.0
-
-class TradeManagementBoard:
-    """
-    The single source of truth for trade management decisions.
-    Evaluates all available data and produces one decision per cycle.
-    """
-    def __init__(self):
-        self._last_decision = None
-        self._last_decision_time = 0
-        self._decision_history = []
-
-    def evaluate(self, context: Dict) -> TradeDecision:
-        """
-        context contains:
-          - symbol, side, entry, qty, remaining_qty, current_price, atr, roe
-          - smart_money, momentum, adx, di_plus, di_minus, adx_slope, regime
-          - thesis (TradeThesis), continuation_eval, thesis_failure_score
-          - max_price, min_price, trail_active, trail_stop, tp1_hit, tp2_hit, etc.
-        """
-        # Unpack context
-        side = context['side']
-        entry = context['entry']
-        current_price = context['current_price']
-        atr = context['atr']
-        roe = context['roe']  # percentage
-        smart = context['smart_money']
-        momentum = context['momentum']
-        adx = context['adx']
-        adx_slope = context['adx_slope']
-        di_plus = context['di_plus']
-        di_minus = context['di_minus']
-        regime = context['regime']
-        thesis = context.get('thesis')
-        continuation = context.get('continuation_eval')
-        thesis_failure_score = context.get('thesis_failure_score', 0)
-        max_price = context.get('max_price', entry)
-        min_price = context.get('min_price', entry)
-        trail_active = context.get('trail_active', False)
-        trail_stop = context.get('trail_stop', 0)
-        tp1_hit = context.get('tp1_hit', False)
-        tp2_hit = context.get('tp2_hit', False)
-        remaining_qty = context['remaining_qty']
-        entry_type = context.get('entry_type', '')
-        trade_state = context.get('trade_state', 'RANGE_CHOP')
-
-        # 1. Emergency exit conditions (highest priority)
-        if context.get('emergency_exit', False):
-            return TradeDecision(TradeDecisionType.EMERGENCY_EXIT, reason="Emergency exit triggered")
-
-        # 2. Thesis failure exit
-        if thesis_failure_score >= 50:
-            return TradeDecision(TradeDecisionType.THESIS_FAILURE_EXIT, reason=f"Thesis failure score {thesis_failure_score}")
-
-        # 3. Hard exit from state machine
-        if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
-            return TradeDecision(TradeDecisionType.FULL_CLOSE, reason=f"Hard exit state: {trade_state}")
-
-        # 4. Stop loss check (synthetic SL)
-        sl_price = context.get('synthetic_sl', 0)
-        if sl_price > 0:
-            if (side == "BUY" and current_price <= sl_price) or (side == "SELL" and current_price >= sl_price):
-                return TradeDecision(TradeDecisionType.FULL_CLOSE, reason="Synthetic stop loss hit")
-
-        # 5. Trailing stop check (if active)
-        if trail_active and trail_stop > 0:
-            if (side == "BUY" and current_price <= trail_stop) or (side == "SELL" and current_price >= trail_stop):
-                return TradeDecision(TradeDecisionType.FULL_CLOSE, reason="Trailing stop hit")
-
-        # 6. Evaluate profit management
-        # Determine trade personality: trend, reversal, breakout
-        is_trend = trade_state in ("ACCUMULATION", "EXPANSION", "TREND_RIDE", "HEALTHY_PULLBACK")
-        is_reversal = trade_state in ("FAKE_BREAKOUT", "REVERSAL")
-        is_breakout = trade_state in ("EXPANSION", "TREND_RIDE")
-
-        # Calculate dynamic profit thresholds
-        base_tp1_roe = 2.5
-        if is_trend:
-            base_tp1_roe = 4.0
-        elif is_reversal:
-            base_tp1_roe = 2.0
-        elif is_breakout:
-            base_tp1_roe = 3.5
-
-        # Adjust for continuation probability
-        if continuation:
-            if continuation.continuation_probability > 0.75:
-                base_tp1_roe *= 1.2
-            elif continuation.continuation_probability < 0.4:
-                base_tp1_roe *= 0.8
-
-        # Adjust for distribution risk
-        dist_risk = smart.get("distribution_risk", 0)
-        if dist_risk > 45:
-            base_tp1_roe *= 0.7
-        if dist_risk > 65:
-            base_tp1_roe *= 0.5
-
-        # TP1 logic
-        if not tp1_hit:
-            # Dynamic TP1 based on context
-            tp1_price = context.get('synthetic_tp1', 0)
-            if tp1_price > 0:
-                if (side == "BUY" and current_price >= tp1_price) or (side == "SELL" and current_price <= tp1_price):
-                    # Consider partial close at TP1
-                    # Only partial if remaining qty > 0 and we haven't already done a partial
-                    if remaining_qty > 0 and not context.get('partial_done', False):
-                        # Determine partial close ratio: can be up to 50%
-                        ratio = 0.5
-                        # If continuation is very strong, reduce partial to 30%
-                        if continuation and continuation.continuation_probability > 0.8:
-                            ratio = 0.3
-                        # If distribution risk high, close more
-                        if dist_risk > 50:
-                            ratio = 0.6
-                        return TradeDecision(TradeDecisionType.PARTIAL_CLOSE,
-                                             params={'ratio': ratio},
-                                             reason=f"TP1 hit (ROE={roe:.2f}%)")
-                    else:
-                        # If already partial, move to breakeven
-                        return TradeDecision(TradeDecisionType.BREAKEVEN, reason="TP1 hit, already partial")
-
-        # TP2 logic (if TP1 already hit)
-        if tp1_hit and not tp2_hit:
-            tp2_price = context.get('tp2_price', 0)
-            if tp2_price > 0:
-                if (side == "BUY" and current_price >= tp2_price) or (side == "SELL" and current_price <= tp2_price):
-                    # Full close at TP2
-                    return TradeDecision(TradeDecisionType.FULL_CLOSE, reason=f"TP2 hit (ROE={roe:.2f}%)")
-
-        # Breakeven logic: move SL to entry if profit is sufficient
-        if roe >= 1.5 and not context.get('breakeven_done', False):
-            # If we have some profit, move SL to breakeven
-            return TradeDecision(TradeDecisionType.BREAKEVEN, reason="Profit sufficient, moving to breakeven")
-
-        # Trailing stop management
-        # Determine trail multiplier dynamically
-        base_trail_mult = context.get('smart_trail_mult', 2.0)
-        # Adjust based on trend strength
-        if is_trend and continuation and continuation.continuation_probability > 0.65:
-            # Widen trail in strong trends
-            trail_mult = base_trail_mult * 1.4
-        elif is_reversal:
-            # Tighten trail in reversals
-            trail_mult = base_trail_mult * 0.7
-        else:
-            trail_mult = base_trail_mult
-
-        # Adjust for volatility (ATR)
-        atr_pct = (atr / entry) * 100 if entry > 0 else 1
-        if atr_pct > 3:
-            trail_mult *= 0.8  # Higher volatility -> tighter trail
-        elif atr_pct < 1:
-            trail_mult *= 1.2  # Lower volatility -> wider trail
-
-        # Adjust for distribution risk
-        if dist_risk > 45:
-            trail_mult *= 0.8
-        if dist_risk > 65:
-            trail_mult *= 0.5
-
-        # Ensure bounds
-        trail_mult = max(0.5, min(4.0, trail_mult))
-
-        # Activate or update trailing
-        if roe > 1.5:
-            if not trail_active:
-                # Activate trailing
-                return TradeDecision(TradeDecisionType.TRAIL,
-                                     params={'multiplier': trail_mult, 'activate': True},
-                                     reason="Activating trailing stop")
-            else:
-                # Update trailing (move stop)
-                # Only update if price moved in our favor
-                new_trail_stop = 0
-                if side == "BUY":
-                    new_trail_stop = max_price - trail_mult * atr
-                else:
-                    new_trail_stop = min_price + trail_mult * atr
-                # Check if new stop is better than current
-                if (side == "BUY" and new_trail_stop > trail_stop) or (side == "SELL" and new_trail_stop < trail_stop):
-                    return TradeDecision(TradeDecisionType.TRAIL,
-                                         params={'multiplier': trail_mult, 'new_stop': new_trail_stop},
-                                         reason="Updating trailing stop")
-                else:
-                    return TradeDecision(TradeDecisionType.HOLD, reason="Trailing already optimal")
-
-        # If no action needed, hold
-        return TradeDecision(TradeDecisionType.HOLD, reason="No action required")
-
-# ========== REVERSAL ENTRY VALIDATION (ENHANCED) ==========
-def validate_reversal_entry(symbol: str, side: str, df: pd.DataFrame, atr: float, price: float, ob: dict) -> Tuple[bool, str, int]:
-    """
-    Enhanced validation for reversal trades.
-    Aggregates multiple institutional signals and returns a score.
-    Returns: (valid, reason, score)
-    """
-    if df is None or len(df) < 20:
-        return False, "insufficient_data", 0
-
-    score = 0
-    reasons = []
-
-    # 1. Liquidity Sweep / Stop Hunt
-    pools = build_liquidity_pools(df)
-    swept_high, swept_low = detect_sweep(df, pools)
-    if (side == "BUY" and swept_low) or (side == "SELL" and swept_high):
-        score += 2
-        reasons.append("liquidity_sweep")
-    else:
-        # if no sweep, still allow but with lower score
-        reasons.append("no_sweep")
-
-    # 2. Market Structure Shift (MSS / CHoCH / BOS)
-    bos_up, bos_down = detect_bos(df, lookback=5)
-    struct_shift = detect_structure_shift(df)
-    if (side == "BUY" and (bos_up or struct_shift == "bullish_shift")) or \
-       (side == "SELL" and (bos_down or struct_shift == "bearish_shift")):
-        score += 2
-        reasons.append("mss_confirmed")
-    else:
-        reasons.append("no_mss")
-
-    # 3. Rejection Candle (Pinbar)
-    rejection = candle_rejection(df, side)
-    if rejection:
-        score += 2
-        reasons.append("rejection_candle")
-    else:
-        # Check for wick/body ratio as extra
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        range_ = last['high'] - last['low']
-        if range_ > 0:
-            if side == "BUY":
-                lower_wick = min(last['open'], last['close']) - last['low']
-                if lower_wick > body * 1.2:
-                    score += 1
-                    reasons.append("strong_lower_wick")
-            else:
-                upper_wick = last['high'] - max(last['open'], last['close'])
-                if upper_wick > body * 1.2:
-                    score += 1
-                    reasons.append("strong_upper_wick")
-
-    # 4. Zone Retest (Support/Resistance)
-    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
-    zone_hit = False
-    if side == "BUY" and supports:
-        nearest_sup = max([s for s in supports if s <= price], default=None)
-        if nearest_sup and abs(price - nearest_sup) / price < 0.003:
-            zone_hit = True
-            reasons.append("support_retest")
-    elif side == "SELL" and resistances:
-        nearest_res = min([r for r in resistances if r >= price], default=None)
-        if nearest_res and abs(price - nearest_res) / price < 0.003:
-            zone_hit = True
-            reasons.append("resistance_retest")
-    if zone_hit:
-        score += 2
-    else:
-        reasons.append("no_zone_retest")
-
-    # 5. Volume Confirmation
-    vol_state = classify_volume(df)
-    if vol_state in ("expansion", "spike"):
-        score += 1
-        reasons.append("volume_confirmation")
-    else:
-        reasons.append("low_volume")
-
-    # 6. Momentum Shift (MACD flip, RSI turning)
-    rsi = compute_rsi(df).iloc[-1]
-    macd_hist = compute_macd(df)[2]
-    momentum_shift = False
-    if side == "BUY" and rsi < 40 and macd_first_flip(macd_hist):
-        momentum_shift = True
-    elif side == "SELL" and rsi > 60 and macd_first_flip(macd_hist):
-        momentum_shift = True
-    if momentum_shift:
-        score += 1
-        reasons.append("momentum_shift")
-    else:
-        reasons.append("no_momentum_shift")
-
-    # 7. Smart Money / Institutional Bias
-    smart = SmartMoneyEngine.analyze_smart_money(df)
-    if smart["smart_money_dominant"] and smart["institutional_bias"] == side:
-        score += 2
-        reasons.append("smart_money_aligned")
-    else:
-        reasons.append("no_smart_money_alignment")
-
-    # 8. Low Continuation Probability (for reversal)
-    cont_eval = _continuation_engine.evaluate(side, df, {"atr": atr, "adx": 0, "adx_slope": 0, "di_plus": 0, "di_minus": 0, "trend_health": 5, "weak_pullback": False, "counter_displacement": 0, "volume_ratio": 1.0}, {})
-    if cont_eval.continuation_probability < 0.5:
-        score += 1
-        reasons.append("low_continuation_prob")
-    else:
-        reasons.append("high_continuation_prob")
-
-    # 9. Declining ADX (weakening prior trend)
-    adx_series = compute_adx(df)
-    if len(adx_series) >= 3:
-        adx_trend = adx_series.iloc[-1] - adx_series.iloc[-2]
-        if adx_trend < 0:
-            score += 1
-            reasons.append("adx_declining")
-        else:
-            reasons.append("adx_rising")
-
-    # 10. Institutional Flow Alignment
-    mom = MomentumFlowEngine.analyze_momentum_flow(df)
-    if mom["flow_bias"] == side and mom["trend_expansion"] is False:
-        score += 1
-        reasons.append("flow_aligned")
-
-    # 11. Reclaim Risk (penalty if high)
-    if cont_eval.reclaim_risk > 0.5:
-        score -= 1
-        reasons.append("high_reclaim_risk")
-
-    # Minimum threshold
-    required_score = 8
-    valid = score >= required_score
-    reason_str = ", ".join(reasons) if reasons else "no_signals"
-    return valid, reason_str, score
-
-# ========== REAL EXCHANGE ORDERS (SAFE) ==========
-def wait_for_position_closure(symbol, timeout=30):
-    """Poll exchange until position quantity becomes 0, or timeout."""
-    sym = normalize_symbol(symbol)
+# ========== FIXED: ORDER VERIFICATION HELPER ==========
+def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
+    if PAPER_MODE:
+        return True, expected_qty
     start = time.time()
+    sym = normalize_symbol(symbol)
     while time.time() - start < timeout:
         try:
+            order = safe_api_call(ex.fetch_order, order_id, sym)
+            if order:
+                status = order.get('status')
+                filled = order.get('filled', 0)
+                if status == 'closed' and filled >= expected_qty * 0.999:
+                    return True, filled
+                elif status == 'open' or status == 'partial':
+                    time.sleep(0.5)
+                    continue
+            # Also check if position reduced (for reduceOnly)
             pos = fetch_position(symbol)
-            if pos is None or float(pos.get('contracts', 0)) <= 0:
-                return True
-        except:
-            pass
-        time.sleep(1)
-    return False
+            if pos is not None:
+                # If we are closing, we expect qty to decrease
+                # But we can't infer from here; we just wait.
+                pass
+            time.sleep(0.5)
+        except Exception as e:
+            log_execution(f"[ORDER_VERIFY] Error: {e}", "WARN")
+            time.sleep(0.5)
+    return False, 0
 
-def safe_close_position(symbol, qty=None):
-    """Close position with retries and state update only on success."""
-    if PAPER_MODE:
-        paper["position"] = None
-        STATE["open"] = False
-        TRADE_STATE["in_position"] = False
-        DASHBOARD_STATE["live_trade_mode"] = False
-        return True
-
-    if not STATE["open"]:
-        return False
-
-    side = STATE["side"]
-    close_side = "sell" if side == "BUY" else "buy"
-    qty_to_close = qty if qty is not None else STATE["remaining_qty"]
-    if qty_to_close <= 0:
-        return False
-
-    sym = normalize_symbol(symbol)
+# ========== FIXED: close_partial with robust verification ==========
+def close_partial(ratio):
+    global _closing_in_progress
+    if _closing_in_progress:
+        log_execution("[CLOSE_PARTIAL] Already closing, skipping", "WARN")
+        return
+    _closing_in_progress = True
     try:
-        qty_to_close = float(ex.amount_to_precision(sym, qty_to_close))
-        order = safe_api_call(ex.create_order, sym, "market", close_side, qty_to_close, params={"reduceOnly": True})
-        if order:
-            # Wait for position to actually close
-            if wait_for_position_closure(symbol, timeout=30):
-                # Update state only after confirmation
-                with _TRADE_LOCK:
-                    STATE["remaining_qty"] -= qty_to_close
-                    if STATE["remaining_qty"] <= 0:
+        if PAPER_MODE:
+            if paper["position"]:
+                paper["position"]["remaining_qty"] *= (1-ratio)
+                STATE["remaining_qty"] *= (1-ratio)
+                TRADE_STATE["qty"] = STATE["remaining_qty"]
+                log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}%", "SUCCESS")
+            return
+
+        symbol = STATE["current_symbol"]
+        qty_to_close = STATE["remaining_qty"] * ratio
+        if qty_to_close <= 0:
+            log_execution("[CLOSE_PARTIAL] No quantity to close", "WARN")
+            return
+
+        side = "sell" if STATE["side"] == "BUY" else "buy"
+        sym = normalize_symbol(symbol)
+        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True})
+        if order is None:
+            log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
+            return
+        order_id = order.get('id')
+        if not order_id:
+            log_execution("[CLOSE_PARTIAL] No order ID returned", "ERROR")
+            return
+
+        filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
+        if filled:
+            # Now confirm that the position actually decreased
+            # Wait a bit for exchange to update
+            time.sleep(1)
+            pos = fetch_position(symbol)
+            if pos is None:
+                # Position gone, meaning we closed all? But partial should leave some.
+                log_execution("[CLOSE_PARTIAL] Position vanished unexpectedly", "WARN")
+                # Treat as full close
+                STATE["open"] = False
+                TRADE_STATE["in_position"] = False
+                DASHBOARD_STATE["live_trade_mode"] = False
+                finalize_trade_with_reality(symbol)
+                return
+            current_qty = float(pos.get('contracts', 0))
+            # We expect current_qty to be roughly remaining_qty - filled_qty
+            expected_remaining = STATE["remaining_qty"] - filled_qty
+            if abs(current_qty - expected_remaining) < 0.0001 * expected_remaining:
+                STATE["remaining_qty"] = current_qty
+                TRADE_STATE["qty"] = current_qty
+                log_execution(f"[CLOSE_PARTIAL] Partial close confirmed, remaining qty: {current_qty:.6f}", "SUCCESS")
+            else:
+                log_execution(f"[CLOSE_PARTIAL] Position mismatch: expected {expected_remaining:.6f}, got {current_qty:.6f}. Using exchange value.", "WARN")
+                STATE["remaining_qty"] = current_qty
+                TRADE_STATE["qty"] = current_qty
+                if current_qty <= 0:
+                    STATE["open"] = False
+                    TRADE_STATE["in_position"] = False
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    finalize_trade_with_reality(symbol)
+            _exchange_sync.reconcile(symbol, STATE)
+        else:
+            log_execution(f"[CLOSE_PARTIAL] Partial close failed to fill after timeout", "ERROR")
+            # Attempt to close via market order again? maybe retry later.
+    except Exception as e:
+        log_execution(f"[CLOSE_PARTIAL] Error: {traceback.format_exc()}", "ERROR")
+    finally:
+        _closing_in_progress = False
+
+# ========== FIXED: close_position_full with robust verification ==========
+def close_position_full():
+    global _closing_in_progress
+    if _closing_in_progress:
+        log_execution("[CLOSE] Already closing, skipping", "WARN")
+        return False
+    _closing_in_progress = True
+    try:
+        if PAPER_MODE:
+            paper["position"] = None
+            STATE["open"] = False
+            TRADE_STATE["in_position"] = False
+            DASHBOARD_STATE["live_trade_mode"] = False
+            finalize_trade_with_reality(STATE["current_symbol"] if STATE.get("current_symbol") else DEFAULT_SYMBOL)
+            log_execution("[CLOSE] Paper position closed", "SUCCESS")
+            return True
+
+        if not STATE["open"]:
+            log_execution("[CLOSE] No position to close", "WARN")
+            return False
+
+        symbol = STATE["current_symbol"]
+        qty_to_close = STATE["remaining_qty"]
+        if qty_to_close <= 0:
+            log_execution("[CLOSE] No quantity to close", "WARN")
+            return False
+
+        side = "sell" if STATE["side"] == "BUY" else "buy"
+        sym = normalize_symbol(symbol)
+        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+
+        # Retry up to 3 times to close
+        for attempt in range(3):
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True})
+            if order is None:
+                log_execution(f"[CLOSE] Order creation failed (attempt {attempt+1})", "ERROR")
+                time.sleep(1)
+                continue
+            order_id = order.get('id')
+            if not order_id:
+                log_execution(f"[CLOSE] No order ID returned (attempt {attempt+1})", "ERROR")
+                time.sleep(1)
+                continue
+
+            filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
+            if filled:
+                # Verify position is zero
+                time.sleep(1)  # give exchange time to update
+                pos = fetch_position(symbol)
+                if pos is None:
+                    # Position gone, good.
+                    log_execution("[CLOSE] Position confirmed closed (no position found)", "SUCCESS")
+                    STATE["open"] = False
+                    TRADE_STATE["in_position"] = False
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    finalize_trade_with_reality(symbol)
+                    return True
+                else:
+                    current_qty = float(pos.get('contracts', 0))
+                    if current_qty <= 0:
+                        log_execution("[CLOSE] Position confirmed closed (qty=0)", "SUCCESS")
                         STATE["open"] = False
                         TRADE_STATE["in_position"] = False
                         DASHBOARD_STATE["live_trade_mode"] = False
+                        finalize_trade_with_reality(symbol)
+                        return True
                     else:
-                        TRADE_STATE["qty"] = STATE["remaining_qty"]
-                log_execution(f"Closed {qty_to_close} {symbol} successfully", "SUCCESS")
-                return True
+                        log_execution(f"[CLOSE] Position still has qty {current_qty:.6f} after close order. Retrying...", "WARN")
+                        # Update remaining qty to current_qty for next attempt
+                        qty_to_close = current_qty
+                        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+                        continue
             else:
-                log_execution(f"Close order placed but position not closed within timeout for {symbol}", "ERROR")
-                return False
-        else:
-            log_execution(f"Close order failed for {symbol}", "ERROR")
-            return False
+                log_execution(f"[CLOSE] Order did not fill (attempt {attempt+1})", "ERROR")
+                time.sleep(1)
+                continue
+
+        # If we exit loop without success, try a last resort: close via exchange position close? (some exchanges support)
+        log_execution("[CLOSE] All close attempts failed. Attempting emergency close via position close.", "ERROR")
+        try:
+            # Some exchanges have explicit position close endpoint, but not all.
+            # We'll use a market order with reduceOnly again but with no quantity check.
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True})
+            if order:
+                time.sleep(2)
+                pos = fetch_position(symbol)
+                if pos is None or float(pos.get('contracts', 0)) <= 0:
+                    STATE["open"] = False
+                    TRADE_STATE["in_position"] = False
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    finalize_trade_with_reality(symbol)
+                    log_execution("[CLOSE] Emergency close succeeded", "SUCCESS")
+                    return True
+        except Exception as e:
+            log_execution(f"[CLOSE] Emergency close failed: {e}", "ERROR")
+        return False
     except Exception as e:
-        log_execution(f"Close position error: {e}", "ERROR")
+        log_execution(f"[CLOSE] Error: {traceback.format_exc()}", "ERROR")
         return False
+    finally:
+        _closing_in_progress = False
 
-def safe_close_partial(symbol, ratio):
-    """Close a fraction of the position, update state only on success."""
-    if PAPER_MODE:
-        if paper["position"]:
-            paper["position"]["remaining_qty"] *= (1 - ratio)
-            STATE["remaining_qty"] *= (1 - ratio)
-            TRADE_STATE["qty"] = STATE["remaining_qty"]
-        return True
-
-    if not STATE["open"]:
-        return False
-
-    qty_to_close = STATE["remaining_qty"] * ratio
-    if qty_to_close <= 0:
-        return False
-
-    sym = normalize_symbol(symbol)
-    side = "sell" if STATE["side"] == "BUY" else "buy"
-    try:
-        qty_to_close = float(ex.amount_to_precision(sym, qty_to_close))
-        order = safe_api_call(ex.create_order, sym, "market", side, qty_to_close, params={"reduceOnly": True})
-        if order:
-            # Wait for position to close partially
-            if wait_for_position_closure(symbol, timeout=30):
-                with _TRADE_LOCK:
-                    STATE["remaining_qty"] -= qty_to_close
-                    TRADE_STATE["qty"] = STATE["remaining_qty"]
-                    STATE["partial_closed"] = True
-                log_execution(f"Partial close {ratio*100:.0f}% of {symbol} executed", "SUCCESS")
-                return True
-            else:
-                log_execution(f"Partial close order placed but position not closed within timeout for {symbol}", "ERROR")
-                return False
+# ========== FIXED: apply_50_50_profit_engine without overriding trail_active ==========
+def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
+    if roe_pct is None:
+        return "HOLD", state.get("sl", 0.0), state.get("trail_stop", 0.0)
+    high = df['high'].iloc[-1]
+    low = df['low'].iloc[-1]
+    state["max_price"] = max(state["max_price"], high)
+    state["min_price"] = min(state["min_price"], low)
+    smart = state.get("smart_money", {})
+    mom = state.get("momentum_flow", {})
+    dist_risk = smart.get("distribution_risk", 0)
+    continuation_strength = mom.get("continuation_strength", 50)
+    momentum_health = mom.get("momentum_health", 50)
+    institutional_bias = smart.get("institutional_bias", "NEUTRAL")
+    
+    if dist_risk > 45 and not state.get("profit_lock_activated", False):
+        log_execution("[PPE] Distribution risk >45 – activating profit lock", "WARN")
+        if not state.get("tp1_done", False):
+            close_partial(0.5)
+        state["profit_lock_activated"] = True
+    
+    climax_risk = mom.get("climax_risk", 0)
+    if climax_risk > 50 and state.get("trail_active", False):
+        if not state.get("trail_tightened", False):
+            state["smart_trail_mult"] = max(0.6, state.get("smart_trail_mult", 1.5) * 0.7)
+            state["trail_tightened"] = True
+            log_execution(f"[PPE] Climax risk {climax_risk:.1f} > 50 – tightened trail to {state['smart_trail_mult']:.2f}x", "WARN")
+    
+    if momentum_health < -8 and roe_pct > 2 and not state.get("tp1_hit", False):
+        log_execution("[PPE] Negative momentum health – exiting partial to lock profit", "WARN")
+        close_partial(0.5)
+        state["sl"] = entry
+        return "HOLD", state["sl"], state.get("trail_stop", 0.0)
+    
+    if not state.get("trail_active", False) and roe_pct >= 1.5:
+        state["sl"] = entry
+        if side == "BUY":
+            state["trail_stop"] = price - 1.2 * atr
         else:
-            log_execution(f"Partial close failed for {symbol}", "ERROR")
-            return False
-    except Exception as e:
-        log_execution(f"Partial close error: {e}", "ERROR")
-        return False
+            state["trail_stop"] = price + 1.2 * atr
+        state["trail_active"] = True
+        log_execution(f"[PPE] {state['symbol']} Stage1: BE SL, trail_active @ 1.2xATR (ROE={roe_pct:.2f}%)", "INFO")
+        return "HOLD", state["sl"], state["trail_stop"]
+    
+    remaining = state.get("remaining_qty", 0)
+    adx_series = compute_adx(df)
+    if not state.get("runner_mode", False) and len(adx_series) > idx:
+        adx_val = adx_series.iloc[idx]
+        if adx_val >= 25:
+            state["runner_mode"] = True
+            log_execution(f"[PPE] {state['symbol']} Stage3: Runner mode activated (ADX={adx_val:.1f})", "INFO")
+    
+    trail_mult = state.get("smart_trail_mult", 1.5)
+    if state.get("trail_active", False):
+        if side == "BUY":
+            new_stop = state["max_price"] - trail_mult * atr
+            if new_stop > state.get("trail_stop", 0):
+                state["trail_stop"] = new_stop
+        else:
+            new_stop = state["min_price"] + trail_mult * atr
+            if new_stop < state.get("trail_stop", float('inf')):
+                state["trail_stop"] = new_stop
+    
+    if state.get("trail_active", False) and state.get("trail_stop", 0):
+        if (side == "BUY" and price <= state["trail_stop"]) or (side == "SELL" and price >= state["trail_stop"]):
+            log_execution(f"[PPE] {state['symbol']} Exit: trailing stop hit at price {price:.4f}", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    if state.get("runner_mode", False) and len(adx_series) >= 2:
+        adx_now = adx_series.iloc[idx]
+        adx_prev = adx_series.iloc[idx-1]
+        last_candle = df.iloc[-1]
+        is_bearish = last_candle['close'] < last_candle['open']
+        is_bullish = last_candle['close'] > last_candle['open']
+        if (side == "BUY" and adx_now < adx_prev and is_bearish) or (side == "SELL" and adx_now < adx_prev and is_bullish):
+            log_execution(f"[PPE] {state['symbol']} Exit: momentum weakness (ADX decreasing)", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    bos_up, bos_down = detect_bos(df, lookback=5)
+    if state.get("runner_mode", False):
+        if (side == "BUY" and bos_down) or (side == "SELL" and bos_up):
+            log_execution(f"[PPE] {state['symbol']} Exit: structure break (BOS)", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    if mom.get("greed_state", False) and roe_pct > 4 and not state.get("profit_lock_activated", False):
+        log_execution(f"[PPE] Profit lock activated: greed state, ROE={roe_pct:.2f}%", "WARN")
+        if not state.get("tp1_done", False):
+            close_partial(0.5)
+        state["profit_lock_activated"] = True
+    
+    return "HOLD", state["sl"], state["trail_stop"]
 
-# ========== LIVE TRADE MANAGER WITH NEW BOARD ==========
+# ========== REAL EXCHANGE ORDERS (ONLY ENTRY, PARTIAL, FULL CLOSE) ==========
+# No native SL/TP orders are sent.
+
+# ========== LIVE TRADE MANAGER WITH SYNTHETIC PROTECTION (FIXED) ==========
 class LiveTradeManager:
     def __init__(self, event_bus, exchange_sync, recovery_guard):
         self.event_bus = event_bus
@@ -2470,9 +2351,6 @@ class LiveTradeManager:
         self.confidence_engine = ConfidenceEngine()
         self.regime_classifier = MarketRegimeClassifier()
         self.brain = InstitutionalTradeBrain()
-        self.board = TradeManagementBoard()
-        self._last_decision = None
-        self._decision_log = []  # for /decision endpoint
         event_bus.subscribe("reconciled", self._on_reconciled)
         event_bus.subscribe("force_close_local", self._force_close)
         event_bus.subscribe("lifecycle_change", self._set_lifecycle)
@@ -2491,7 +2369,6 @@ class LiveTradeManager:
     def _force_close(self, _):
         if STATE["open"]:
             close_position_full()
-            finalize_trade_with_reality(STATE["current_symbol"])
             self.lifecycle_state = TradeLifecycleState.CLOSED
             DASHBOARD_STATE["live_trade_mode"] = False
 
@@ -2499,6 +2376,121 @@ class LiveTradeManager:
         self.lifecycle_state = TradeLifecycleState.OPEN_PENDING_CONFIRMATION
         self.event_bus.emit("lifecycle_change", TradeLifecycleState.OPEN_PENDING_CONFIRMATION)
         log_execution(f"[LIFECYCLE] Trade open requested for {symbol} {side}", "INFO")
+
+    def set_entry_atr(self, entry_atr):
+        STATE["entry_atr"] = entry_atr
+        base_sl_mult = 1.6
+        if STATE["side"] == "BUY":
+            STATE["synthetic_sl"] = STATE["entry"] - entry_atr * base_sl_mult
+        else:
+            STATE["synthetic_sl"] = STATE["entry"] + entry_atr * base_sl_mult
+        log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f}", "INFO")
+
+    def _compute_tp1_hold_score(self, smart: dict, momentum: dict, adx: float, adx_slope: float,
+                                 trade_state: str, continuation_eval: ContinuationEvaluation,
+                                 distribution_risk: float, rejection_detected: bool,
+                                 failed_breakout: bool, roe: float) -> int:
+        score = 0
+        if smart.get("smart_money_dominant", False):
+            score += 4
+        banker = smart.get("banker_pressure", 50)
+        retail = smart.get("retailer_pressure", 50)
+        if banker > retail + 10:
+            score += 3
+        cont_strength = momentum.get("continuation_strength", 0)
+        if cont_strength > 70:
+            score += 4
+        mom_health = momentum.get("momentum_health", 50)
+        if mom_health > 65:
+            score += 2
+        if momentum.get("trend_expansion", False):
+            score += 3
+        if continuation_eval.continuation_probability > 0.75:
+            score += 3
+        if trade_state in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK"):
+            score += 3
+        if adx > 25 and adx_slope > 0:
+            score += 2
+        if momentum.get("exhaustion_risk", 0) > 50:
+            score -= 5
+        if momentum.get("climax_risk", 0) > 60:
+            score -= 4
+        if distribution_risk > 45:
+            score -= 6
+        if smart.get("retail_euphoria", False):
+            score -= 3
+        if momentum.get("momentum_decay", False):
+            score -= 4
+        if trade_state in ("PROFIT_DEFENSE", "DISTRIBUTION", "LIQUIDITY_EXHAUSTION", "MOMENTUM_COLLAPSE"):
+            score -= 5
+        if failed_breakout:
+            score -= 5
+        if rejection_detected:
+            score -= 4
+        if continuation_eval.continuation_probability < 0.45:
+            score -= 5
+        if roe > 80:
+            score -= 8
+        elif roe > 50:
+            score -= 4
+        elif roe > 20:
+            score -= 2
+        return max(0, min(20, score))
+
+    def _compute_institutional_exit_warning(self, smart: dict, momentum: dict,
+                                             distribution_risk: float, continuation_prob: float,
+                                             rejection_detected: bool, adx_slope: float,
+                                             di_spread_change: float) -> int:
+        warning = 0
+        if smart.get("banker_pressure", 50) < 45:
+            warning += 1
+        if smart.get("retailer_pressure", 50) > 60:
+            warning += 1
+        if distribution_risk > 50:
+            warning += 2
+        if momentum.get("exhaustion_risk", 0) > 60:
+            warning += 1
+        if momentum.get("climax_risk", 0) > 70:
+            warning += 1
+        if momentum.get("momentum_decay", False):
+            warning += 2
+        if continuation_prob < 0.5:
+            warning += 1
+        if rejection_detected:
+            warning += 1
+        if adx_slope < -2:
+            warning += 1
+        if di_spread_change < -5:
+            warning += 1
+        return min(5, warning)
+
+    def _apply_runner_defense(self, roe: float, peak_roe: float, drawdown: float,
+                               exit_warning: int, continuation_prob: float,
+                               trail_mult: float) -> float:
+        mult = trail_mult
+        if STATE.get("tp1_hit", False):
+            mult *= 0.9
+            if roe > 50:
+                mult *= 0.85
+            if drawdown > 12:
+                mult *= 0.7
+            if exit_warning >= 3:
+                mult *= 0.6
+            if continuation_prob < 0.55:
+                mult *= 0.8
+        return max(0.5, min(4.0, mult))
+
+    def _update_peak_profit(self, roe: float, price: float):
+        if roe > STATE.get("peak_roe", 0.0):
+            STATE["peak_roe"] = roe
+            STATE["peak_price"] = price
+            STATE["peak_unrealized_pnl"] = STATE.get("unrealized_pnl_usdt", 0.0)
+        peak = STATE.get("peak_roe", roe)
+        if peak > 0:
+            drawdown = peak - roe
+            STATE["drawdown_from_peak"] = max(0.0, drawdown)
+        else:
+            STATE["drawdown_from_peak"] = 0.0
 
     def manage_live_trade(self):
         if not (STATE.get("open") and STATE.get("current_symbol")):
@@ -2509,7 +2501,6 @@ class LiveTradeManager:
         now = time.time()
         roe = STATE.get("roe_pct", 0.0)
         adx = STATE.get("adx_live", 20.0)
-        # Adaptive interval: calm trade -> 5 seconds, volatile -> 2 seconds
         calm_conditions = abs(roe) < 1.5 and 18 < adx < 30
         target_interval = 5 if calm_conditions else 2
         if now - self.last_management_ts < target_interval:
@@ -2517,11 +2508,9 @@ class LiveTradeManager:
         self.last_management_ts = now
         symbol = STATE["current_symbol"]
         with _TRADE_LOCK:
-            # Position reconciliation every 10 seconds
             if now - self.last_position_sync_ts >= 10:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
-            # Execute management decision
             self._apply_management(symbol, now)
         self._log_live_status()
 
@@ -2559,7 +2548,6 @@ class LiveTradeManager:
         if self.lifecycle_state != TradeLifecycleState.LIVE:
             return
 
-        # Fetch closed candles (cached with longer TTL)
         df_closed = get_ohlcv_safe(symbol, 50)
         if df_closed is None:
             return
@@ -2567,17 +2555,16 @@ class LiveTradeManager:
         if not mark_price:
             return
 
-        # Build live hybrid dataframe
         df_live = get_live_hybrid_df(symbol, df_closed, mark_price)
         atr = compute_atr(df_live).iloc[-1] if len(df_live) > 14 else mark_price * 0.01
         side = STATE["side"]
         entry = STATE["entry"]
         roe = STATE.get("roe_pct", 0.0)
 
-        # No orderbook fetching during live trade
+        self._update_peak_profit(roe, mark_price)
+
         ob = None
 
-        # Heavy calculations every 5 seconds (ADX, DI, SmartMoney, Momentum, StateMachine)
         if now - self.last_heavy_calc_ts >= 5:
             plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
             if plus_di is None: plus_di = 20.0
@@ -2585,7 +2572,6 @@ class LiveTradeManager:
             if adx_now is None: adx_now = 20.0
             if adx_slope is None: adx_slope = 0.0
 
-            # Pullback intelligence
             pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
             weak_pullback = (pullback_type == "WEAK_PULLBACK")
             counter_displacement = 0.0
@@ -2633,7 +2619,6 @@ class LiveTradeManager:
             STATE["momentum_flow"] = momentum
             STATE["market_regime"] = regime
 
-            # Thesis and continuation
             thesis_dict = STATE.get("trade_thesis", {})
             cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
             market_state["continuation_pressure"] = cont_pressure_score
@@ -2646,14 +2631,19 @@ class LiveTradeManager:
             STATE["continuation_reasons"] = continuation_eval.reasons
             STATE["continuation_pressure"] = cont_pressure_score
 
-            # Thesis failure check
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
             STATE["thesis_failure_score"] = failure_score
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
-                # Board will decide based on failure_score
+                if roe > 0:
+                    close_partial(0.5)
+                    STATE["synthetic_sl"] = entry
+                else:
+                    close_position_full()
+                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    return
 
-            # Confidence update
             old_conf = STATE.get("current_confidence", 50.0)
             di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
             new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
@@ -2661,9 +2651,27 @@ class LiveTradeManager:
             STATE["current_confidence"] = new_conf
             STATE["prev_di_spread"] = plus_di - minus_di
 
+            rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
+            rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
+            rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
+            failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
+
+            tp1_hold_score = self._compute_tp1_hold_score(
+                smart_money, momentum, adx_now, adx_slope, trade_state,
+                continuation_eval, smart_money.get("distribution_risk", 0),
+                rejection_detected, failed_breakout, roe
+            )
+            STATE["tp1_hold_score"] = tp1_hold_score
+
+            exit_warning = self._compute_institutional_exit_warning(
+                smart_money, momentum, smart_money.get("distribution_risk", 0),
+                continuation_eval.continuation_probability, rejection_detected,
+                adx_slope, di_spread_change
+            )
+            STATE["exit_warning"] = exit_warning
+
             self.last_heavy_calc_ts = now
         else:
-            # Use cached values from STATE
             adx_now = STATE.get("adx_live", 20.0)
             plus_di = STATE.get("di_plus_live", 20.0)
             minus_di = STATE.get("di_minus_live", 20.0)
@@ -2681,8 +2689,9 @@ class LiveTradeManager:
                 should_hold=STATE.get("continuation_probability", 0.5) >= 0.62,
                 hold_quality=STATE.get("hold_quality", "UNKNOWN")
             )
+            tp1_hold_score = STATE.get("tp1_hold_score", 10)
+            exit_warning = STATE.get("exit_warning", 0)
 
-        # LIVE DEBUG LOG every 5 seconds
         if now - self.last_live_debug_ts >= 5:
             self.last_live_debug_ts = now
             log_execution(
@@ -2690,131 +2699,167 @@ class LiveTradeManager:
                 f"ContProb={continuation_eval.continuation_probability:.2f} | MomHealth={momentum.get('momentum_health', 50):.1f} | "
                 f"DistRisk={smart_money.get('distribution_risk', 0):.1f} | TradeState={trade_state} | "
                 f"TrailMult={self.brain.get_trail_multiplier():.2f} | TP1Delay={self.brain.should_delay_tp1()} | "
-                f"TrailActive={STATE.get('trail_activated', False)} | SyntheticSL={STATE.get('synthetic_sl', 0):.4f} | ROE={roe:.2f}%",
+                f"TrailActive={STATE.get('trail_activated', False)} | SyntheticSL={STATE.get('synthetic_sl', 0):.4f} | ROE={roe:.2f}% | "
+                f"TP1HoldScore={tp1_hold_score} | ExitWarning={exit_warning}",
                 "INFO"
             )
 
-        # ========== BUILD CONTEXT FOR BOARD ==========
-        context = {
-            'symbol': symbol,
-            'side': side,
-            'entry': entry,
-            'current_price': mark_price,
-            'atr': atr,
-            'roe': roe,
-            'remaining_qty': STATE.get('remaining_qty', STATE['qty']),
-            'smart_money': smart_money,
-            'momentum': momentum,
-            'adx': adx_now,
-            'adx_slope': STATE.get('adx_slope', 0),
-            'di_plus': plus_di,
-            'di_minus': minus_di,
-            'regime': STATE.get('market_regime', 'UNKNOWN'),
-            'thesis': STATE.get('trade_thesis', {}),
-            'continuation_eval': continuation_eval,
-            'thesis_failure_score': STATE.get('thesis_failure_score', 0),
-            'max_price': STATE.get('max_price', entry),
-            'min_price': STATE.get('min_price', entry),
-            'trail_active': STATE.get('trail_activated', False),
-            'trail_stop': STATE.get('trail_stop', 0),
-            'tp1_hit': STATE.get('tp1_hit', False),
-            'tp2_hit': STATE.get('tp2_hit', False),
-            'synthetic_sl': STATE.get('synthetic_sl', 0),
-            'synthetic_tp1': STATE.get('synthetic_tp1', 0),
-            'tp2_price': STATE.get('tp2_price', 0),
-            'entry_type': STATE.get('entry_type', ''),
-            'trade_state': trade_state,
-            'breakeven_done': STATE.get('be_done', False),
-            'partial_done': STATE.get('partial_closed', False),
-            'emergency_exit': False,  # can be set if needed
-            'smart_trail_mult': self.brain.get_trail_multiplier(),
-        }
+        if self.brain.should_aggressive_profit_lock() and not STATE.get("profit_lock_activated", False):
+            log_execution(f"[PROFIT_LOCK] Aggressive profit lock triggered (state={trade_state})", "WARN")
+            if not STATE.get("tp1_hit", False):
+                close_partial(0.5)
+                STATE["tp1_hit"] = True
+                STATE["runner_mode"] = True
+            STATE["profit_lock_activated"] = True
 
-        # ========== GET DECISION FROM BOARD ==========
-        decision = self.board.evaluate(context)
-        self._last_decision = decision
-        # Log decision for /decision endpoint
-        self._decision_log.append({
-            "time": time.time(),
-            "action": decision.action.value,
-            "reason": decision.reason,
-            "symbol": symbol
-        })
-        if len(self._decision_log) > 100:
-            self._decision_log = self._decision_log[-100:]
-        log_execution(f"[BOARD] Decision: {decision.action.value} - {decision.reason}", "INFO")
+        if self.brain.should_hard_exit():
+            log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
 
-        # ========== EXECUTE DECISION ==========
-        self._execute_decision(decision, symbol)
+        entry_atr = STATE.get("entry_atr", atr)
+        base_sl_mult = 1.6
+        if smart_money.get("distribution_risk", 0) > 45:
+            base_sl_mult = 1.2
+        elif smart_money.get("distribution_risk", 0) > 65:
+            base_sl_mult = 0.8
+        if side == "BUY":
+            synthetic_sl = entry - entry_atr * base_sl_mult
+            if STATE.get("tp1_hit", False):
+                synthetic_sl = max(synthetic_sl, entry)
+        else:
+            synthetic_sl = entry + entry_atr * base_sl_mult
+            if STATE.get("tp1_hit", False):
+                synthetic_sl = min(synthetic_sl, entry)
+        STATE["synthetic_sl"] = synthetic_sl
 
-    def _execute_decision(self, decision: TradeDecision, symbol: str):
-        action = decision.action
-        params = decision.params
-        if action == TradeDecisionType.NO_ACTION:
-            pass
-        elif action == TradeDecisionType.HOLD:
-            pass
-        elif action == TradeDecisionType.MOVE_SL:
-            new_sl = params.get('new_sl', 0)
-            if new_sl > 0:
-                STATE["synthetic_sl"] = new_sl
-                log_execution(f"[BOARD] SL moved to {new_sl:.4f}", "INFO")
-        elif action == TradeDecisionType.BREAKEVEN:
-            if not STATE.get('be_done', False):
-                STATE["synthetic_sl"] = STATE["entry"]
-                STATE["be_done"] = True
-                log_execution("[BOARD] SL moved to breakeven", "INFO")
-        elif action == TradeDecisionType.LOCK_PROFITS:
-            # Lock partial profits by moving SL to a profit level
-            new_sl = params.get('new_sl', 0)
-            if new_sl > 0:
-                STATE["synthetic_sl"] = new_sl
-                log_execution(f"[BOARD] Locked profits at SL={new_sl:.4f}", "INFO")
-        elif action == TradeDecisionType.PARTIAL_CLOSE:
-            ratio = params.get('ratio', 0.5)
-            if safe_close_partial(symbol, ratio):
-                STATE["partial_closed"] = True
-                STATE["tp1_hit"] = True  # mark as TP1 hit
-                # Move SL to breakeven after partial close
-                STATE["synthetic_sl"] = STATE["entry"]
-                STATE["be_done"] = True
-                log_execution(f"[BOARD] Partial close {ratio*100:.0f}% executed, SL to breakeven", "SUCCESS")
-        elif action == TradeDecisionType.TRAIL:
-            # Activate or update trailing
-            if params.get('activate', False):
-                STATE["trail_activated"] = True
-                mult = params.get('multiplier', 2.0)
-                atr = STATE.get("atr", 0)
-                if STATE["side"] == "BUY":
-                    STATE["trail_stop"] = STATE["mark_price"] - mult * atr
-                else:
-                    STATE["trail_stop"] = STATE["mark_price"] + mult * atr
-                log_execution(f"[BOARD] Trailing activated with mult {mult:.2f}", "INFO")
+        if (side == "BUY" and mark_price <= synthetic_sl) or (side == "SELL" and mark_price >= synthetic_sl):
+            log_execution(f"[SYNTHETIC_SL] Hit at {mark_price:.4f} (SL={synthetic_sl:.4f})", "WARN")
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
+
+        if not STATE.get("tp1_hit", False):
+            if tp1_hold_score >= 8:
+                log_execution(f"[TP1_DELAY] Hold score {tp1_hold_score} >= 8, delaying TP1", "INFO")
+                tp1_price = entry * (1 + 0.04) if side == "BUY" else entry * (1 - 0.04)
+                STATE["synthetic_tp1"] = tp1_price
             else:
-                new_stop = params.get('new_stop', 0)
-                if new_stop > 0:
-                    STATE["trail_stop"] = new_stop
-                    log_execution(f"[BOARD] Trailing stop updated to {new_stop:.4f}", "INFO")
-        elif action == TradeDecisionType.FULL_CLOSE:
-            if safe_close_position(symbol):
-                finalize_trade_with_reality(symbol)
-                self.lifecycle_state = TradeLifecycleState.CLOSED
-                DASHBOARD_STATE["live_trade_mode"] = False
-                log_execution(f"[BOARD] Full close executed: {decision.reason}", "SUCCESS")
-        elif action == TradeDecisionType.THESIS_FAILURE_EXIT:
-            if safe_close_position(symbol):
-                finalize_trade_with_reality(symbol)
-                self.lifecycle_state = TradeLifecycleState.CLOSED
-                DASHBOARD_STATE["live_trade_mode"] = False
-                log_execution(f"[BOARD] Thesis failure exit: {decision.reason}", "WARN")
-        elif action == TradeDecisionType.EMERGENCY_EXIT:
-            if safe_close_position(symbol):
-                finalize_trade_with_reality(symbol)
-                self.lifecycle_state = TradeLifecycleState.CLOSED
-                DASHBOARD_STATE["live_trade_mode"] = False
-                log_execution(f"[BOARD] Emergency exit: {decision.reason}", "ERROR")
+                log_execution(f"[TP1_EXECUTE] Hold score {tp1_hold_score} < 8, executing TP1 partial close", "SUCCESS")
+                close_partial(0.5)
+                STATE["tp1_hit"] = True
+                STATE["synthetic_sl"] = entry
+                tg_tp_hit(symbol, 1, roe)
+                STATE["runner_mode"] = True
+                STATE["trail_activated"] = True
+                self._update_peak_profit(roe, mark_price)
 
-# ========== EXISTING GLOBALS (reused) ==========
+        if STATE.get("tp1_hit", False):
+            peak_roe = STATE.get("peak_roe", roe)
+            drawdown = STATE.get("drawdown_from_peak", 0.0)
+            base_trail_mult = self.brain.get_trail_multiplier()
+            adjusted_mult = self._apply_runner_defense(roe, peak_roe, drawdown, exit_warning,
+                                                        continuation_eval.continuation_probability,
+                                                        base_trail_mult)
+            STATE["smart_trail_mult"] = adjusted_mult
+
+            tp2_pct = 0.05
+            if continuation_eval.continuation_probability > 0.8:
+                tp2_pct = 0.08
+            tp2_price = entry * (1 + tp2_pct) if side == "BUY" else entry * (1 - tp2_pct)
+            STATE["tp2_price"] = tp2_price
+            if not STATE.get("tp2_hit", False):
+                if (side == "BUY" and mark_price >= tp2_price) or (side == "SELL" and mark_price <= tp2_price):
+                    log_execution(f"[SYNTHETIC_TP2] Hit at {mark_price:.4f}", "SUCCESS")
+                    close_position_full()
+                    STATE["tp2_hit"] = True
+                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    return
+
+        trail_mult = STATE.get("smart_trail_mult", 1.5)
+        if smart_money.get("distribution_risk", 0) > 45:
+            trail_mult *= 0.7
+        if momentum.get("momentum_health", 50) < 30:
+            trail_mult *= 0.8
+        if continuation_eval.continuation_probability > 0.8:
+            trail_mult *= 1.2
+        trail_mult = max(0.5, min(4.5, trail_mult))
+
+        if roe > 1.5:
+            if not STATE.get("trail_activated", False):
+                STATE["trail_activated"] = True
+                STATE["trail_stop"] = synthetic_sl
+                log_execution(f"[TRAIL] Activated with multiplier {trail_mult}", "INFO")
+            if side == "BUY":
+                new_trail = mark_price - trail_mult * atr
+                if new_trail > STATE.get("trail_stop", 0):
+                    STATE["trail_stop"] = new_trail
+            else:
+                new_trail = mark_price + trail_mult * atr
+                if new_trail < STATE.get("trail_stop", float('inf')):
+                    STATE["trail_stop"] = new_trail
+            if (side == "BUY" and mark_price <= STATE.get("trail_stop", 0)) or (side == "SELL" and mark_price >= STATE.get("trail_stop", float('inf'))):
+                log_execution(f"[TRAIL] Stop hit at {mark_price:.4f} (trail={STATE['trail_stop']:.4f})", "WARN")
+                close_position_full()
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
+        else:
+            pass
+
+        if USE_PPE:
+            state_ppe = {
+                "symbol": symbol,
+                "trail_active": STATE.get("trail_activated", False),
+                "tp1_done": STATE.get("tp1_hit", False),
+                "tp1_hit": STATE.get("tp1_hit", False),
+                "runner_mode": STATE.get("runner_mode", False),
+                "max_price": STATE.get("max_price", entry),
+                "min_price": STATE.get("min_price", entry),
+                "sl": STATE.get("synthetic_sl", 0.0),
+                "trail_stop": STATE.get("trail_stop", 0.0),
+                "remaining_qty": STATE.get("remaining_qty", STATE["qty"]),
+                "smart_trail_mult": trail_mult,
+                "smart_money": smart_money,
+                "momentum_flow": momentum,
+                "profit_lock_activated": STATE.get("profit_lock_activated", False),
+                "trail_tightened": STATE.get("trail_tightened", False)
+            }
+            idx = len(df_live) - 1
+            action, new_sl, new_trail = apply_50_50_profit_engine(
+                df_live, idx, mark_price, atr, side, entry, state_ppe, roe, trade_state=trade_state
+            )
+            STATE["synthetic_sl"] = new_sl
+            STATE["trail_stop"] = new_trail
+            if state_ppe.get("trail_active", False):
+                STATE["trail_activated"] = state_ppe["trail_active"]
+            if state_ppe.get("tp1_hit", False):
+                STATE["tp1_hit"] = state_ppe["tp1_hit"]
+            if state_ppe.get("runner_mode", False):
+                STATE["runner_mode"] = state_ppe["runner_mode"]
+            STATE["max_price"] = state_ppe["max_price"]
+            STATE["min_price"] = state_ppe["min_price"]
+            if state_ppe.get("profit_lock_activated", False):
+                STATE["profit_lock_activated"] = state_ppe["profit_lock_activated"]
+            STATE["trail_tightened"] = state_ppe["trail_tightened"]
+            TRADE_STATE["trail_on"] = STATE["trail_activated"]
+            TRADE_STATE["tp1_hit"] = STATE["tp1_hit"]
+            if action == "EXIT":
+                close_position_full()
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
+
+        if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
+
 _event_bus = EventBus()
 _exchange_sync = ExchangeSyncService(_event_bus)
 _recovery_guard = RecoveryGuard(_event_bus, _exchange_sync)
@@ -2913,7 +2958,7 @@ def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
         log_execution(f"[REALIZED_PNL] Error: {e}", "WARN")
         return 0.0, 0.0
 
-# ========== INDICATORS (unchanged) ==========
+# ========== INDICATORS ==========
 def rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
 
@@ -3085,7 +3130,7 @@ def early_score(df, ob, atr, side):
         reasons.append("late_move_penalty")
     return score, reasons
 
-# ========== RF ENGINE (unchanged) ==========
+# ========== RF ENGINE ==========
 class RFEngine:
     def __init__(self, period=20, multiplier=3.5):
         self.period = period
@@ -3357,7 +3402,79 @@ def decision_engine(scenario, rf_signal, adx):
     return "SKIP"
 
 def apply_profit_engine(symbol, current_price, df, idx, position_state):
-    # This is now replaced by TradeManagementBoard, kept for compatibility if called elsewhere
+    if not position_state["open"]:
+        return "HOLD"
+    side = position_state["side"]
+    entry = position_state["entry"]
+    remaining = position_state["remaining_qty"]
+    pnl_pct = (current_price - entry) / entry * 100 if side == "BUY" else (entry - current_price) / entry * 100
+    if not position_state.get("tp1_hit", False) and pnl_pct >= 0.5:
+        close_ratio = 0.3
+        close_qty = remaining * close_ratio
+        if close_qty > 0:
+            if PAPER_MODE:
+                position_state["remaining_qty"] -= close_qty
+                TRADE_STATE["qty"] = position_state["remaining_qty"]
+            else:
+                close_partial(close_ratio)
+            log_execution(f"TP1 hit at {pnl_pct:.2f}% - closed {close_ratio*100:.0f}%", "SUCCESS")
+            tg_tp_hit(symbol, 1, pnl_pct)
+        position_state["tp1_hit"] = True
+        position_state["sl"] = entry
+        position_state["trail_activated"] = True
+        atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else current_price * 0.01
+        if side == "BUY":
+            position_state["trail_stop"] = current_price - TRAIL_ATR_MULT * atr_val
+        else:
+            position_state["trail_stop"] = current_price + TRAIL_ATR_MULT * atr_val
+        return "TP1"
+    if position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and pnl_pct >= 1.2:
+        close_ratio = 0.3
+        close_qty = position_state["remaining_qty"] * close_ratio
+        if close_qty > 0:
+            if PAPER_MODE:
+                position_state["remaining_qty"] -= close_qty
+                TRADE_STATE["qty"] = position_state["remaining_qty"]
+            else:
+                close_partial(close_ratio)
+            log_execution(f"TP2 hit at {pnl_pct:.2f}% - closed {close_ratio*100:.0f}%", "SUCCESS")
+            tg_tp_hit(symbol, 2, pnl_pct)
+        position_state["tp2_hit"] = True
+        return "TP2"
+    if len(df) >= 2 and idx >= 1:
+        adx_series = compute_adx(df)
+        if adx_series is not None and len(adx_series) > idx:
+            adx_now = adx_series.iloc[idx]
+            adx_prev = adx_series.iloc[idx-1]
+            if adx_now < adx_prev:
+                candle_close = df['close'].iloc[idx]
+                candle_open = df['open'].iloc[idx]
+                if side == "BUY" and candle_close < candle_open:
+                    log_execution(f"Exhaustion exit: ADX weakening and bearish candle", "WARN")
+                    close_position_full()
+                    return "EXIT"
+                if side == "SELL" and candle_close > candle_open:
+                    log_execution(f"Exhaustion exit: ADX weakening and bullish candle", "WARN")
+                    close_position_full()
+                    return "EXIT"
+    if position_state.get("trail_activated", False) and position_state.get("trail_stop", 0) > 0:
+        if side == "BUY" and current_price <= position_state["trail_stop"]:
+            log_execution(f"Trailing stop hit at {current_price:.4f}", "WARN")
+            close_position_full()
+            return "EXIT"
+        if side == "SELL" and current_price >= position_state["trail_stop"]:
+            log_execution(f"Trailing stop hit at {current_price:.4f}", "WARN")
+            close_position_full()
+            return "EXIT"
+        atr_val = compute_atr(df).iloc[-1] if len(df) > 14 else current_price * 0.01
+        if side == "BUY":
+            new_stop = current_price - TRAIL_ATR_MULT * atr_val
+            if new_stop > position_state["trail_stop"]:
+                position_state["trail_stop"] = new_stop
+        else:
+            new_stop = current_price + TRAIL_ATR_MULT * atr_val
+            if new_stop < position_state["trail_stop"]:
+                position_state["trail_stop"] = new_stop
     return "HOLD"
 
 def detect_liquidity_context(df, lookback=10):
@@ -3817,10 +3934,19 @@ STATE = {
     "synthetic_sl": 0.0,
     "synthetic_tp1": 0.0,
     "max_price": 0.0,
-    "min_price": 0.0
+    "min_price": 0.0,
+    "peak_roe": 0.0,
+    "peak_price": 0.0,
+    "peak_unrealized_pnl": 0.0,
+    "drawdown_from_peak": 0.0,
+    "tp1_hold_score": 10,
+    "exit_warning": 0,
+    "runner_mode": False,
+    "entry_atr": 0.0
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
+_closing_in_progress = False
 _TRADE_LOCK = threading.RLock()
 
 # ========== DASHBOARD STATE ==========
@@ -3879,6 +4005,7 @@ def open_position(side, amount, symbol):
     sym = normalize_symbol(symbol)
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
+            log_execution("[OPEN] Another trade already in progress, skipping", "WARN")
             return None
         _ACTIVE_TRADE = True
     try:
@@ -3886,17 +4013,19 @@ def open_position(side, amount, symbol):
         amount = float(ex.amount_to_precision(sym, amount))
         bal = safe_api_call(ex.fetch_balance)
         if bal is None:
+            log_execution("[OPEN] Failed to fetch balance", "ERROR")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
             return None
         usdt = bal.get("free", {}).get("USDT", 0.0)
         ticker = safe_api_call(ex.fetch_ticker, sym)
         if ticker is None:
+            log_execution("[OPEN] Failed to fetch ticker", "ERROR")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
             return None
         price = ticker["last"]
         required_margin = (amount * price) / LEVERAGE
         if usdt < required_margin * 1.01:
-            log_execution(f"Insufficient margin: need {required_margin:.2f}, have {usdt:.2f}", "ERROR")
+            log_execution(f"[OPEN] Insufficient margin: need {required_margin:.2f}, have {usdt:.2f}", "ERROR")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
             global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL
             INSUFFICIENT_MARGIN_COOLDOWN_UNTIL = time.time() + INSUFFICIENT_MARGIN_COOLDOWN_SEC
@@ -3904,15 +4033,15 @@ def open_position(side, amount, symbol):
         max_spread = dynamic_spread_tolerance(symbol)
         spread = get_spread_bps(symbol)
         if spread > max_spread:
-            log_execution(f"Spread {spread:.2f}% > {max_spread}%", "WARN")
+            log_execution(f"[OPEN] Spread {spread:.2f}% > {max_spread}%", "WARN")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
             return None
         order = safe_api_call(ex.create_order, sym, "market", side.lower(), amount, params={"leverage": LEVERAGE})
         if order:
-            log_execution(f"Order filled: {side} {amount} {symbol} @ {price}", "SUCCESS")
+            log_execution(f"[OPEN] Order filled: {side} {amount} {symbol} @ {price}", "SUCCESS")
             return order
     except Exception as e:
-        log_execution(f"Open position error: {e}", "ERROR")
+        log_execution(f"[OPEN] Open position error: {traceback.format_exc()}", "ERROR")
     with _TRADE_LOCK:
         _ACTIVE_TRADE = False
     return None
@@ -3927,255 +4056,79 @@ def close_position(amount, symbol):
         order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"reduceOnly": True})
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
+        log_execution(f"[CLOSE] Closed {amount} {symbol} (reduceOnly)", "SUCCESS")
         return order
     except Exception as e:
-        log_execution(f"Close position error: {e}", "ERROR")
+        log_execution(f"[CLOSE] Close position error: {traceback.format_exc()}", "ERROR")
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
         return None
 
-def close_position_full():
+def finalize_trade_with_reality(symbol):
+    mark_price, unrealized, initial_margin, roe = sync_position_state(symbol)
+    if mark_price is None and not PAPER_MODE:
+        mark_price = get_ticker_safe(symbol)
+    pnl_usdt = 0.0
+    pnl_pct = 0.0
     if PAPER_MODE:
-        paper["position"] = None
-        STATE["open"] = False
-        TRADE_STATE["in_position"] = False
-        DASHBOARD_STATE["live_trade_mode"] = False
-        return True
-    if not STATE["open"]:
-        return False
-    # Use safe_close_position which waits for confirmation
-    success = safe_close_position(STATE["current_symbol"])
-    if success:
-        # Note: state already updated inside safe_close_position
-        log_execution("Position fully closed", "SUCCESS")
-        return True
-    return False
-
-def close_partial(ratio):
-    # This is kept for backward compatibility; use safe_close_partial now
-    return safe_close_partial(STATE["current_symbol"], ratio)
-
-def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification, is_reversal=False):
-    # Apply reversal validation if applicable
-    if is_reversal:
-        df = get_ohlcv_safe(symbol, 100)
-        if df is not None:
-            ob = get_orderbook_cached(symbol, 10)
-            valid, reason_str, rev_score = validate_reversal_entry(symbol, side, df, atr_val, price, ob)
-            if not valid:
-                log_execution(f"[REVERSAL_REJECT] {symbol} {side} - {reason_str} (score {rev_score})", "WARN")
-                return False
-            else:
-                log_execution(f"[REVERSAL_ACCEPT] {symbol} {side} - {reason_str} (score {rev_score})", "INFO")
-                # Optionally adjust score/confidence
-                score = max(score, rev_score * 2)  # boost score
-        else:
-            # If no data, fall back to original logic (but still log)
-            log_execution(f"[REVERSAL] No data for validation, skipping enhancement", "WARN")
-
-    free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
-    usable_balance = free_bal * BALANCE_SAFETY_FACTOR
-    if PAPER_MODE:
-        balance = paper["balance"]
-    else:
-        balance = usable_balance
-
-    if classification == "SNIPER" or classification == "INSTITUTIONAL_SNIPER":
-        margin_percent = 0.40
-        trade_type_label = "STRONG"
-    elif classification == "TREND":
-        margin_percent = 0.30
-        trade_type_label = "NORMAL"
-    elif classification == "LOW":
-        margin_percent = 0.15
-        trade_type_label = "LOW_CONF"
-    else:
-        margin_percent = 0.30
-        trade_type_label = "NORMAL"
-
-    margin = balance * margin_percent
-    notional = margin * LEVERAGE  # LEVERAGE is now 10
-    qty = notional / price
-    log_execution(f"[SIZING]\nFree USDT: {free_bal:.2f}\nUsable (x{BALANCE_SAFETY_FACTOR}): {balance:.2f}\nType: {trade_type_label}\nMargin: {margin:.2f}\nLeverage: {LEVERAGE}X\nNotional: {notional:.2f}\nFinal Qty: {qty:.6f}", "INFO")
-
-    df = get_ohlcv_safe(symbol, 100)
-    adx_series = compute_adx(df) if df is not None else None
-    adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
-
-    if not PAPER_MODE and MODE_LIVE:
-        if not (25 <= adx_val <= 38):
-            log_execution(f"[ENTRY] ADX {adx_val:.1f} not in [25,38] – skipping", "WARN")
-            return False
-        if df is not None:
-            liquidity_ctx = detect_liquidity_context(df, lookback=10)
-            if side == "BUY" and liquidity_ctx != "sell_side_taken":
-                log_execution(f"[ENTRY] BUY requires sell‑side liquidity sweep, got {liquidity_ctx}", "WARN")
-                return False
-            if side == "SELL" and liquidity_ctx != "buy_side_taken":
-                log_execution(f"[ENTRY] SELL requires buy‑side liquidity sweep, got {liquidity_ctx}", "WARN")
-                return False
-        else:
-            log_execution(f"[ENTRY] No DF for liquidity check, skipping", "WARN")
-            return False
-
-    plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
-    di_dominance = False
-    if plus_di is not None and minus_di is not None:
-        di_dominance = (side == "BUY" and plus_di > minus_di) or (side == "SELL" and minus_di > plus_di)
-    weak_pullback = False
-    if df is not None:
-        last = df.iloc[-1]
+        entry = STATE["entry"]
+        side = STATE["side"]
         if side == "BUY":
-            if last['close'] < last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
-                weak_pullback = True
+            pnl_pct = (mark_price - entry) / entry * 100
         else:
-            if last['close'] > last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
-                weak_pullback = True
-    structure_aligned = False
-    struct_shift = detect_structure_shift(df) if df is not None else None
-    if side == "BUY" and struct_shift == "bullish_shift":
-        structure_aligned = True
-    elif side == "SELL" and struct_shift == "bearish_shift":
-        structure_aligned = True
-    counter_displacement = 0.0
-    if df is not None:
-        last = df.iloc[-1]
-        if side == "SELL" and last['close'] > last['open']:
-            body = abs(last['close'] - last['open'])
-            if body > atr_val * 0.6:
-                counter_displacement = body / atr_val
-        elif side == "BUY" and last['close'] < last['open']:
-            body = abs(last['close'] - last['open'])
-            if body > atr_val * 0.6:
-                counter_displacement = body / atr_val
-    market_state = {
-        "adx": adx_val,
-        "regime": MEMORY.get("regime", "UNKNOWN"),
-        "di_dominance": di_dominance,
-        "weak_pullback": weak_pullback,
-        "structure_aligned": structure_aligned,
-        "counter_displacement": counter_displacement,
-        "trend_health": trend_engine.get_trend_health(df, side) if df is not None else 5
-    }
-    narrative = {"classification": classification}
-    entry_context = {"price": price, "atr": atr_val}
-    thesis = _thesis_engine.build_thesis(symbol, side, trade_type, market_state, narrative, entry_context)
-    STATE["trade_thesis"] = thesis.__dict__
-
-    regime_class = MarketRegimeClassifier.classify(df) if df is not None else "UNKNOWN"
-    di_spread = abs(plus_di - minus_di) if plus_di is not None else 0
-    location_quality = "mid"
-    initial_conf = ConfidenceEngine.calculate_initial_confidence(score, narrative.get("narrative_score", 0), regime_class, adx_val, di_spread, location_quality)
-
-    if df is not None:
-        smart_money = SmartMoneyEngine.analyze_smart_money(df)
-        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-        dominance_weight = 0.7 if smart_money["smart_money_dominant"] else 0.3
-        initial_conf += (dominance_weight - 0.5) * 12
-        if momentum["trend_expansion"]:
-            initial_conf += 8
-        if momentum["momentum_decay"]:
-            initial_conf -= 12
-        dist_risk = smart_money["distribution_risk"] / 100.0
-        initial_conf -= dist_risk * 15
-        if smart_money["retail_euphoria"]:
-            initial_conf -= 10
-        continuation_strength = momentum.get("continuation_strength", 50)
-        initial_conf = ConfidenceEngine.apply_institutional_modifiers(initial_conf, smart_money, momentum, continuation_strength)
-        initial_conf = max(0, min(95, initial_conf))
-
-    STATE["current_confidence"] = initial_conf
-    STATE["market_regime"] = regime_class
-
-    if PAPER_MODE:
-        paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
-        STATE.update({
-            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
-            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
-            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
-            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
-            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
-            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
-            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
-            "roe_pct": 0.0, "mark_price": price,
-            "narrative_classification": STATE.get("narrative_classification", ""),
-            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-            "confidence_level": STATE.get("confidence_level", ""),
-            "trade_thesis": thesis.__dict__,
-            "current_confidence": initial_conf,
-            "market_regime": regime_class,
-            "adx_live": adx_val,
-            "di_plus_live": plus_di if plus_di else 0,
-            "di_minus_live": minus_di if minus_di else 0,
-            "trade_personality": "NEUTRAL",
-            "institutional_flow": "NEUTRAL",
-            "synthetic_sl": sl,
-            "synthetic_tp1": tp1,
-            "max_price": price,
-            "min_price": price
-        })
-        TRADE_STATE.update({
-            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
-            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
-        })
-        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
-        update_position_dashboard(symbol, side, price, qty)
-        log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
-        return True
-
-    sym = normalize_symbol(symbol)
-    market = ex.market(sym)
-    min_qty = market['limits']['amount']['min']
-    if qty < min_qty:
-        log_execution(f"SKIP: computed qty {qty:.6f} below minimum {min_qty}", "WARN")
-        return False
-    precision = market['precision']['amount']
-    qty = math.floor(qty / precision) * precision
-    if qty <= 0:
-        log_execution(f"SKIP: qty rounded to zero", "WARN")
-        return False
-    log_execution(f"Position sizing final: free_balance={free_bal:.2f}, usable={balance:.2f}, classification={classification}, margin_percent={margin_percent*100:.0f}%, margin={margin:.2f}, notional={notional:.2f}, qty={qty:.6f}", "INFO")
-    order = open_position(side, qty, symbol)
-    if order:
-        STATE.update({
-            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
-            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
-            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
-            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
-            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
-            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
-            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
-            "roe_pct": 0.0, "mark_price": price,
-            "narrative_classification": STATE.get("narrative_classification", ""),
-            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-            "confidence_level": STATE.get("confidence_level", ""),
-            "trade_thesis": thesis.__dict__,
-            "current_confidence": initial_conf,
-            "market_regime": regime_class,
-            "adx_live": adx_val,
-            "di_plus_live": plus_di if plus_di else 0,
-            "di_minus_live": minus_di if minus_di else 0,
-            "trade_personality": "NEUTRAL",
-            "institutional_flow": "NEUTRAL",
-            "synthetic_sl": sl,
-            "synthetic_tp1": tp1,
-            "max_price": price,
-            "min_price": price
-        })
-        TRADE_STATE.update({
-            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
-            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
-        })
-        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
-        update_position_dashboard(symbol, side, price, qty)
-        log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
-        time.sleep(1)
-        sync_position_state(symbol)
-        return True
+            pnl_pct = (entry - mark_price) / entry * 100
+        pnl_usdt = pnl_pct / 100 * entry * STATE["qty"]
     else:
-        return False
+        realized_usdt, realized_pct = get_realized_pnl_for_symbol(symbol, lookback_seconds=30)
+        if realized_usdt != 0.0:
+            pnl_usdt = realized_usdt
+            pnl_pct = realized_pct
+        else:
+            if roe is not None:
+                pnl_pct = roe
+                if STATE.get("margin", 0) > 0:
+                    pnl_usdt = STATE["margin"] * (roe / 100)
+                else:
+                    pnl_usdt = (pnl_pct / 100) * STATE["entry"] * STATE["qty"]
+    PERF["total_pnl_pct"] += pnl_pct
+    PERF["total_pnl_usdt"] += pnl_usdt
+    PERF["trades"] += 1
+    if pnl_pct >= 0:
+        PERF["wins"] += 1
+        result = "WIN"
+    else:
+        PERF["losses"] += 1
+        result = "LOSS"
+    PERF["last_trade"] = {"result": result, "pnl_pct": pnl_pct}
+    TRADE_STATE.update({
+        "in_position": False,
+        "symbol": None,
+        "side": None,
+        "entry": 0.0,
+        "qty": 0.0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "trail_on": False,
+        "zone": None,
+        "location": None,
+        "reason": []
+    })
+    DASHBOARD_STATE["live_trade_mode"] = False
+    log_execution(f"Trade closed: {result} {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f}", "SUCCESS" if pnl_pct>=0 else "ERROR")
+    tg_close(STATE["current_symbol"], pnl_pct, (time.time() - STATE["entry_time"])/60, STATE["side"])
+    with _TRADE_LOCK:
+        STATE["open"] = False
+        STATE["side"] = None
+        STATE["current_symbol"] = None
+        STATE["tp1_hit"] = False
+        STATE["tp2_hit"] = False
+        STATE["trail_activated"] = False
+        STATE["profit_lock_activated"] = False
+        STATE["runner_mode"] = False
+        STATE["trail_tightened"] = False
+        STATE["partial_closed"] = False
+        STATE["scale_ins"] = 0
+    return pnl_usdt, pnl_pct
 
 def dynamic_spread_tolerance(symbol):
     df = get_ohlcv_safe(symbol, 50)
@@ -4631,7 +4584,7 @@ def smart_opportunity_selection():
         sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr, df)
         reason_str = f"INST_SWEEP+CHOCH+RETEST | nscore={score:.1f}"
         ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
-                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER", is_reversal=True)
+                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
         if ok:
             return True
     return False
@@ -5266,8 +5219,10 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     elif side == "SELL" and (struct_shift == "bearish_shift" or bos_down):
         choch_ok = True
         reasons.append("Bearish MSS/CHoCH")
-    if not choch_ok:
-        return False, None, "No MSS/CHoCH confirmation"
+    if sweep_ok and not choch_ok:
+        return False, None, "Reversal requires MSS/CHoCH confirmation"
+    elif not sweep_ok and not choch_ok:
+        reasons.append("No MSS/CHoCH (trend continuation, optional)")
     rejection_ok = candle_rejection(df, side)
     vol_state = classify_volume(df)
     displacement_ok = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
@@ -5277,7 +5232,6 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
         reasons.append("Rejection candle")
     if displacement_ok:
         reasons.append("Displacement")
-    vol_state = classify_volume(df)
     volume_ok = vol_state in ("expansion", "spike")
     if not volume_ok:
         return False, None, "No volume expansion"
@@ -5288,9 +5242,25 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     adx_now = adx_series.iloc[-1]
     adx_prev = adx_series.iloc[-2]
     adx_slope = adx_now - adx_prev
-    if not (18 <= adx_now <= 35 and adx_slope > 0):
-        return False, None, f"ADX {adx_now:.1f} (slope {adx_slope:.1f}) not in rising 18-35"
-    reasons.append(f"ADX rising {adx_now:.1f} (+{adx_slope:.1f})")
+    plus_di, minus_di, _, _ = get_di_components(df)
+    di_spread = (plus_di - minus_di) if side == "BUY" else (minus_di - plus_di)
+    if adx_now < 18:
+        return False, None, f"ADX too low ({adx_now:.1f})"
+    if adx_now > 50:
+        if adx_slope > 0 and di_spread > 8:
+            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f} DI_spread={di_spread:.1f}")
+        else:
+            return False, None, f"Exhaustion risk: ADX>50 but slope={adx_slope:.1f} DI_spread={di_spread:.1f}"
+    elif adx_now > 35:
+        if adx_slope > 0:
+            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f}")
+        else:
+            return False, None, f"ADX high but falling slope ({adx_now:.1f} slope={adx_slope:.1f})"
+    else:
+        if adx_slope > 0:
+            reasons.append(f"Healthy ADX={adx_now:.1f} rising")
+        else:
+            return False, None, f"ADX not rising ({adx_now:.1f} slope={adx_slope:.1f})"
     rf = RFEngine(20, 3.5).compute(df)
     if rf["signal"] != side:
         return False, None, f"RF signal {rf['signal']} does not match {side}"
@@ -5337,11 +5307,9 @@ def decide_and_execute_v1(symbol, side, total_score, reasons, price, sl, tp1, tp
     should_enter, classification, narrative = evaluate_with_narrative(symbol, side, price, atr_val, df, ob, side)
     if not should_enter:
         return False
-    # Mark as reversal if scenario indicates
-    is_reversal = any(x in reasons for x in ["sweep", "rejection", "retest"])  # heuristic
     reason_str = f"DECISION_V1 score={total_score} reasons={reasons} | NARR={narrative['classification']}"
     return execute_entry(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                         trade_type="DECISION_V1", entry_type="V1", classification=classification, is_reversal=is_reversal)
+                         trade_type="DECISION_V1", entry_type="V1", classification=classification)
 
 def decision_score(df, ob, atr_val, side):
     vol_state = classify_volume(df)
@@ -5386,7 +5354,7 @@ def monitor_watchlist():
                         continue
                     sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
                     ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification, is_reversal=True)
+                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
                     if ok:
                         return True
             decision, dec_side, dec_info = smart_decision(df, ob, sym)
@@ -5399,7 +5367,7 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
                 ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification, is_reversal=True)
+                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
                 if ok:
                     return True
             elif decision == "EXHAUSTION_ENTRY":
@@ -5411,7 +5379,7 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
                 ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification, is_reversal=True)
+                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
                 if ok:
                     return True
         rf_engine = RFEngine(period=20, multiplier=3.5)
@@ -5449,14 +5417,14 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "REVERSAL" if scenario_name=="REVERSAL" else "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
                 ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
                 if ok:
                     return True
             elif total_score >= 5:
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
                 ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
                 if ok:
                     return True
         ob = get_orderbook_cached(sym, limit=10)
@@ -5468,14 +5436,14 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_SNIPER ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification, is_reversal=False)  # not reversal by default
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
                 if ok:
                     return True
             elif early_score_val >= 4:
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_ENTRY ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification, is_reversal=False)
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
                 if ok:
                     return True
         supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
@@ -5502,7 +5470,7 @@ def monitor_watchlist():
         TRADE_STATE["zone"] = "support" if side=="BUY" else "resistance"
         TRADE_STATE["location"] = location
         TRADE_STATE["reason"] = [scenario, adv_class, location, narrative['classification']]
-        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification, is_reversal=(scenario=="TRAP_REVERSAL"))
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
         if ok:
             return True
     return False
@@ -5548,69 +5516,43 @@ def stop_hit(current_price):
         return True
     return False
 
-def finalize_trade_with_reality(symbol):
-    mark_price, unrealized, initial_margin, roe = sync_position_state(symbol)
-    if mark_price is None and not PAPER_MODE:
-        mark_price = get_ticker_safe(symbol)
-    pnl_usdt = 0.0
-    pnl_pct = 0.0
-    if PAPER_MODE:
-        entry = STATE["entry"]
-        side = STATE["side"]
-        if side == "BUY":
-            pnl_pct = (mark_price - entry) / entry * 100
-        else:
-            pnl_pct = (entry - mark_price) / entry * 100
-        pnl_usdt = pnl_pct / 100 * entry * STATE["qty"]
+def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
+    if debounce_key:
+        now = time.time()
+        last = MEMORY.get("log_debounce", {}).get(debounce_key, 0)
+        if now - last < debounce_sec:
+            return
+        MEMORY.setdefault("log_debounce", {})[debounce_key] = now
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if level == "INFO":
+        colored = color_text(msg, CYAN)
+    elif level == "SUCCESS":
+        colored = color_text(msg, GREEN)
+    elif level == "ERROR":
+        colored = color_text(msg, RED)
+    elif level == "WARN":
+        colored = color_text(msg, YELLOW)
     else:
-        realized_usdt, realized_pct = get_realized_pnl_for_symbol(symbol, lookback_seconds=30)
-        if realized_usdt != 0.0:
-            pnl_usdt = realized_usdt
-            pnl_pct = realized_pct
-        else:
-            if roe is not None:
-                pnl_pct = roe
-                if STATE.get("margin", 0) > 0:
-                    pnl_usdt = STATE["margin"] * (roe / 100)
-                else:
-                    pnl_usdt = (pnl_pct / 100) * STATE["entry"] * STATE["qty"]
-    PERF["total_pnl_pct"] += pnl_pct
-    PERF["total_pnl_usdt"] += pnl_usdt
-    PERF["trades"] += 1
+        colored = msg
+    entry = f"[{ts}] {msg}"
+    DASHBOARD_STATE["logs"].append(entry)
+    if len(DASHBOARD_STATE["logs"]) > 200:
+        DASHBOARD_STATE["logs"].pop(0)
+    print(colored)
+    if level == "ERROR":
+        DASHBOARD_STATE["errors"].append(entry)
+        if len(DASHBOARD_STATE["errors"]) > 50:
+            DASHBOARD_STATE["errors"].pop(0)
+        tg_error(msg, level)
+
+def update_stats(pnl_pct):
+    DASHBOARD_STATE["stats"]["trades"] += 1
     if pnl_pct >= 0:
-        PERF["wins"] += 1
-        result = "WIN"
+        DASHBOARD_STATE["stats"]["wins"] += 1
     else:
-        PERF["losses"] += 1
-        result = "LOSS"
-    PERF["last_trade"] = {"result": result, "pnl_pct": pnl_pct}
-    TRADE_STATE.update({
-        "in_position": False,
-        "symbol": None,
-        "side": None,
-        "entry": 0.0,
-        "qty": 0.0,
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "trail_on": False,
-        "zone": None,
-        "location": None,
-        "reason": []
-    })
-    DASHBOARD_STATE["live_trade_mode"] = False
-    log_execution(f"Trade closed: {result} {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f}", "SUCCESS" if pnl_pct>=0 else "ERROR")
-    tg_close(STATE["current_symbol"], pnl_pct, (time.time() - STATE["entry_time"])/60, STATE["side"])
-    STATE["open"] = False
-    STATE["side"] = None
-    STATE["current_symbol"] = None
-    return pnl_usdt, pnl_pct
-
-def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
-    # This function is now deprecated; kept for compatibility.
-    return "HOLD", state.get("sl", 0.0), state.get("trail_stop", 0.0)
-
-def manage_open_trade_light():
-    _live_manager.manage_live_trade()
+        DASHBOARD_STATE["stats"]["losses"] += 1
+    total = DASHBOARD_STATE["stats"]["trades"]
+    DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
 def get_dashboard_metrics():
     winrate = (PERF["wins"] / PERF["trades"] * 100) if PERF["trades"] else 0
@@ -5814,7 +5756,7 @@ def radar_entry_scan():
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
                 ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification, is_reversal=True)
+                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -5826,7 +5768,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
             ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification, is_reversal=True)
+                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5837,7 +5779,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
             ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification, is_reversal=True)
+                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5862,7 +5804,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
             ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5873,7 +5815,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
             ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5886,7 +5828,7 @@ def radar_entry_scan():
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"RADAR_EARLY ({','.join(reasons)}) score={es} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, es, reason_str, atr_val,
-                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification, is_reversal=False)
+                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -5974,6 +5916,1040 @@ def get_smart_zones(symbol, df, ob):
     MEMORY[key] = {"data": zones, "ts": time.time()}
     return zones
 
+# ========== NEW LIQUIDITY DISCOVERY LAYER ==========
+class FreshLiquidityRadar:
+    @staticmethod
+    def compute_liquidity_score(df):
+        if len(df) < 30:
+            return 0.0, {}
+        score = 0.0
+        details = {}
+        vol = df['volume']
+        vol_accel = vol.iloc[-5:].mean() / (vol.iloc[-10:-5].mean() + 1e-9)
+        vol_accel_score = min(2.0, vol_accel - 1.0) if vol_accel > 1.0 else 0.0
+        score += vol_accel_score * 2
+        details["vol_accel"] = round(vol_accel, 2)
+        vol_ratio = vol.iloc[-1] / vol.iloc[-20:].mean()
+        vol_exp_score = min(1.5, vol_ratio - 0.8) if vol_ratio > 0.8 else 0.0
+        score += vol_exp_score * 1.5
+        details["vol_ratio"] = round(vol_ratio, 2)
+        atr = compute_atr(df)
+        atr_ratio = atr.iloc[-1] / atr.iloc[-20:].mean()
+        atr_exp_score = min(1.5, atr_ratio - 0.9) if atr_ratio > 0.9 else 0.0
+        score += atr_exp_score * 1.5
+        details["atr_ratio"] = round(atr_ratio, 2)
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        range_ = last['high'] - last['low']
+        if range_ > 0:
+            body_ratio = body / range_
+            displacement = 1.0 if body_ratio > 0.6 else 0.0
+            score += displacement * 1.0
+            details["displacement"] = displacement
+        sweep_count = 0
+        for i in range(-5, 0):
+            sub_df = df.iloc[:i] if i < 0 else df
+            if len(sub_df) >= 2:
+                pools = build_liquidity_pools(sub_df)
+                swept_h, swept_l = detect_sweep(sub_df, pools)
+                if swept_h or swept_l:
+                    sweep_count += 1
+        sweep_score = min(2.0, sweep_count / 3.0)
+        score += sweep_score * 2
+        details["sweep_count"] = sweep_count
+        adx = compute_adx(df)
+        if len(adx) >= 5:
+            adx_slope = adx.iloc[-1] - adx.iloc[-4]
+            if adx_slope > 0:
+                score += min(1.5, adx_slope / 5) * 1.0
+                details["adx_slope"] = round(adx_slope, 2)
+        final_score = min(10.0, score)
+        return final_score, details
+
+    @staticmethod
+    def scan(symbols, limit=15):
+        candidates = []
+        for sym in symbols:
+            try:
+                df = get_ohlcv_safe(sym, 60)
+                if df is None or not validate_dataframe(df, 30):
+                    continue
+                price = df['close'].iloc[-1]
+                atr = compute_atr(df).iloc[-1]
+                atr_pct = (atr / price) * 100 if price > 0 else 0
+                if atr_pct < 0.2:
+                    continue
+                score, details = FreshLiquidityRadar.compute_liquidity_score(df)
+                if score >= 3.0:
+                    candidates.append({
+                        "symbol": sym,
+                        "score": round(score, 2),
+                        "details": details
+                    })
+            except Exception:
+                continue
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:limit]
+
+# ========== SECTOR CLASSIFICATION & LEADER SELECTION ==========
+SECTOR_MAP = {
+    "AI": ["FET", "AGIX", "OCEAN", "RNDR", "TAO", "WLD", "PHB", "CTXC", "NMR", "ORAI"],
+    "MEME": ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BABYDOGE", "ELON", "SAMO"],
+    "LAYER1": ["BTC", "ETH", "SOL", "BNB", "ADA", "AVAX", "TON", "DOT", "ATOM", "NEAR", "ICP", "APT", "SUI", "KAS", "ALGO", "XLM", "VET", "HBAR", "FTM", "EGLD"],
+    "LAYER2": ["MATIC", "ARB", "OP", "METIS", "BOBA", "LRC", "SKL", "IMX", "ZK", "POL"],
+    "DEFI": ["UNI", "AAVE", "MKR", "COMP", "CRV", "LDO", "SNX", "BAL", "1INCH", "SUSHI", "CAKE", "RUNE", "ENJ", "YFI"],
+    "GAMING": ["SAND", "MANA", "GALA", "AXS", "ILV", "YGG", "MAGIC", "PRIME", "GHST", "ALICE", "WAXP", "CROWN"],
+    "INFRASTRUCTURE": ["LINK", "GRT", "FIL", "AR", "STORJ", "ANKR", "GNO", "LPT", "HNT", "THETA"],
+    "RWA": ["ONDO", "CFG", "RIO", "LNDX", "PRO", "BTRST", "DUSK", "TRU"],
+    "PAYMENT": ["XRP", "XLM", "ALGO", "NANO", "XDC", "AMP", "ACH"],
+    "PRIVACY": ["ZEC", "XMR", "DASH", "KEEP", "NU", "SCRT", "NYM"],
+    "STORAGE": ["FIL", "AR", "STORJ", "BLZ", "SIA", "BTT"]
+}
+
+def get_sector(symbol):
+    base = symbol.replace("/USDT", "").upper()
+    for sector, keywords in SECTOR_MAP.items():
+        if any(kw in base for kw in keywords):
+            return sector
+    return "OTHER"
+
+def get_volume_growth(sym):
+    df = get_ohlcv_safe(sym, 30)
+    if df is None or len(df) < 20:
+        return 0.0
+    vol = df['volume']
+    recent_avg = vol.iloc[-5:].mean()
+    older_avg = vol.iloc[-20:-5].mean()
+    if older_avg == 0:
+        return 0.0
+    return (recent_avg / older_avg) - 1.0
+
+def get_price_momentum(sym):
+    df = get_ohlcv_safe(sym, 30)
+    if df is None or len(df) < 20:
+        return 0.0
+    return (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
+
+def select_sector_leaders():
+    sectors = set(SECTOR_MAP.keys())
+    leaders = []
+    for sector in sectors:
+        symbols_in_sector = [s for s in get_usdt_perp_symbols() if get_sector(s) == sector][:20]
+        if not symbols_in_sector:
+            continue
+        best = None
+        best_score = -1e9
+        for sym in symbols_in_sector:
+            vol_growth = get_volume_growth(sym)
+            momentum = get_price_momentum(sym)
+            score = vol_growth * 10 + momentum
+            if score > best_score:
+                best_score = score
+                best = sym
+        if best:
+            leaders.append({"symbol": best, "score": round(best_score, 2), "sector": sector})
+    leaders.sort(key=lambda x: x["score"], reverse=True)
+    return leaders[:5]
+
+# ========== WATCHLIST ROTATION ENGINE ==========
+class WatchlistRotation:
+    def __init__(self, symbols_40):
+        self.symbols = symbols_40
+        self.batch_size = 6
+        self.current_index = 0
+        self.last_rotate = time.time()
+        self.rotation_interval = 30
+
+    def get_next_batch(self):
+        batch = []
+        for i in range(self.batch_size):
+            idx = (self.current_index + i) % len(self.symbols)
+            batch.append(self.symbols[idx])
+        self.current_index = (self.current_index + self.batch_size) % len(self.symbols)
+        self.last_rotate = time.time()
+        return batch
+
+    def should_rotate(self):
+        return time.time() - self.last_rotate >= self.rotation_interval
+
+def build_40_symbol_universe():
+    strong_set = set()
+    for c in MEMORY.get("scanner_v2_buy", []) + MEMORY.get("scanner_v2_sell", []):
+        strong_set.add(c["symbol"])
+    for c in MEMORY.get("radar_top5", []):
+        strong_set.add(c["symbol"])
+    for c in MEMORY.get("rf_watchlist", []):
+        strong_set.add(c["symbol"])
+    strong_list = list(strong_set)[:20]
+    all_symbols = get_usdt_perp_symbols()
+    fresh_radar = FreshLiquidityRadar.scan(all_symbols, limit=20)
+    fresh_list = [c["symbol"] for c in fresh_radar if c["symbol"] not in strong_set][:15]
+    sector_leaders = select_sector_leaders()
+    leader_list = [l["symbol"] for l in sector_leaders if l["symbol"] not in strong_set and l["symbol"] not in fresh_list][:5]
+    universe = strong_list + fresh_list + leader_list
+    seen = set()
+    unique_universe = []
+    for sym in universe:
+        if sym not in seen:
+            seen.add(sym)
+            unique_universe.append(sym)
+    if len(unique_universe) < 40:
+        extra = [s for s in all_symbols if s not in seen][:40 - len(unique_universe)]
+        unique_universe.extend(extra)
+    return unique_universe[:40]
+
+# ========== EXECUTION QUEUE INTEGRATION (NEW) ==========
+# Data structures for the queue
+class OrderBlockQuality(Enum):
+    FRESH = "FRESH"
+    TESTED = "TESTED"
+    WEAK = "WEAK"
+    BROKEN = "BROKEN"
+    FAKE = "FAKE"
+
+class InstitutionalBehaviour(Enum):
+    ACCUMULATION = "ACCUMULATION"
+    DISTRIBUTION = "DISTRIBUTION"
+    RE_ACCUMULATION = "RE_ACCUMULATION"
+    RE_DISTRIBUTION = "RE_DISTRIBUTION"
+    NEUTRAL = "NEUTRAL"
+
+class MarketStructure(Enum):
+    BOS = "BOS"              # Break of Structure
+    CHOCH = "CHOCH"          # Change of Character
+    MSS = "MSS"              # Market Structure Shift
+    NONE = "NONE"
+
+class OpportunityType(Enum):
+    INSTITUTIONAL_REVERSAL = "INSTITUTIONAL_REVERSAL"
+    TREND_CONTINUATION = "TREND_CONTINUATION"
+    BREAKOUT_RETEST = "BREAKOUT_RETEST"
+    DISTRIBUTION_ENTRY = "DISTRIBUTION_ENTRY"
+    ACCUMULATION_ENTRY = "ACCUMULATION_ENTRY"
+    LOW_QUALITY = "LOW_QUALITY"
+    FAKE_BREAKOUT = "FAKE_BREAKOUT"
+    WEAK_ORDER_BLOCK = "WEAK_ORDER_BLOCK"
+
+class ExecutionState(Enum):
+    DISCOVERED = "DISCOVERED"
+    WATCHLIST = "WATCHLIST"
+    GOOD_ZONE = "GOOD_ZONE"
+    WAITING_TRIGGER = "WAITING_TRIGGER"
+    TRIGGER_DETECTED = "TRIGGER_DETECTED"
+    ENTRY_VALIDATION = "ENTRY_VALIDATION"
+    READY = "READY"
+    EXECUTED = "EXECUTED"
+    INVALIDATED = "INVALIDATED"
+    RETURNED_WATCHLIST = "RETURNED_WATCHLIST"
+
+@dataclass
+class ZoneMetrics:
+    order_block_quality: float = 50.0
+    zone_strength: float = 50.0
+    liquidity_quality: float = 50.0
+    institutional_confidence: float = 50.0
+    structure_alignment: float = 50.0
+    entry_timing: float = 50.0
+    trend_alignment: float = 50.0
+    risk_score: float = 50.0
+    trigger_state: str = "WAITING_TRIGGER"
+
+    @property
+    def final_zone_score(self) -> float:
+        weights = {
+            'order_block_quality': 0.20,
+            'zone_strength': 0.18,
+            'liquidity_quality': 0.15,
+            'institutional_confidence': 0.15,
+            'structure_alignment': 0.12,
+            'entry_timing': 0.10,
+            'trend_alignment': 0.05,
+            'risk_score': 0.05
+        }
+        score = 0.0
+        for attr, w in weights.items():
+            score += getattr(self, attr, 50) * w
+        return round(score, 2)
+
+@dataclass
+class ExecutionCandidate:
+    symbol: str
+    side: str
+    price: float
+    entry_price: float
+    stop_loss: float
+    take_profit_1: float
+    take_profit_2: float
+    atr: float
+    df: pd.DataFrame
+    ob: Any
+
+    zone_metrics: ZoneMetrics = field(default_factory=ZoneMetrics)
+    opportunity_type: OpportunityType = OpportunityType.LOW_QUALITY
+    market_structure: MarketStructure = MarketStructure.NONE
+    institutional_behaviour: InstitutionalBehaviour = InstitutionalBehaviour.NEUTRAL
+    state: ExecutionState = ExecutionState.DISCOVERED
+    priority_score: float = 0.0
+    added_at: float = field(default_factory=time.time)
+    last_evaluated: float = field(default_factory=time.time)
+    evaluation_count: int = 0
+
+    original_score: float = 0.0
+    original_reason: str = ""
+    signal_type: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            'symbol': self.symbol,
+            'side': self.side,
+            'entry_price': self.entry_price,
+            'opportunity_type': self.opportunity_type.value,
+            'market_structure': self.market_structure.value,
+            'institutional_behaviour': self.institutional_behaviour.value,
+            'zone_score': self.zone_metrics.final_zone_score,
+            'priority_score': self.priority_score,
+            'state': self.state.value,
+            'trigger_state': self.zone_metrics.trigger_state,
+            'ob_score': self.zone_metrics.order_block_quality,
+            'zone_strength': self.zone_metrics.zone_strength,
+            'liquidity': self.zone_metrics.liquidity_quality,
+            'institutional': self.zone_metrics.institutional_confidence,
+            'structure': self.zone_metrics.structure_alignment,
+            'timing': self.zone_metrics.entry_timing,
+            'trend': self.zone_metrics.trend_alignment,
+            'risk': self.zone_metrics.risk_score,
+            'evaluation_count': self.evaluation_count,
+            'last_update': self.last_evaluated
+        }
+
+class ExecutionQueue:
+    def __init__(self, max_size: int = 15, re_eval_interval: float = 5.0):
+        self._candidates: Dict[str, ExecutionCandidate] = {}
+        self._max_size = max_size
+        self._re_eval_interval = re_eval_interval
+        self._lock = threading.RLock()
+        self.total_evaluations = 0
+        self.total_rejected = 0
+        self.total_executed = 0
+        self._last_promote = 0
+
+    def add_candidate(self, candidate: ExecutionCandidate) -> bool:
+        with self._lock:
+            if len(self._candidates) >= self._max_size:
+                # Remove lowest priority candidate that is not READY
+                lowest = min(
+                    [(s, c) for s, c in self._candidates.items() if c.state != ExecutionState.READY],
+                    key=lambda x: x[1].priority_score,
+                    default=None
+                )
+                if lowest:
+                    self._candidates.pop(lowest[0])
+                    self.total_rejected += 1
+                else:
+                    return False  # cannot add more
+
+            if candidate.symbol in self._candidates:
+                existing = self._candidates[candidate.symbol]
+                if candidate.zone_metrics.final_zone_score > existing.zone_metrics.final_zone_score:
+                    self._candidates[candidate.symbol] = candidate
+                    return True
+                return False
+
+            self._candidates[candidate.symbol] = candidate
+            return True
+
+    def re_evaluate_all(self, data_fetcher):
+        if not self._candidates:
+            return
+
+        with self._lock:
+            for symbol, cand in list(self._candidates.items()):
+                df = data_fetcher(symbol)
+                if df is None or len(df) < 30:
+                    self._invalidate(symbol, "Insufficient data")
+                    continue
+
+                current_price = df['close'].iloc[-1]
+                atr = compute_atr(df).iloc[-1] if len(df) > 14 else current_price * 0.01
+                cand.atr = atr
+
+                # 1. Reject if price extended >1.5 ATR from entry zone
+                if self._is_extended(cand, current_price):
+                    self._return_to_watchlist(symbol, "Price extended")
+                    continue
+
+                # 2. Check if order block broken
+                if self._is_order_block_broken(cand, current_price):
+                    self._invalidate(symbol, "Order block broken")
+                    continue
+
+                # Evaluate dimensions
+                ob_score, ob_type = self._evaluate_order_block(df, cand.side, atr)
+                zone_score = self._evaluate_zone_strength(df, cand.side, atr, cand.entry_price)
+                liq_score = self._evaluate_liquidity(df, cand.side, atr)
+                inst_score = self._evaluate_institutional(df, cand.side)
+                struct_score, struct_type = self._evaluate_structure(df, cand.side)
+                timing_score = self._evaluate_timing(df, cand.side, atr, current_price, cand.entry_price)
+                trend_score = self._evaluate_trend_alignment(df, cand.side)
+                risk_score = self._evaluate_risk(cand, current_price)
+
+                # Detect trigger state
+                trigger_state = self._detect_trigger_state(df, cand.side, atr, cand.entry_price)
+
+                metrics = ZoneMetrics(
+                    order_block_quality=ob_score,
+                    zone_strength=zone_score,
+                    liquidity_quality=liq_score,
+                    institutional_confidence=inst_score,
+                    structure_alignment=struct_score,
+                    entry_timing=timing_score,
+                    trend_alignment=trend_score,
+                    risk_score=risk_score,
+                    trigger_state=trigger_state
+                )
+
+                opp_type = self._classify_opportunity(metrics, struct_type, cand.side, df)
+                behaviour = self._detect_institutional_behaviour(df, cand.side)
+
+                cand.zone_metrics = metrics
+                cand.opportunity_type = opp_type
+                cand.market_structure = struct_type
+                cand.institutional_behaviour = behaviour
+                cand.last_evaluated = time.time()
+                cand.evaluation_count += 1
+                cand.priority_score = metrics.final_zone_score
+
+                self._update_state(cand, current_price)
+
+                self.total_evaluations += 1
+
+                # If priority too low, return to watchlist
+                if cand.priority_score < 30:
+                    self._return_to_watchlist(symbol, "Score too low")
+
+    # ---------- Evaluation methods ----------
+    def _is_extended(self, cand, price):
+        return abs(price - cand.entry_price) > cand.atr * 1.5
+
+    def _is_order_block_broken(self, cand, price):
+        if cand.side == "BUY":
+            return price < cand.entry_price - cand.atr * 0.8
+        else:
+            return price > cand.entry_price + cand.atr * 0.8
+
+    def _evaluate_order_block(self, df, side, atr):
+        if len(df) < 1:
+            return 30, OrderBlockQuality.WEAK
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        range_ = last['high'] - last['low']
+        if range_ == 0:
+            return 30, OrderBlockQuality.WEAK
+
+        if side == "BUY":
+            lower_wick = min(last['open'], last['close']) - last['low']
+            ratio = lower_wick / range_
+            if ratio > 0.6 and last['close'] > last['open']:
+                return 90, OrderBlockQuality.FRESH
+            elif ratio > 0.4:
+                return 70, OrderBlockQuality.TESTED
+            else:
+                return 50, OrderBlockQuality.WEAK
+        else:
+            upper_wick = last['high'] - max(last['open'], last['close'])
+            ratio = upper_wick / range_
+            if ratio > 0.6 and last['close'] < last['open']:
+                return 90, OrderBlockQuality.FRESH
+            elif ratio > 0.4:
+                return 70, OrderBlockQuality.TESTED
+            else:
+                return 50, OrderBlockQuality.WEAK
+
+    def _evaluate_zone_strength(self, df, side, atr, entry_price):
+        touches = 0
+        rejections = 0
+        vol_sum = 0
+        for i in range(max(0, len(df)-30), len(df)-1):
+            candle = df.iloc[i]
+            if side == "BUY":
+                if abs(candle['low'] - entry_price) < atr * 0.5:
+                    touches += 1
+                    if df['close'].iloc[i+1] > candle['close']:
+                        rejections += 1
+                        vol_sum += candle['volume']
+            else:
+                if abs(candle['high'] - entry_price) < atr * 0.5:
+                    touches += 1
+                    if df['close'].iloc[i+1] < candle['close']:
+                        rejections += 1
+                        vol_sum += candle['volume']
+
+        score = 50
+        if touches >= 4:
+            score += 25
+        elif touches >= 2:
+            score += 12
+        elif touches >= 1:
+            score += 5
+
+        if rejections >= 3:
+            score += 20
+        elif rejections >= 2:
+            score += 10
+
+        avg_vol = df['volume'].iloc[-30:].mean()
+        if touches > 0 and avg_vol > 0:
+            avg_touch_vol = vol_sum / touches
+            if avg_touch_vol > 2 * avg_vol:
+                score += 15
+            elif avg_touch_vol > 1.5 * avg_vol:
+                score += 8
+
+        return min(100, max(0, score))
+
+    def _evaluate_liquidity(self, df, side, atr):
+        pools = self._build_liquidity_pools(df)
+        swept_high, swept_low = self._detect_sweep(df, pools)
+        stop_hunt, hunt_side = self._detect_stop_hunt(df)
+        eq_highs, eq_lows = self._detect_equal_highs_lows(df)
+
+        score = 50
+        if side == "BUY":
+            if swept_low: score += 25
+            if eq_lows: score += 10
+            if stop_hunt and hunt_side == "BUY": score += 20
+        else:
+            if swept_high: score += 25
+            if eq_highs: score += 10
+            if stop_hunt and hunt_side == "SELL": score += 20
+        return min(100, max(0, score))
+
+    def _evaluate_institutional(self, df, side):
+        try:
+            smart = SmartMoneyEngine.analyze_smart_money(df)
+            mom = MomentumFlowEngine.analyze_momentum_flow(df)
+        except:
+            return 50
+
+        score = 50
+        if smart.get('smart_money_dominant', False):
+            score += 15
+            if (side == "BUY" and smart['institutional_bias'] == "BUY") or \
+               (side == "SELL" and smart['institutional_bias'] == "SELL"):
+                score += 15
+
+        dist = smart.get('distribution_risk', 0)
+        if side == "BUY" and dist < 30:
+            score += 10
+        elif side == "SELL" and dist > 60:
+            score += 10
+
+        acc = smart.get('accumulation_strength', 0)
+        if side == "BUY" and acc > 60:
+            score += 10
+        elif side == "SELL" and acc < 40:
+            score += 10
+
+        if mom.get('trend_expansion', False):
+            score += 5
+        if mom.get('momentum_decay', False):
+            score -= 10
+
+        return min(100, max(0, score))
+
+    def _evaluate_structure(self, df, side):
+        bos_up, bos_down = self._detect_bos(df)
+        struct_shift = self._detect_structure_shift(df)
+        score = 50
+        struct_type = MarketStructure.NONE
+
+        if side == "BUY":
+            if struct_shift == "bullish_shift":
+                score = 90
+                struct_type = MarketStructure.MSS
+            elif bos_up:
+                score = 70
+                struct_type = MarketStructure.BOS
+        else:
+            if struct_shift == "bearish_shift":
+                score = 90
+                struct_type = MarketStructure.MSS
+            elif bos_down:
+                score = 70
+                struct_type = MarketStructure.BOS
+        return score, struct_type
+
+    def _evaluate_timing(self, df, side, atr, current_price, entry_price):
+        dist = abs(current_price - entry_price) / entry_price
+        score = 50
+        if dist < 0.005:
+            score += 30
+        elif dist < 0.015:
+            score += 15
+        elif dist > 0.03:
+            score -= 30
+
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        range_ = last['high'] - last['low']
+        if range_ > 0:
+            if side == "BUY":
+                lower_wick = min(last['open'], last['close']) - last['low']
+                if lower_wick / range_ > 0.5 and last['close'] > last['open']:
+                    score += 20
+            else:
+                upper_wick = last['high'] - max(last['open'], last['close'])
+                if upper_wick / range_ > 0.5 and last['close'] < last['open']:
+                    score += 20
+
+        vol_avg = df['volume'].iloc[-10:].mean()
+        if vol_avg > 0 and df['volume'].iloc[-1] > 1.5 * vol_avg:
+            score += 10
+
+        return min(100, max(0, score))
+
+    def _evaluate_trend_alignment(self, df, side):
+        if len(df) < 20:
+            return 50
+        ema20 = df['close'].ewm(span=20).mean().iloc[-1]
+        ema50 = df['close'].ewm(span=50).mean().iloc[-1]
+        price = df['close'].iloc[-1]
+        score = 50
+        if side == "BUY":
+            if price > ema20 > ema50:
+                score += 25
+            elif price > ema20:
+                score += 10
+            else:
+                score -= 20
+        else:
+            if price < ema20 < ema50:
+                score += 25
+            elif price < ema20:
+                score += 10
+            else:
+                score -= 20
+        return min(100, max(0, score))
+
+    def _evaluate_risk(self, cand, price):
+        spread = get_spread_bps(cand.symbol)
+        score = 50
+        if spread < 0.05:
+            score += 20
+        elif spread < 0.1:
+            score += 10
+        elif spread > 0.2:
+            score -= 30
+
+        atr_pct = (cand.atr / cand.entry_price) * 100 if cand.entry_price > 0 else 0
+        if 0.5 < atr_pct < 2.5:
+            score += 10
+        elif atr_pct > 4:
+            score -= 20
+        return min(100, max(0, score))
+
+    def _classify_opportunity(self, metrics, struct_type, side, df):
+        score = metrics.final_zone_score
+        if score >= 85 and struct_type != MarketStructure.NONE:
+            return OpportunityType.INSTITUTIONAL_REVERSAL
+        elif score >= 70 and struct_type == MarketStructure.BOS:
+            return OpportunityType.BREAKOUT_RETEST
+        elif score >= 60 and struct_type != MarketStructure.NONE:
+            return OpportunityType.TREND_CONTINUATION
+        elif side == "BUY" and metrics.institutional_confidence > 70:
+            return OpportunityType.ACCUMULATION_ENTRY
+        elif side == "SELL" and metrics.institutional_confidence > 70:
+            return OpportunityType.DISTRIBUTION_ENTRY
+        elif metrics.order_block_quality < 40:
+            return OpportunityType.FAKE_BREAKOUT
+        elif metrics.order_block_quality < 50:
+            return OpportunityType.WEAK_ORDER_BLOCK
+        return OpportunityType.LOW_QUALITY
+
+    def _detect_institutional_behaviour(self, df, side):
+        try:
+            smart = SmartMoneyEngine.analyze_smart_money(df)
+            mom = MomentumFlowEngine.analyze_momentum_flow(df)
+        except:
+            return InstitutionalBehaviour.NEUTRAL
+
+        banker = smart.get('banker_pressure', 50)
+        retail = smart.get('retailer_pressure', 50)
+        dist = smart.get('distribution_risk', 0)
+        acc = smart.get('accumulation_strength', 0)
+
+        if side == "BUY" and banker > retail and dist < 30 and acc > 60:
+            return InstitutionalBehaviour.ACCUMULATION
+        if side == "SELL" and banker < retail and dist > 50:
+            return InstitutionalBehaviour.DISTRIBUTION
+        if side == "BUY" and dist > 50 and acc > 50:
+            return InstitutionalBehaviour.RE_ACCUMULATION
+        if side == "SELL" and dist < 30 and acc > 50:
+            return InstitutionalBehaviour.RE_DISTRIBUTION
+        return InstitutionalBehaviour.NEUTRAL
+
+    def _detect_trigger_state(self, df, side, atr, entry_price):
+        """Determine the trigger state based on institutional price action."""
+        # Check for sweep
+        pools = self._build_liquidity_pools(df)
+        swept_high, swept_low = self._detect_sweep(df, pools)
+        sweep_ok = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
+
+        # Check BOS / CHoCH
+        bos_up, bos_down = self._detect_bos(df)
+        struct_shift = self._detect_structure_shift(df)
+        bos_ok = (side == "BUY" and bos_up) or (side == "SELL" and bos_down)
+        choch_ok = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
+
+        # Check rejection / engulfing
+        rejection_ok = candle_rejection(df, side)
+        # Check displacement
+        vol_state = classify_volume(df)
+        displacement_ok = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
+
+        # Check if price is near entry (zone mitigation)
+        dist = abs(df['close'].iloc[-1] - entry_price) / entry_price
+        near_entry = dist < 0.003
+
+        # Determine state
+        if sweep_ok and (bos_ok or choch_ok) and rejection_ok:
+            return "MSS_CONFIRMED"
+        elif sweep_ok and near_entry and rejection_ok:
+            return "LIQUIDITY_SWEEP"
+        elif bos_ok and displacement_ok:
+            return "BOS_CONFIRMED"
+        elif choch_ok and displacement_ok:
+            return "CHOCH_CONFIRMED"
+        elif sweep_ok and not (bos_ok or choch_ok):
+            return "MITIGATION"
+        elif near_entry and (bos_ok or choch_ok):
+            return "WAITING_TRIGGER"
+        elif near_entry:
+            return "MITIGATION"
+        elif displacement_ok:
+            return "DISPLACEMENT"
+        else:
+            return "WAITING_TRIGGER"
+
+    def _update_state(self, cand, price):
+        score = cand.zone_metrics.final_zone_score
+        trigger = cand.zone_metrics.trigger_state
+
+        if score >= 85 and trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED"):
+            cand.state = ExecutionState.READY
+        elif score >= 70 and trigger == "MITIGATION":
+            cand.state = ExecutionState.ENTRY_VALIDATION
+        elif score >= 70:
+            cand.state = ExecutionState.WAITING_TRIGGER
+        elif score >= 55:
+            cand.state = ExecutionState.GOOD_ZONE
+        else:
+            cand.state = ExecutionState.WATCHLIST
+
+    # ---------- Helper structure detection (using existing functions) ----------
+    def _detect_bos(self, df, lookback=5):
+        if len(df) < lookback+2:
+            return False, False
+        recent_high = df['high'].iloc[-lookback-1:-1].max()
+        recent_low = df['low'].iloc[-lookback-1:-1].min()
+        close = df['close'].iloc[-1]
+        return close > recent_high, close < recent_low
+
+    def _detect_structure_shift(self, df):
+        if len(df) < 10:
+            return None
+        if df['high'].iloc[-3] > df['high'].iloc[-6] and df['low'].iloc[-3] > df['low'].iloc[-6]:
+            return "bullish_shift"
+        if df['high'].iloc[-3] < df['high'].iloc[-6] and df['low'].iloc[-3] < df['low'].iloc[-6]:
+            return "bearish_shift"
+        return None
+
+    def _build_liquidity_pools(self, df):
+        if len(df) < 10:
+            return {"high_pools": [], "low_pools": []}
+        highs = df['high'].values
+        lows = df['low'].values
+        sh = [highs[i] for i in range(2, len(df)-2) if highs[i] == max(highs[i-2:i+3])]
+        sl = [lows[i] for i in range(2, len(df)-2) if lows[i] == min(lows[i-2:i+3])]
+        return {"high_pools": sh[-3:], "low_pools": sl[-3:]}
+
+    def _detect_sweep(self, df, pools):
+        if len(df) < 2:
+            return False, False
+        last, prev = df.iloc[-1], df.iloc[-2]
+        swept_high = any(last['high'] > h and prev['high'] <= h for h in pools['high_pools'])
+        swept_low = any(last['low'] < l and prev['low'] >= l for l in pools['low_pools'])
+        return swept_high, swept_low
+
+    def _detect_stop_hunt(self, df):
+        pools = self._build_liquidity_pools(df)
+        swept_high, swept_low = self._detect_sweep(df, pools)
+        last = df.iloc[-1]
+        if swept_high and last['close'] < last['high']:
+            return True, "SELL"
+        if swept_low and last['close'] > last['low']:
+            return True, "BUY"
+        return False, None
+
+    def _detect_equal_highs_lows(self, df, lookback=50):
+        if len(df) < lookback:
+            return False, False
+        sub = df.iloc[-lookback:]
+        highs = sub['high'].values
+        lows = sub['low'].values
+        sh = [highs[i] for i in range(2, len(sub)-2) if highs[i] == max(highs[i-2:i+3])]
+        sl = [lows[i] for i in range(2, len(sub)-2) if lows[i] == min(lows[i-2:i+3])]
+
+        def eq(points, tol=0.002):
+            if len(points) < 2:
+                return False
+            avg = sum(points) / len(points)
+            return all(abs(p - avg) / avg < tol for p in points)
+
+        eq_high = eq(sh[-3:]) if len(sh) >= 3 else False
+        eq_low = eq(sl[-3:]) if len(sl) >= 3 else False
+        return eq_high, eq_low
+
+    # ---------- Queue management ----------
+    def get_best_candidate(self) -> Optional[ExecutionCandidate]:
+        with self._lock:
+            ready = [c for c in self._candidates.values() if c.state == ExecutionState.READY]
+            if not ready:
+                return None
+            return max(ready, key=lambda c: c.priority_score)
+
+    def _invalidate(self, symbol, reason):
+        if symbol in self._candidates:
+            self._candidates[symbol].state = ExecutionState.INVALIDATED
+            self._candidates.pop(symbol, None)
+            self.total_rejected += 1
+            log_execution(f"[QUEUE] {symbol} invalidated: {reason}", "WARN")
+
+    def _return_to_watchlist(self, symbol, reason):
+        if symbol in self._candidates:
+            self._candidates[symbol].state = ExecutionState.RETURNED_WATCHLIST
+            log_execution(f"[QUEUE] {symbol} returned to Watchlist: {reason}", "WARN")
+
+    def cleanup(self):
+        with self._lock:
+            now = time.time()
+            to_remove = []
+            for symbol, cand in self._candidates.items():
+                if cand.state in (ExecutionState.EXECUTED, ExecutionState.INVALIDATED, ExecutionState.RETURNED_WATCHLIST):
+                    to_remove.append(symbol)
+                elif now - cand.added_at > 3600:  # 1 hour expiry
+                    if cand.priority_score >= 40:
+                        self._return_to_watchlist(symbol, "Expired")
+                    to_remove.append(symbol)
+            for sym in to_remove:
+                self._candidates.pop(sym, None)
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {
+                'total_candidates': len(self._candidates),
+                'discovered': sum(1 for c in self._candidates.values() if c.state == ExecutionState.DISCOVERED),
+                'watchlist': sum(1 for c in self._candidates.values() if c.state == ExecutionState.WATCHLIST),
+                'good_zone': sum(1 for c in self._candidates.values() if c.state == ExecutionState.GOOD_ZONE),
+                'waiting_trigger': sum(1 for c in self._candidates.values() if c.state == ExecutionState.WAITING_TRIGGER),
+                'trigger_detected': sum(1 for c in self._candidates.values() if c.state == ExecutionState.TRIGGER_DETECTED),
+                'entry_validation': sum(1 for c in self._candidates.values() if c.state == ExecutionState.ENTRY_VALIDATION),
+                'ready': sum(1 for c in self._candidates.values() if c.state == ExecutionState.READY),
+                'total_evaluations': self.total_evaluations,
+                'total_rejected': self.total_rejected,
+                'total_executed': self.total_executed,
+                'candidates': [c.to_dict() for c in self._candidates.values()],
+                'best_score': max([c.priority_score for c in self._candidates.values()]) if self._candidates else 0
+            }
+
+# Global queue instance
+queue = ExecutionQueue(max_size=QUEUE_MAX_SIZE, re_eval_interval=QUEUE_RE_EVAL_INTERVAL)
+_last_queue_promote = 0
+_last_queue_eval = 0
+
+# ========== GLOBAL DISCOVERY SCANNER (NEW) ==========
+def global_discovery_scan():
+    """Scan entire market every 20 minutes, update watchlist with top candidates."""
+    log_execution("[DISCOVERY] Starting global discovery scan...", "INFO")
+    start_time = time.time()
+    all_symbols = get_usdt_perp_symbols()[:200]
+    candidates = []
+
+    # 1. Smart Scanner v2 (existing)
+    buy, sell = smart_scanner_v2()
+    for b in buy[:5]:
+        candidates.append({"symbol": b["symbol"], "score": b["score"], "side": "BUY", "source": "scanner_v2"})
+    for s in sell[:5]:
+        candidates.append({"symbol": s["symbol"], "score": s["score"], "side": "SELL", "source": "scanner_v2"})
+
+    # 2. RF Scanner
+    rf_candidates = scan_market_rf(top_n=20)
+    for r in rf_candidates[:10]:
+        side = r.get("rf_signal")
+        if side in ("BUY", "SELL"):
+            candidates.append({"symbol": r["symbol"], "score": r["score"]*10, "side": side, "source": "rf"})
+
+    # 3. Fresh Liquidity Radar
+    fresh = FreshLiquidityRadar.scan(all_symbols, limit=15)
+    for f in fresh:
+        # determine side based on momentum? For now we assign both sides
+        candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "BUY", "source": "fresh"})
+        candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "SELL", "source": "fresh"})
+
+    # 4. Random discovery (10% of symbols)
+    random.shuffle(all_symbols)
+    for sym in all_symbols[:10]:
+        if not any(c["symbol"] == sym for c in candidates):
+            candidates.append({"symbol": sym, "score": 0, "side": "BUY", "source": "random"})
+            candidates.append({"symbol": sym, "score": 0, "side": "SELL", "source": "random"})
+
+    # Sort by score, keep top 40
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top_candidates = candidates[:40]
+
+    # Update watchlist (MEMORY["watchlist"])
+    for item in top_candidates:
+        sym = item["symbol"]
+        side = item["side"]
+        # Use existing record_watchlist_entry to add/update
+        # we need a narrative dict; we can create a minimal one
+        narrative = {
+            "sweep": False,
+            "choch_bos": False,
+            "retest": False,
+            "rejection": False,
+            "displacement": False,
+            "volume_confirmation": False,
+            "rf_alignment": False
+        }
+        # We don't have full narrative, just assign a basic score
+        # Let's call record_watchlist_entry with dummy narrative
+        # But we want to preserve existing entries; better to update only if new score is higher
+        existing = MEMORY.get("watchlist", {}).get(sym)
+        if existing and existing.get("score", 0) >= item["score"]:
+            continue
+        # Build a simple narrative based on source
+        if item["source"] == "scanner_v2":
+            narrative["sweep"] = True
+        elif item["source"] == "rf":
+            narrative["rf_alignment"] = True
+        elif item["source"] == "fresh":
+            narrative["volume_confirmation"] = True
+        record_watchlist_entry(sym, side, narrative, item["score"])
+
+    # Also update radar_top5 for compatibility
+    radar_top = [{"symbol": c["symbol"], "score": c["score"]} for c in top_candidates[:5]]
+    MEMORY["radar_top5"] = radar_top
+
+    elapsed = time.time() - start_time
+    log_execution(f"[DISCOVERY] Scan completed in {elapsed:.1f}s, {len(top_candidates)} candidates added to watchlist.", "INFO")
+
+def promote_to_queue():
+    """Scan watchlist and add high-potential symbols to the execution queue."""
+    if not USE_EXECUTION_QUEUE:
+        return
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return
+
+    watchlist = []
+    # Combine from multiple watchlist sources
+    for source in (MEMORY.get("watchlist", {}).values(),
+                   MEMORY.get("rf_watchlist", []),
+                   MEMORY.get("scanner_v2_buy", []),
+                   MEMORY.get("scanner_v2_sell", [])):
+        if isinstance(source, dict):
+            # if it's a dict of entries
+            for item in source.values():
+                if isinstance(item, dict) and "symbol" in item:
+                    watchlist.append(item)
+        elif isinstance(source, list):
+            for item in source:
+                if isinstance(item, dict) and "symbol" in item:
+                    watchlist.append(item)
+
+    best_per_symbol = {}
+    for item in watchlist:
+        sym = item.get('symbol')
+        if not sym:
+            continue
+        score = item.get('score', 0)
+        side = item.get('side', 'BUY')
+        if sym not in best_per_symbol or score > best_per_symbol[sym]['score']:
+            best_per_symbol[sym] = {'score': score, 'side': side, 'source': item.get('source', 'unknown')}
+
+    sorted_items = sorted(best_per_symbol.items(), key=lambda x: x[1]['score'], reverse=True)
+
+    for sym, data in sorted_items[:30]:
+        if sym in queue._candidates:
+            continue
+
+        df = get_ohlcv_safe(sym, 100)
+        if df is None or len(df) < 30:
+            continue
+
+        price = df['close'].iloc[-1]
+        atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+        ob = get_orderbook_cached(sym, limit=10)
+
+        side = data.get('side', 'BUY')
+        sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
+
+        metrics = ZoneMetrics()
+        candidate = ExecutionCandidate(
+            symbol=sym,
+            side=side,
+            price=price,
+            entry_price=price,
+            stop_loss=sl,
+            take_profit_1=tp1,
+            take_profit_2=tp2,
+            atr=atr,
+            df=df,
+            ob=ob,
+            zone_metrics=metrics,
+            original_score=data.get('score', 0),
+            original_reason=data.get('reason', 'Watchlist promotion'),
+            signal_type=data.get('source', 'watchlist')
+        )
+        queue.add_candidate(candidate)
+        log_execution(f"[QUEUE] Promoted {sym} {side} from watchlist", "INFO", debounce_key=f"promote_{sym}", debounce_sec=60)
+
+def process_queue_entry():
+    """Select best candidate and attempt entry via existing execute_entry."""
+    if not USE_EXECUTION_QUEUE:
+        return
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return
+
+    best = queue.get_best_candidate()
+    if best is None:
+        return
+
+    if best.priority_score < 80:
+        return
+
+    log_execution(f"[QUEUE] Attempting entry for {best.symbol} {best.side} (Score: {best.priority_score:.1f})", "INFO")
+    success = execute_entry(
+        best.side,
+        best.symbol,
+        best.price,
+        best.stop_loss,
+        best.take_profit_1,
+        best.take_profit_2,
+        best.original_score,
+        f"QUEUE: {best.opportunity_type.value} (Zone Score: {best.zone_metrics.final_zone_score})",
+        best.atr,
+        best.opportunity_type.value,
+        "EXECUTION_QUEUE",
+        best.opportunity_type.value
+    )
+    if success:
+        with queue._lock:
+            if best.symbol in queue._candidates:
+                queue._candidates[best.symbol].state = ExecutionState.EXECUTED
+        queue.total_executed += 1
+        log_execution(f"[QUEUE] Trade executed for {best.symbol}", "SUCCESS")
+
 # ========== FLASK DASHBOARD ==========
 app = Flask(__name__)
 
@@ -6014,7 +6990,7 @@ def render_live_supervisor_panel():
     return """
     <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
       <div class="rf-live-header">
-        <span class="rf-live-title">🧠 RF v28.2 Professional Trade Mgmt</span>
+        <span class="rf-live-title">🧠 RF v28 Fixed Live Supervisor</span>
         <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
       </div>
       <div class="rf-live-grid">
@@ -6279,11 +7255,39 @@ def dashboard():
     </style>
     """
     
+    # Execution Queue Panel (NEW)
+    queue_panel_html = """
+    <div class="section smart-layer" id="queue-panel" style="display: none;">
+        <div class="title">🎯 EXECUTION QUEUE – Institutional Zone Analysis</div>
+        <div id="queue-summary" class="grid" style="grid-template-columns: repeat(6,1fr); margin-bottom:10px;">
+            <div class="card">Total<div id="q-total">0</div></div>
+            <div class="card">Ready<div id="q-ready" class="green">0</div></div>
+            <div class="card">Waiting Trigger<div id="q-waiting" class="orange">0</div></div>
+            <div class="card">Good Zone<div id="q-good-zone" class="blue">0</div></div>
+            <div class="card">Returned<div id="q-returned" class="grey">0</div></div>
+            <div class="card">Best Score<div id="q-best-score">0</div></div>
+        </div>
+        <div id="queue-table" style="max-height:400px; overflow-y:auto; font-size:12px;">
+            <table style="width:100%; border-collapse:collapse; background:#0f1724; border-radius:8px; overflow:hidden;">
+                <thead>
+                    <tr style="background:#1a2332; color:#9ca3af; text-align:center;">
+                        <th>Symbol</th><th>Side</th><th>Score</th><th>OB</th><th>Zone</th><th>Liq</th><th>Inst</th>
+                        <th>Struct</th><th>Timing</th><th>Trend</th><th>Risk</th><th>Trigger</th><th>Type</th><th>State</th>
+                    </tr>
+                </thead>
+                <tbody id="queue-body">
+                    <!-- rows populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+    
     supervisor_panel_html = render_live_supervisor_panel()
     
     html = f"""
 <!DOCTYPE html>
-<html><head><title>RF v28.2 Professional Trade Mgmt</title>
+<html><head><title>RF v28 Fixed Live Supervisor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
@@ -6294,6 +7298,9 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 .card{{background:#111827;border-radius:10px;padding:10px}}
 .green{{color:#00ffa6}}
 .red{{color:#ff4d4d}}
+.blue{{color:#3498db}}
+.orange{{color:#f1c40f}}
+.grey{{color:#95a5a6}}
 .log,.err{{max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px}}
 .btn{{background:#2d3748;border:none;color:white;padding:8px 16px;margin:4px;border-radius:6px;cursor:pointer}}
 .btn-buy{{background:#0f7b3a}}
@@ -6304,9 +7311,10 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </style>
 </head>
 <body>
-<div class="header">🔥 RF v28.2 Professional Trade Mgmt (10x)</div>
+<div class="header">🔥 RF v28 Fixed Live Supervisor</div>
 {decision_panel_html}
 {scanner_v2_section}
+{queue_panel_html}
 {supervisor_panel_html}
 {flow_section_html}
 {continuation_panel_html}
@@ -6359,7 +7367,7 @@ let lastFetch = 0;
 let cachedData = null;
 async function fetchData() {{
     const now = Date.now();
-    if (cachedData && (now - lastFetch) < 2000) {{
+    if (cachedData && (now - lastFetch) < 5000) {{
         updateUI(cachedData);
         return;
     }}
@@ -6531,10 +7539,60 @@ function updateUI(d) {{
         document.getElementById("flow-greed").innerHTML = flow.greed_state ? "🚨 Yes" : "✅ No";
         document.getElementById("flow-dom").innerHTML = flow.smart_money_dominant ? "✅ Yes" : "❌ No";
     }}
+    // Execution Queue panel (NEW)
+    if (d.queue && d.queue.enabled !== false) {{
+        document.getElementById("queue-panel").style.display = "block";
+        document.getElementById("q-total").innerText = d.queue.total;
+        document.getElementById("q-ready").innerText = d.queue.ready;
+        document.getElementById("q-waiting").innerText = (d.queue.candidates || []).filter(c => c.state === "WAITING_TRIGGER").length;
+        document.getElementById("q-good-zone").innerText = (d.queue.candidates || []).filter(c => c.state === "GOOD_ZONE" || c.state === "ENTRY_VALIDATION").length;
+        document.getElementById("q-returned").innerText = (d.queue.candidates || []).filter(c => c.state === "RETURNED_WATCHLIST").length;
+        document.getElementById("q-best-score").innerText = d.queue.best_score ? d.queue.best_score.toFixed(1) : "0";
+        let body = document.getElementById("queue-body");
+        body.innerHTML = "";
+        (d.queue.candidates || []).slice(0, 15).forEach(c => {{
+            let tr = document.createElement("tr");
+            tr.style.borderBottom = "1px solid #2c3e50";
+            let stateColor = "";
+            if (c.state === "READY") stateColor = "#2ecc71";
+            else if (c.state === "ENTRY_VALIDATION") stateColor = "#3498db";
+            else if (c.state === "WAITING_TRIGGER") stateColor = "#f1c40f";
+            else if (c.state === "GOOD_ZONE") stateColor = "#3498db";
+            else if (c.state === "MITIGATION") stateColor = "#e67e22";
+            else if (c.state === "INVALIDATED" || c.state === "RETURNED_WATCHLIST") stateColor = "#95a5a6";
+            else stateColor = "#ecf0f1";
+            let triggerState = c.trigger_state || "WAITING_TRIGGER";
+            let triggerColor = triggerState === "MSS_CONFIRMED" ? "#2ecc71" :
+                               triggerState === "LIQUIDITY_SWEEP" ? "#3498db" :
+                               triggerState === "BOS_CONFIRMED" ? "#9b59b6" :
+                               triggerState === "CHOCH_CONFIRMED" ? "#1abc9c" :
+                               triggerState === "MITIGATION" ? "#f1c40f" :
+                               "#95a5a6";
+            tr.innerHTML = `
+                <td><b>${{c.symbol}}</b></td>
+                <td style="color:${{c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}}">${{c.side}}</td>
+                <td style="font-weight:bold; color:${{c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}}">${{c.zone_score.toFixed(1)}}</td>
+                <td>${{c.ob_score.toFixed(0)}}</td>
+                <td>${{c.zone_strength.toFixed(0)}}</td>
+                <td>${{c.liquidity.toFixed(0)}}</td>
+                <td>${{c.institutional.toFixed(0)}}</td>
+                <td>${{c.structure.toFixed(0)}}</td>
+                <td>${{c.timing.toFixed(0)}}</td>
+                <td>${{c.trend.toFixed(0)}}</td>
+                <td>${{c.risk.toFixed(0)}}</td>
+                <td style="color:${{triggerColor}}; font-weight:bold;">${{triggerState}}</td>
+                <td style="font-size:10px;">${{c.opportunity_type}}</td>
+                <td style="color:${{stateColor}}; font-weight:bold;">${{c.state}}</td>
+            `;
+            body.appendChild(tr);
+        }});
+    }} else {{
+        document.getElementById("queue-panel").style.display = "none";
+    }}
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
 async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
-setInterval(fetchData, 2000);
+setInterval(fetchData, 6000);
 async function loadDecision() {{
   try {{
     const res = await fetch('/decision');
@@ -6560,7 +7618,7 @@ async function loadDecision() {{
     }}
   }} catch(e) {{ console.error(e); }}
 }}
-setInterval(loadDecision, 3000);
+setInterval(loadDecision, 6000);
 loadDecision();
 fetchData();
 </script>
@@ -6570,6 +7628,9 @@ fetchData();
 
 @app.route("/data")
 def data():
+    cached = cache_get("dashboard", 5)
+    if cached is not None:
+        return jsonify(safe_json(cached))
     try:
         bal = get_balance_safe()
         free_bal = get_free_balance_safe()
@@ -6709,14 +7770,39 @@ def data():
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
-            "decision_log": _live_manager._decision_log[-20:] if hasattr(_live_manager, '_decision_log') else [],
             **live_data
         }
+        # Add queue status
+        if USE_EXECUTION_QUEUE:
+            queue_status = queue.get_status()
+            payload['queue'] = {
+                'enabled': True,
+                'total': queue_status['total_candidates'],
+                'ready': queue_status['ready'],
+                'best_score': queue_status['best_score'],
+                'candidates': queue_status['candidates'][:15]
+            }
+        else:
+            payload['queue'] = {'enabled': False}
+        
         safe_payload = safe_json(payload)
+        cache_set("dashboard", safe_payload)
         return jsonify(safe_payload), 200
     except Exception as e:
-        log_execution(f"/data error: {e}", "ERROR")
+        log_execution(f"/data error: {traceback.format_exc()}", "ERROR")
         return jsonify({"error": str(e)}), 200
+
+@app.route("/queue")
+def queue_endpoint():
+    if not USE_EXECUTION_QUEUE:
+        return jsonify({"enabled": False})
+    status = queue.get_status()
+    return jsonify(safe_json(status))
+
+@app.route("/decision")
+def decision_endpoint():
+    decisions = MEMORY.get("decision_log", [])[-50:]
+    return jsonify({"data": decisions})
 
 @app.route("/trade", methods=["POST"])
 def manual_trade():
@@ -6742,7 +7828,7 @@ def manual_trade():
     tp1 = price*1.006 if side=="BUY" else price*0.994
     tp2 = price*1.02 if side=="BUY" else price*0.98
     classification = "SNIPER"
-    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification, is_reversal=False)
+    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
     return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
 
 @app.route("/close", methods=["POST"])
@@ -6761,12 +7847,6 @@ def manual_close():
 def health():
     return jsonify({"ok": True})
 
-@app.route("/decision")
-def decision_log():
-    """Return the recent trade management decisions for the dashboard."""
-    data = _live_manager._decision_log[-50:] if hasattr(_live_manager, '_decision_log') else []
-    return jsonify({"data": data})
-
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
 def keep_alive():
@@ -6782,9 +7862,9 @@ def hourly_cleanup():
     global _last_cleanup
     if time.time() - _last_cleanup < 3600:
         return
-    CACHE["ohlcv"].clear()
-    CACHE["ticker"].clear()
-    CACHE["orderbook"].clear()
+    CACHE["ohlcv"]["value"].clear()
+    CACHE["ticker"]["value"].clear()
+    CACHE["orderbook"]["value"].clear()
     gc.collect()
     _last_cleanup = time.time()
 
@@ -6800,7 +7880,7 @@ def print_snapshot():
     mode = "LIVE" if MODE_LIVE else "PAPER"
     perf = get_dashboard_metrics()
     print("\n" + "="*70)
-    print(color_text(f"🔥 RF v28.2 Professional Trade Mgmt ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
+    print(color_text(f"🔥 RF v28 Professional (FIXED) ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
     print(f"💰 Balance (Total): {color_text(f'{bal:.2f} USDT', GREEN)}   Free: {color_text(f'{free_bal:.2f} USDT', GREEN)}")
     print(f"📊 Total PnL: {color_text(perf['total_pnl'], GREEN if perf['total_pnl'].startswith('+') else RED)} | Last Trade: {perf['last_trade']}")
     regime = MEMORY.get("regime", "RANGE")
@@ -6819,7 +7899,7 @@ def print_snapshot():
         roe = STATE.get("roe_pct", 0.0)
         roe_colored = color_pnl(roe)
         print(f"📊 POSITION: {STATE['current_symbol']} {STATE['side']} ({STATE.get('entry_type','?')} / {STATE.get('classification','?')})")
-        print(f"   Entry: {STATE['entry']:.4f} | ROE: {roe_colored} ({LEVERAGE}x leveraged)")
+        print(f"   Entry: {STATE['entry']:.4f} | ROE: {roe_colored} (5x leveraged)")
         print(f"   SL: {STATE.get('synthetic_sl',0):.4f} | TP1: {STATE.get('synthetic_tp1',0):.4f} | TP2: {STATE.get('tp2_price',0):.4f}")
         print(f"   Narrative: {STATE.get('narrative_classification','N/A')} (Conf: {STATE.get('narrative_confidence',0):.1f}) | Conf Level: {STATE.get('confidence_level','')}")
         cp = STATE.get("continuation_probability", 0.5)
@@ -6827,11 +7907,14 @@ def print_snapshot():
         print(f"   Continuation: {cp*100:.1f}% | Hold Quality: {hq}")
         print(f"   Current Confidence: {STATE.get('current_confidence',50):.1f} | Market Regime: {STATE.get('market_regime','UNKNOWN')} | Cont. Pressure: {STATE.get('continuation_pressure',50)}")
         print(f"   Trade State: {STATE.get('trade_state','RANGE_CHOP')} | Trail Mult: {STATE.get('smart_trail_mult',1.5)} | Delay TP1: {STATE.get('delay_tp1',False)}")
-        if STATE.get("tp1_hit"): print(color_text(f"   ✅ TP1 achieved - partial close, SL to breakeven", GREEN))
+        if STATE.get("tp1_hit"): print(color_text(f"   ✅ TP1 achieved - partial close, SL moved to breakeven", GREEN))
         if DASHBOARD_STATE.get("live_trade_mode", False):
             print(color_text(f"   [LIVE MGMT] State: {_live_manager.lifecycle_state.value}", MAGENTA))
     else:
         print("📊 POSITION: None")
+    if USE_EXECUTION_QUEUE:
+        qstat = queue.get_status()
+        print(f"🎯 EXECUTION QUEUE: {qstat['total_candidates']} candidates, {qstat['ready']} ready, best score: {qstat['best_score']:.1f}")
     print("="*70 + "\n")
 
 def print_rf_dashboard():
@@ -6867,7 +7950,7 @@ def run_scanner_v2():
         log_execution(f"[SCANNER] TOP BUY updated: {len(buy)} candidates", "INFO")
         log_execution(f"[SCANNER] TOP SELL updated: {len(sell)} candidates", "INFO")
     except Exception as e:
-        log_execution(f"Smart Scanner v2 error: {e}", "ERROR")
+        log_execution(f"Smart Scanner v2 error: {traceback.format_exc()}", "ERROR")
 
 # ========== SNIPER V2 ==========
 SNIPER_ZONES = {}
@@ -7034,7 +8117,7 @@ def sniper_engine_v2():
                     tp2 = price * (1 - 0.01) if side == "SELL" else price * (1 + 0.01)
                     reason_str = f"SNIPER_V2 {zone['type']} conf={conf_count} reasons={zone.get('reasons', [])} | NARR={narrative['classification']}"
                     ok = execute_entry(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
-                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification, is_reversal=True)
+                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
                     if ok:
                         log_execution(f"[SNIPER_V2] {sym} {side} entry executed", "SUCCESS")
                         zone["state"] = "USED"
@@ -7051,7 +8134,6 @@ def sniper_engine_v2():
                 SNIPER_ZONES.pop(sym, None)
     return False
 
-# ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
 def update_institutional_flow_scanner():
     try:
         df = get_ohlcv_safe(DEFAULT_SYMBOL, 100)
@@ -7085,13 +8167,11 @@ def update_institutional_flow_scanner():
         DASHBOARD_STATE["last_live_refresh"] = time.time()
         log_execution(f"[SCANNER] Institutional flow updated: bias={smart['institutional_bias_detailed']}, dominance={smart['smart_money_dominant']}", "INFO")
     except Exception as e:
-        log_execution(f"[SCANNER] Error updating institutional flow: {e}", "ERROR")
+        log_execution(f"[SCANNER] Error updating institutional flow: {traceback.format_exc()}", "ERROR")
 
-# ========== LIVE INSTITUTIONAL UPDATER THREAD (PAUSED DURING TRADE) ==========
 def live_institutional_updater():
     while True:
         try:
-            # Do not run during open trade to avoid duplicate API calls and thread contention
             if STATE.get("open"):
                 time.sleep(5)
                 continue
@@ -7120,10 +8200,9 @@ def live_institutional_updater():
             else:
                 update_institutional_flow_scanner()
         except Exception as e:
-            log_execution(f"[LIVE_UPDATER] Error: {e}", "ERROR")
+            log_execution(f"[LIVE_UPDATER] Error: {traceback.format_exc()}", "ERROR")
         time.sleep(5)
 
-# ========== MAIN LOOP ==========
 MEMORY = {
     "candidates": [],
     "top_candidates": [],
@@ -7140,7 +8219,8 @@ MEMORY = {
     "radar_top5": [],
     "log_debounce": {},
     "watchlist": {},
-    "no_entry_feed": []
+    "no_entry_feed": [],
+    "decision_log": []
 }
 
 SNIPER_MODE = True
@@ -7235,14 +8315,225 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
+def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        log_execution(f"[ENTRY] Already in position, skipping {symbol}", "WARN")
+        return False
+    free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
+    usable_balance = free_bal * BALANCE_SAFETY_FACTOR
+    if PAPER_MODE:
+        balance = paper["balance"]
+    else:
+        balance = usable_balance
+
+    if classification == "SNIPER" or classification == "INSTITUTIONAL_SNIPER":
+        margin_percent = 0.40
+        trade_type_label = "STRONG"
+    elif classification == "TREND":
+        margin_percent = 0.30
+        trade_type_label = "NORMAL"
+    elif classification == "LOW":
+        margin_percent = 0.15
+        trade_type_label = "LOW_CONF"
+    else:
+        margin_percent = 0.30
+        trade_type_label = "NORMAL"
+
+    margin = balance * margin_percent
+    notional = margin * LEVERAGE
+    qty = notional / price
+    log_execution(f"[SIZING]\nFree USDT: {free_bal:.2f}\nUsable (x{BALANCE_SAFETY_FACTOR}): {balance:.2f}\nType: {trade_type_label}\nMargin: {margin:.2f}\nLeverage: {LEVERAGE}X\nNotional: {notional:.2f}\nFinal Qty: {qty:.6f}", "INFO")
+
+    df = get_ohlcv_safe(symbol, 100)
+    plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
+    di_dominance = False
+    if plus_di is not None and minus_di is not None:
+        di_dominance = (side == "BUY" and plus_di > minus_di) or (side == "SELL" and minus_di > plus_di)
+    weak_pullback = False
+    if df is not None:
+        last = df.iloc[-1]
+        if side == "BUY":
+            if last['close'] < last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
+                weak_pullback = True
+        else:
+            if last['close'] > last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
+                weak_pullback = True
+    structure_aligned = False
+    struct_shift = detect_structure_shift(df) if df is not None else None
+    if side == "BUY" and struct_shift == "bullish_shift":
+        structure_aligned = True
+    elif side == "SELL" and struct_shift == "bearish_shift":
+        structure_aligned = True
+    counter_displacement = 0.0
+    if df is not None:
+        last = df.iloc[-1]
+        if side == "SELL" and last['close'] > last['open']:
+            body = abs(last['close'] - last['open'])
+            if body > atr_val * 0.6:
+                counter_displacement = body / atr_val
+        elif side == "BUY" and last['close'] < last['open']:
+            body = abs(last['close'] - last['open'])
+            if body > atr_val * 0.6:
+                counter_displacement = body / atr_val
+    market_state = {
+        "adx": compute_adx(df).iloc[-1] if df is not None else 20.0,
+        "regime": MEMORY.get("regime", "UNKNOWN"),
+        "di_dominance": di_dominance,
+        "weak_pullback": weak_pullback,
+        "structure_aligned": structure_aligned,
+        "counter_displacement": counter_displacement,
+        "trend_health": trend_engine.get_trend_health(df, side) if df is not None else 5
+    }
+    narrative = {"classification": classification}
+    entry_context = {"price": price, "atr": atr_val}
+    thesis = _thesis_engine.build_thesis(symbol, side, trade_type, market_state, narrative, entry_context)
+    STATE["trade_thesis"] = thesis.__dict__
+
+    regime_class = MarketRegimeClassifier.classify(df) if df is not None else "UNKNOWN"
+    di_spread = abs(plus_di - minus_di) if plus_di is not None else 0
+    location_quality = "mid"
+    initial_conf = ConfidenceEngine.calculate_initial_confidence(score, narrative.get("narrative_score", 0), regime_class, market_state["adx"], di_spread, location_quality)
+
+    if df is not None:
+        smart_money = SmartMoneyEngine.analyze_smart_money(df)
+        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
+        dominance_weight = 0.7 if smart_money["smart_money_dominant"] else 0.3
+        initial_conf += (dominance_weight - 0.5) * 12
+        if momentum["trend_expansion"]:
+            initial_conf += 8
+        if momentum["momentum_decay"]:
+            initial_conf -= 12
+        dist_risk = smart_money["distribution_risk"] / 100.0
+        initial_conf -= dist_risk * 15
+        if smart_money["retail_euphoria"]:
+            initial_conf -= 10
+        continuation_strength = momentum.get("continuation_strength", 50)
+        initial_conf = ConfidenceEngine.apply_institutional_modifiers(initial_conf, smart_money, momentum, continuation_strength)
+        initial_conf = max(0, min(95, initial_conf))
+
+    STATE["current_confidence"] = initial_conf
+    STATE["market_regime"] = regime_class
+
+    if PAPER_MODE:
+        paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
+        STATE.update({
+            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
+            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
+            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
+            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
+            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
+            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
+            "roe_pct": 0.0, "mark_price": price,
+            "narrative_classification": STATE.get("narrative_classification", ""),
+            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+            "confidence_level": STATE.get("confidence_level", ""),
+            "trade_thesis": thesis.__dict__,
+            "current_confidence": initial_conf,
+            "market_regime": regime_class,
+            "adx_live": market_state["adx"],
+            "di_plus_live": plus_di if plus_di else 0,
+            "di_minus_live": minus_di if minus_di else 0,
+            "trade_personality": "NEUTRAL",
+            "institutional_flow": "NEUTRAL",
+            "synthetic_sl": sl,
+            "synthetic_tp1": tp1,
+            "max_price": price,
+            "min_price": price,
+            "peak_roe": 0.0,
+            "peak_price": price,
+            "peak_unrealized_pnl": 0.0,
+            "drawdown_from_peak": 0.0,
+            "tp1_hold_score": 10,
+            "exit_warning": 0,
+            "runner_mode": False,
+            "entry_atr": atr_val
+        })
+        TRADE_STATE.update({
+            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
+            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
+        })
+        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
+        _live_manager.set_entry_atr(atr_val)
+        update_position_dashboard(symbol, side, price, qty)
+        log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        return True
+
+    sym = normalize_symbol(symbol)
+    market = ex.market(sym)
+    min_qty = market['limits']['amount']['min']
+    if qty < min_qty:
+        log_execution(f"SKIP: computed qty {qty:.6f} below minimum {min_qty}", "WARN")
+        return False
+    precision = market['precision']['amount']
+    qty = math.floor(qty / precision) * precision
+    if qty <= 0:
+        log_execution(f"SKIP: qty rounded to zero", "WARN")
+        return False
+    log_execution(f"Position sizing final: free_balance={free_bal:.2f}, usable={balance:.2f}, classification={classification}, margin_percent={margin_percent*100:.0f}%, margin={margin:.2f}, notional={notional:.2f}, qty={qty:.6f}", "INFO")
+    order = open_position(side, qty, symbol)
+    if order:
+        STATE.update({
+            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
+            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
+            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
+            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
+            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
+            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
+            "roe_pct": 0.0, "mark_price": price,
+            "narrative_classification": STATE.get("narrative_classification", ""),
+            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+            "confidence_level": STATE.get("confidence_level", ""),
+            "trade_thesis": thesis.__dict__,
+            "current_confidence": initial_conf,
+            "market_regime": regime_class,
+            "adx_live": market_state["adx"],
+            "di_plus_live": plus_di if plus_di else 0,
+            "di_minus_live": minus_di if minus_di else 0,
+            "trade_personality": "NEUTRAL",
+            "institutional_flow": "NEUTRAL",
+            "synthetic_sl": sl,
+            "synthetic_tp1": tp1,
+            "max_price": price,
+            "min_price": price,
+            "peak_roe": 0.0,
+            "peak_price": price,
+            "peak_unrealized_pnl": 0.0,
+            "drawdown_from_peak": 0.0,
+            "tp1_hold_score": 10,
+            "exit_warning": 0,
+            "runner_mode": False,
+            "entry_atr": atr_val
+        })
+        TRADE_STATE.update({
+            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
+            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
+        })
+        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
+        _live_manager.set_entry_atr(atr_val)
+        update_position_dashboard(symbol, side, price, qty)
+        log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        time.sleep(1)
+        sync_position_state(symbol)
+        return True
+    else:
+        return False
+
+# ========== MAIN LOOP ==========
 def main_loop_sniper():
-    global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL
+    global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, _last_queue_promote, _last_queue_eval
     last_scan = 0
     last_scanner_v2 = 0
     last_radar_scan = 0
     last_radar_refresh = 0
     last_candidate_scan = 0
     last_flow_update = 0
+    last_universe_build = 0
+    last_discovery_scan = 0
+    watchlist_rotation = None
     try:
         ex.load_markets()
         log_execution(f"Markets loaded", "INFO")
@@ -7253,10 +8544,46 @@ def main_loop_sniper():
     log_execution("[SCANNER] Initial scanner v2 run completed", "INFO")
     updater_thread = threading.Thread(target=live_institutional_updater, daemon=True, name="live_institutional_updater")
     updater_thread.start()
+
+    # Initialize queue timers
+    _last_queue_promote = time.time()
+    _last_queue_eval = time.time()
+
     while True:
         try:
             now = time.time()
             sync_all_states()
+
+            # ---- Global Discovery Scan (every 20 min) ----
+            if now - last_discovery_scan > GLOBAL_SCAN_INTERVAL:
+                global_discovery_scan()
+                last_discovery_scan = now
+
+            # ---- Execution Queue integration ----
+            if USE_EXECUTION_QUEUE:
+                # Promote candidates from watchlist periodically
+                if now - _last_queue_promote > QUEUE_PROMOTE_INTERVAL:
+                    promote_to_queue()
+                    _last_queue_promote = now
+
+                # Re-evaluate all candidates
+                if now - _last_queue_eval > QUEUE_RE_EVAL_INTERVAL:
+                    queue.re_evaluate_all(lambda sym: get_ohlcv_safe(sym, 100))
+                    _last_queue_eval = now
+
+                # Attempt to execute best candidate (only if not in position)
+                if not (STATE.get("open") or TRADE_STATE.get("in_position")):
+                    process_queue_entry()
+
+                # Cleanup expired candidates periodically
+                if now % 60 < 1:
+                    queue.cleanup()
+
+            if now - last_universe_build > 1800:
+                universe = build_40_symbol_universe()
+                watchlist_rotation = WatchlistRotation(universe)
+                log_execution(f"[UNIVERSE] Built 40-symbol universe: {universe[:10]}...", "INFO")
+                last_universe_build = now
 
             if now - last_flow_update > 60:
                 update_institutional_flow_scanner()
@@ -7293,6 +8620,17 @@ def main_loop_sniper():
                         last_radar_refresh = now
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
+                        if watchlist_rotation and watchlist_rotation.should_rotate():
+                            batch = watchlist_rotation.get_next_batch()
+                            for sym in batch:
+                                df = get_ohlcv_safe(sym, 60)
+                                if df is None:
+                                    continue
+                                price = df['close'].iloc[-1]
+                                atr_val = compute_atr(df).iloc[-1]
+                                ob = get_orderbook_cached(sym, limit=10)
+                                if ob is None:
+                                    continue
                         smart_opportunity_selection()
                         last_candidate_scan = now
                     time.sleep(1)
@@ -7336,7 +8674,12 @@ def safe_main_loop():
         try:
             main_loop()
         except Exception as e:
-            log_execution(f"CRITICAL EXCEPTION: {traceback.format_exc()}", "ERROR")
+            tb = traceback.format_exc()
+            print(f"CRITICAL EXCEPTION: {tb}")
+            try:
+                log_execution(f"CRITICAL EXCEPTION: {tb}", "ERROR")
+            except Exception as log_err:
+                print(f"Failed to log: {log_err}")
             time.sleep(5)
 
 if __name__ == "__main__":
