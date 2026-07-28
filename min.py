@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ====================================================================
-# RF LIQUIDITY ENGINE v28.1 - PROFESSIONAL TRADE MANAGEMENT
-# [PRODUCTION PATCH] Institutional-Grade Trade Management Refactor
+# RF LIQUIDITY ENGINE v28.2 - PROFESSIONAL TRADE MANAGEMENT
+# [PRODUCTION PATCH] Critical Stability & Reversal Enhancement
 # Leverage: 10x | Dynamic Trail | Thesis-Aware | Single Source of Truth
 # ====================================================================
 
@@ -457,7 +457,7 @@ def send_once(msg, key, cooldown=60):
         _tg_send(msg)
 
 def tg_start(balance, mode):
-    send_once(f"🚀 <b>RF v28.1 Professional Trade Mgmt</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nLeverage: 10x\nOptimized: Institutional Trade Mgmt", "startup", 86400)
+    send_once(f"🚀 <b>RF v28.2 Professional Trade Mgmt</b>\nBalance: {balance:.2f} USDT\nMode: {mode}\nLeverage: 10x\nOptimized: Institutional Trade Mgmt", "startup", 86400)
 
 def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
     side_emoji = "🟢" if side == "BUY" else "🔴"
@@ -2213,7 +2213,159 @@ class TradeManagementBoard:
         # If no action needed, hold
         return TradeDecision(TradeDecisionType.HOLD, reason="No action required")
 
+# ========== REVERSAL ENTRY VALIDATION (ENHANCED) ==========
+def validate_reversal_entry(symbol: str, side: str, df: pd.DataFrame, atr: float, price: float, ob: dict) -> Tuple[bool, str, int]:
+    """
+    Enhanced validation for reversal trades.
+    Aggregates multiple institutional signals and returns a score.
+    Returns: (valid, reason, score)
+    """
+    if df is None or len(df) < 20:
+        return False, "insufficient_data", 0
+
+    score = 0
+    reasons = []
+
+    # 1. Liquidity Sweep / Stop Hunt
+    pools = build_liquidity_pools(df)
+    swept_high, swept_low = detect_sweep(df, pools)
+    if (side == "BUY" and swept_low) or (side == "SELL" and swept_high):
+        score += 2
+        reasons.append("liquidity_sweep")
+    else:
+        # if no sweep, still allow but with lower score
+        reasons.append("no_sweep")
+
+    # 2. Market Structure Shift (MSS / CHoCH / BOS)
+    bos_up, bos_down = detect_bos(df, lookback=5)
+    struct_shift = detect_structure_shift(df)
+    if (side == "BUY" and (bos_up or struct_shift == "bullish_shift")) or \
+       (side == "SELL" and (bos_down or struct_shift == "bearish_shift")):
+        score += 2
+        reasons.append("mss_confirmed")
+    else:
+        reasons.append("no_mss")
+
+    # 3. Rejection Candle (Pinbar)
+    rejection = candle_rejection(df, side)
+    if rejection:
+        score += 2
+        reasons.append("rejection_candle")
+    else:
+        # Check for wick/body ratio as extra
+        last = df.iloc[-1]
+        body = abs(last['close'] - last['open'])
+        range_ = last['high'] - last['low']
+        if range_ > 0:
+            if side == "BUY":
+                lower_wick = min(last['open'], last['close']) - last['low']
+                if lower_wick > body * 1.2:
+                    score += 1
+                    reasons.append("strong_lower_wick")
+            else:
+                upper_wick = last['high'] - max(last['open'], last['close'])
+                if upper_wick > body * 1.2:
+                    score += 1
+                    reasons.append("strong_upper_wick")
+
+    # 4. Zone Retest (Support/Resistance)
+    supports, resistances = get_clustered_zones(df, lookback=80, cluster_pct=0.002)
+    zone_hit = False
+    if side == "BUY" and supports:
+        nearest_sup = max([s for s in supports if s <= price], default=None)
+        if nearest_sup and abs(price - nearest_sup) / price < 0.003:
+            zone_hit = True
+            reasons.append("support_retest")
+    elif side == "SELL" and resistances:
+        nearest_res = min([r for r in resistances if r >= price], default=None)
+        if nearest_res and abs(price - nearest_res) / price < 0.003:
+            zone_hit = True
+            reasons.append("resistance_retest")
+    if zone_hit:
+        score += 2
+    else:
+        reasons.append("no_zone_retest")
+
+    # 5. Volume Confirmation
+    vol_state = classify_volume(df)
+    if vol_state in ("expansion", "spike"):
+        score += 1
+        reasons.append("volume_confirmation")
+    else:
+        reasons.append("low_volume")
+
+    # 6. Momentum Shift (MACD flip, RSI turning)
+    rsi = compute_rsi(df).iloc[-1]
+    macd_hist = compute_macd(df)[2]
+    momentum_shift = False
+    if side == "BUY" and rsi < 40 and macd_first_flip(macd_hist):
+        momentum_shift = True
+    elif side == "SELL" and rsi > 60 and macd_first_flip(macd_hist):
+        momentum_shift = True
+    if momentum_shift:
+        score += 1
+        reasons.append("momentum_shift")
+    else:
+        reasons.append("no_momentum_shift")
+
+    # 7. Smart Money / Institutional Bias
+    smart = SmartMoneyEngine.analyze_smart_money(df)
+    if smart["smart_money_dominant"] and smart["institutional_bias"] == side:
+        score += 2
+        reasons.append("smart_money_aligned")
+    else:
+        reasons.append("no_smart_money_alignment")
+
+    # 8. Low Continuation Probability (for reversal)
+    cont_eval = _continuation_engine.evaluate(side, df, {"atr": atr, "adx": 0, "adx_slope": 0, "di_plus": 0, "di_minus": 0, "trend_health": 5, "weak_pullback": False, "counter_displacement": 0, "volume_ratio": 1.0}, {})
+    if cont_eval.continuation_probability < 0.5:
+        score += 1
+        reasons.append("low_continuation_prob")
+    else:
+        reasons.append("high_continuation_prob")
+
+    # 9. Declining ADX (weakening prior trend)
+    adx_series = compute_adx(df)
+    if len(adx_series) >= 3:
+        adx_trend = adx_series.iloc[-1] - adx_series.iloc[-2]
+        if adx_trend < 0:
+            score += 1
+            reasons.append("adx_declining")
+        else:
+            reasons.append("adx_rising")
+
+    # 10. Institutional Flow Alignment
+    mom = MomentumFlowEngine.analyze_momentum_flow(df)
+    if mom["flow_bias"] == side and mom["trend_expansion"] is False:
+        score += 1
+        reasons.append("flow_aligned")
+
+    # 11. Reclaim Risk (penalty if high)
+    if cont_eval.reclaim_risk > 0.5:
+        score -= 1
+        reasons.append("high_reclaim_risk")
+
+    # Minimum threshold
+    required_score = 8
+    valid = score >= required_score
+    reason_str = ", ".join(reasons) if reasons else "no_signals"
+    return valid, reason_str, score
+
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
+def wait_for_position_closure(symbol, timeout=30):
+    """Poll exchange until position quantity becomes 0, or timeout."""
+    sym = normalize_symbol(symbol)
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            pos = fetch_position(symbol)
+            if pos is None or float(pos.get('contracts', 0)) <= 0:
+                return True
+        except:
+            pass
+        time.sleep(1)
+    return False
+
 def safe_close_position(symbol, qty=None):
     """Close position with retries and state update only on success."""
     if PAPER_MODE:
@@ -2237,17 +2389,22 @@ def safe_close_position(symbol, qty=None):
         qty_to_close = float(ex.amount_to_precision(sym, qty_to_close))
         order = safe_api_call(ex.create_order, sym, "market", close_side, qty_to_close, params={"reduceOnly": True})
         if order:
-            # Update state only after success
-            with _TRADE_LOCK:
-                STATE["remaining_qty"] -= qty_to_close
-                if STATE["remaining_qty"] <= 0:
-                    STATE["open"] = False
-                    TRADE_STATE["in_position"] = False
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                else:
-                    TRADE_STATE["qty"] = STATE["remaining_qty"]
-            log_execution(f"Closed {qty_to_close} {symbol} successfully", "SUCCESS")
-            return True
+            # Wait for position to actually close
+            if wait_for_position_closure(symbol, timeout=30):
+                # Update state only after confirmation
+                with _TRADE_LOCK:
+                    STATE["remaining_qty"] -= qty_to_close
+                    if STATE["remaining_qty"] <= 0:
+                        STATE["open"] = False
+                        TRADE_STATE["in_position"] = False
+                        DASHBOARD_STATE["live_trade_mode"] = False
+                    else:
+                        TRADE_STATE["qty"] = STATE["remaining_qty"]
+                log_execution(f"Closed {qty_to_close} {symbol} successfully", "SUCCESS")
+                return True
+            else:
+                log_execution(f"Close order placed but position not closed within timeout for {symbol}", "ERROR")
+                return False
         else:
             log_execution(f"Close order failed for {symbol}", "ERROR")
             return False
@@ -2277,12 +2434,17 @@ def safe_close_partial(symbol, ratio):
         qty_to_close = float(ex.amount_to_precision(sym, qty_to_close))
         order = safe_api_call(ex.create_order, sym, "market", side, qty_to_close, params={"reduceOnly": True})
         if order:
-            with _TRADE_LOCK:
-                STATE["remaining_qty"] -= qty_to_close
-                TRADE_STATE["qty"] = STATE["remaining_qty"]
-                STATE["partial_closed"] = True
-            log_execution(f"Partial close {ratio*100:.0f}% of {symbol} executed", "SUCCESS")
-            return True
+            # Wait for position to close partially
+            if wait_for_position_closure(symbol, timeout=30):
+                with _TRADE_LOCK:
+                    STATE["remaining_qty"] -= qty_to_close
+                    TRADE_STATE["qty"] = STATE["remaining_qty"]
+                    STATE["partial_closed"] = True
+                log_execution(f"Partial close {ratio*100:.0f}% of {symbol} executed", "SUCCESS")
+                return True
+            else:
+                log_execution(f"Partial close order placed but position not closed within timeout for {symbol}", "ERROR")
+                return False
         else:
             log_execution(f"Partial close failed for {symbol}", "ERROR")
             return False
@@ -2310,6 +2472,7 @@ class LiveTradeManager:
         self.brain = InstitutionalTradeBrain()
         self.board = TradeManagementBoard()
         self._last_decision = None
+        self._decision_log = []  # for /decision endpoint
         event_bus.subscribe("reconciled", self._on_reconciled)
         event_bus.subscribe("force_close_local", self._force_close)
         event_bus.subscribe("lifecycle_change", self._set_lifecycle)
@@ -2570,6 +2733,15 @@ class LiveTradeManager:
         # ========== GET DECISION FROM BOARD ==========
         decision = self.board.evaluate(context)
         self._last_decision = decision
+        # Log decision for /decision endpoint
+        self._decision_log.append({
+            "time": time.time(),
+            "action": decision.action.value,
+            "reason": decision.reason,
+            "symbol": symbol
+        })
+        if len(self._decision_log) > 100:
+            self._decision_log = self._decision_log[-100:]
         log_execution(f"[BOARD] Decision: {decision.action.value} - {decision.reason}", "INFO")
 
         # ========== EXECUTE DECISION ==========
@@ -3771,11 +3943,10 @@ def close_position_full():
         return True
     if not STATE["open"]:
         return False
-    order = close_position(STATE["remaining_qty"], STATE["current_symbol"])
-    if order:
-        STATE["open"] = False
-        TRADE_STATE["in_position"] = False
-        DASHBOARD_STATE["live_trade_mode"] = False
+    # Use safe_close_position which waits for confirmation
+    success = safe_close_position(STATE["current_symbol"])
+    if success:
+        # Note: state already updated inside safe_close_position
         log_execution("Position fully closed", "SUCCESS")
         return True
     return False
@@ -3784,7 +3955,24 @@ def close_partial(ratio):
     # This is kept for backward compatibility; use safe_close_partial now
     return safe_close_partial(STATE["current_symbol"], ratio)
 
-def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification, is_reversal=False):
+    # Apply reversal validation if applicable
+    if is_reversal:
+        df = get_ohlcv_safe(symbol, 100)
+        if df is not None:
+            ob = get_orderbook_cached(symbol, 10)
+            valid, reason_str, rev_score = validate_reversal_entry(symbol, side, df, atr_val, price, ob)
+            if not valid:
+                log_execution(f"[REVERSAL_REJECT] {symbol} {side} - {reason_str} (score {rev_score})", "WARN")
+                return False
+            else:
+                log_execution(f"[REVERSAL_ACCEPT] {symbol} {side} - {reason_str} (score {rev_score})", "INFO")
+                # Optionally adjust score/confidence
+                score = max(score, rev_score * 2)  # boost score
+        else:
+            # If no data, fall back to original logic (but still log)
+            log_execution(f"[REVERSAL] No data for validation, skipping enhancement", "WARN")
+
     free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
     usable_balance = free_bal * BALANCE_SAFETY_FACTOR
     if PAPER_MODE:
@@ -4443,7 +4631,7 @@ def smart_opportunity_selection():
         sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr, df)
         reason_str = f"INST_SWEEP+CHOCH+RETEST | nscore={score:.1f}"
         ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
-                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
+                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER", is_reversal=True)
         if ok:
             return True
     return False
@@ -5149,9 +5337,11 @@ def decide_and_execute_v1(symbol, side, total_score, reasons, price, sl, tp1, tp
     should_enter, classification, narrative = evaluate_with_narrative(symbol, side, price, atr_val, df, ob, side)
     if not should_enter:
         return False
+    # Mark as reversal if scenario indicates
+    is_reversal = any(x in reasons for x in ["sweep", "rejection", "retest"])  # heuristic
     reason_str = f"DECISION_V1 score={total_score} reasons={reasons} | NARR={narrative['classification']}"
     return execute_entry(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                         trade_type="DECISION_V1", entry_type="V1", classification=classification)
+                         trade_type="DECISION_V1", entry_type="V1", classification=classification, is_reversal=is_reversal)
 
 def decision_score(df, ob, atr_val, side):
     vol_state = classify_volume(df)
@@ -5196,7 +5386,7 @@ def monitor_watchlist():
                         continue
                     sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
                     ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
+                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification, is_reversal=True)
                     if ok:
                         return True
             decision, dec_side, dec_info = smart_decision(df, ob, sym)
@@ -5209,7 +5399,7 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
                 ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
+                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification, is_reversal=True)
                 if ok:
                     return True
             elif decision == "EXHAUSTION_ENTRY":
@@ -5221,7 +5411,7 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
                 ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
+                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification, is_reversal=True)
                 if ok:
                     return True
         rf_engine = RFEngine(period=20, multiplier=3.5)
@@ -5259,14 +5449,14 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "REVERSAL" if scenario_name=="REVERSAL" else "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
                 ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
                 if ok:
                     return True
             elif total_score >= 5:
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
                 ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
                 if ok:
                     return True
         ob = get_orderbook_cached(sym, limit=10)
@@ -5278,14 +5468,14 @@ def monitor_watchlist():
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_SNIPER ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification, is_reversal=False)  # not reversal by default
                 if ok:
                     return True
             elif early_score_val >= 4:
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_ENTRY ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification, is_reversal=False)
                 if ok:
                     return True
         supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
@@ -5312,7 +5502,7 @@ def monitor_watchlist():
         TRADE_STATE["zone"] = "support" if side=="BUY" else "resistance"
         TRADE_STATE["location"] = location
         TRADE_STATE["reason"] = [scenario, adv_class, location, narrative['classification']]
-        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification, is_reversal=(scenario=="TRAP_REVERSAL"))
         if ok:
             return True
     return False
@@ -5624,7 +5814,7 @@ def radar_entry_scan():
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
                 ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification)
+                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification, is_reversal=True)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -5636,7 +5826,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
             ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification)
+                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification, is_reversal=True)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5647,7 +5837,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
             ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification)
+                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification, is_reversal=True)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5672,7 +5862,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
             ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification)
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5683,7 +5873,7 @@ def radar_entry_scan():
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
             ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification)
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification, is_reversal=(scenario_name in ("REVERSAL", "TRAP")))
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -5696,7 +5886,7 @@ def radar_entry_scan():
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"RADAR_EARLY ({','.join(reasons)}) score={es} | NARR={narrative['classification']}"
                 ok = execute_entry(side, sym, price, sl, tp1, tp2, es, reason_str, atr_val,
-                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification)
+                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification, is_reversal=False)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -5824,7 +6014,7 @@ def render_live_supervisor_panel():
     return """
     <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
       <div class="rf-live-header">
-        <span class="rf-live-title">🧠 RF v28.1 Professional Trade Mgmt</span>
+        <span class="rf-live-title">🧠 RF v28.2 Professional Trade Mgmt</span>
         <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
       </div>
       <div class="rf-live-grid">
@@ -6093,7 +6283,7 @@ def dashboard():
     
     html = f"""
 <!DOCTYPE html>
-<html><head><title>RF v28.1 Professional Trade Mgmt</title>
+<html><head><title>RF v28.2 Professional Trade Mgmt</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
@@ -6114,7 +6304,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </style>
 </head>
 <body>
-<div class="header">🔥 RF v28.1 Professional Trade Mgmt (10x)</div>
+<div class="header">🔥 RF v28.2 Professional Trade Mgmt (10x)</div>
 {decision_panel_html}
 {scanner_v2_section}
 {supervisor_panel_html}
@@ -6519,6 +6709,7 @@ def data():
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
+            "decision_log": _live_manager._decision_log[-20:] if hasattr(_live_manager, '_decision_log') else [],
             **live_data
         }
         safe_payload = safe_json(payload)
@@ -6551,7 +6742,7 @@ def manual_trade():
     tp1 = price*1.006 if side=="BUY" else price*0.994
     tp2 = price*1.02 if side=="BUY" else price*0.98
     classification = "SNIPER"
-    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
+    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification, is_reversal=False)
     return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
 
 @app.route("/close", methods=["POST"])
@@ -6569,6 +6760,12 @@ def manual_close():
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
+
+@app.route("/decision")
+def decision_log():
+    """Return the recent trade management decisions for the dashboard."""
+    data = _live_manager._decision_log[-50:] if hasattr(_live_manager, '_decision_log') else []
+    return jsonify({"data": data})
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
@@ -6603,7 +6800,7 @@ def print_snapshot():
     mode = "LIVE" if MODE_LIVE else "PAPER"
     perf = get_dashboard_metrics()
     print("\n" + "="*70)
-    print(color_text(f"🔥 RF v28.1 Professional Trade Mgmt ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
+    print(color_text(f"🔥 RF v28.2 Professional Trade Mgmt ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
     print(f"💰 Balance (Total): {color_text(f'{bal:.2f} USDT', GREEN)}   Free: {color_text(f'{free_bal:.2f} USDT', GREEN)}")
     print(f"📊 Total PnL: {color_text(perf['total_pnl'], GREEN if perf['total_pnl'].startswith('+') else RED)} | Last Trade: {perf['last_trade']}")
     regime = MEMORY.get("regime", "RANGE")
@@ -6837,7 +7034,7 @@ def sniper_engine_v2():
                     tp2 = price * (1 - 0.01) if side == "SELL" else price * (1 + 0.01)
                     reason_str = f"SNIPER_V2 {zone['type']} conf={conf_count} reasons={zone.get('reasons', [])} | NARR={narrative['classification']}"
                     ok = execute_entry(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
-                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
+                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification, is_reversal=True)
                     if ok:
                         log_execution(f"[SNIPER_V2] {sym} {side} entry executed", "SUCCESS")
                         zone["state"] = "USED"
