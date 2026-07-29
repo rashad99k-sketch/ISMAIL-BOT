@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 # ====================================================================
-# RF LIQUIDITY ENGINE v28 - CRITICAL FORENSIC FIX PACK + EXECUTION QUEUE v2
+# RF LIQUIDITY ENGINE v28 – INSTITUTIONAL INTENT EDITION
 # [PRODUCTION READY] Institutional Discovery + Dynamic Execution Queue
 # ====================================================================
-# FIXES APPLIED (2026-06-09) + Queue Integration (2026-07-25)
-# 1. LIVE_SUPERVISOR as single source of truth - centralized state management
-# 2. Fixed close_partial() to verify order filled before updating STATE
-# 3. Fixed close_position_full() to verify order filled before finalizing
-# 4. Fixed synthetic_sl to use fixed entry ATR (does not expand with volatility)
-# 5. Fixed trailing activation: once true, never overridden to false by PPE
-# 6. Fixed ROE consistency across Dashboard, Live Manager, PPE, Exchange
-# 7. Fixed total PnL statistics in PAPER mode (call finalize_trade_with_reality)
-# 8. Added forensic logs for trade management and order verification
-# 9. Preserved all existing strategy, RF, Scanner, Dashboard UI, Telegram
-# === EXECUTION QUEUE INTEGRATION v2 (2026-07-25) ===
-# Added Global Discovery Scanner (every 20 min) that scans entire market.
-# Enhanced ExecutionQueue with Trigger State detection (Sweep, BOS, CHoCH, MSS, SFP).
-# Dynamic ranking, demotion, and promotion between Watchlist and Queue.
-# Dashboard queue panel redesigned with all institutional metrics.
-# All existing workflows unchanged if queue disabled.
+# ENHANCEMENTS (2026-07-29):
+# - Institutional Intent Engine (9-layer gatekeeper)
+# - Dynamic Trade Management (adaptive SL, multi-stage TP, runner)
+# - Watchlist Priority Manager
+# - Execution Queue Dynamic Priority
+# - Dashboard extensions (Intent, Lifecycle, Probability)
 # ====================================================================
 
 import os
@@ -223,6 +213,408 @@ class MomentumFlowEngine:
             "greed_state": False,
             "flow_bias": "NEUTRAL"
         }
+
+
+# ============================================================
+# NEW: INSTITUTIONAL INTENT ENGINE (9 LAYERS)
+# ============================================================
+class InstitutionalIntentEngine:
+    """
+    9‑layer pre‑filter to detect early institutional accumulation/distribution.
+    Returns: score (0-100), status ('ACCUMULATION'/'DISTRIBUTION'/'NEUTRAL'), details dict.
+    """
+    @staticmethod
+    def detect(df, ob=None, symbol=None):
+        if df is None or len(df) < 30:
+            return 0, "NEUTRAL", {}
+
+        details = {}
+        score = 0
+
+        # ----- Layer 1: Liquidity Heatmap -----
+        price = df['close'].iloc[-1]
+        pools = build_liquidity_pools(df)
+        eq_high, eq_low = detect_equal_highs_lows(df, lookback=30)
+        liq_score = 0
+        if pools.get("high_pools") or pools.get("low_pools"):
+            liq_score += 25
+        if eq_high or eq_low:
+            liq_score += 15
+        recent_high = df['high'].iloc[-10:].max()
+        recent_low = df['low'].iloc[-10:].min()
+        if abs(price - recent_high) / price < 0.002:
+            liq_score += 10
+        if abs(price - recent_low) / price < 0.002:
+            liq_score += 10
+        liq_score = min(100, liq_score)
+        details['liquidity_score'] = liq_score
+        score += liq_score * 0.12
+
+        # ----- Layer 2: Advanced Absorption (multi‑candle) -----
+        absorption_score, is_abs = InstitutionalIntentEngine._detect_absorption_sequence(df)
+        details['absorption_score'] = absorption_score
+        details['absorption'] = is_abs
+        score += absorption_score * 0.15
+
+        # ----- Layer 3: Volatility Compression -----
+        atr = compute_atr(df)
+        atr_current = atr.iloc[-1]
+        atr_ma = atr.rolling(20).mean().iloc[-1] if len(atr) >= 20 else atr_current
+        atr_ratio = atr_current / atr_ma if atr_ma > 0 else 1.0
+        bb_std = df['close'].rolling(20).std().iloc[-1]
+        bb_mid = df['close'].rolling(20).mean().iloc[-1]
+        bb_width = (2 * bb_std) / bb_mid if bb_mid > 0 else 0.01
+        compression = (atr_ratio < 0.8) and (bb_width < 0.05)
+        vol_score = 85 if compression else (65 if atr_ratio < 0.9 else 40)
+        details['volatility_score'] = vol_score
+        details['atr_ratio'] = round(atr_ratio, 2)
+        details['bb_width'] = round(bb_width * 100, 2)
+        score += vol_score * 0.10
+
+        # ----- Layer 4: Institutional Flow (Smart Money) -----
+        smart = SmartMoneyEngine.analyze_smart_money(df)
+        banker = smart.get("banker_pressure", 50)
+        retail = smart.get("retailer_pressure", 50)
+        acc = smart.get("accumulation_strength", 0)
+        dist = smart.get("distribution_risk", 0)
+        pressure_diff = banker - retail
+        if pressure_diff > 15:
+            flow_score = 80
+            status_candidate = "ACCUMULATION"
+        elif pressure_diff < -15:
+            flow_score = 80
+            status_candidate = "DISTRIBUTION"
+        else:
+            flow_score = 50 + pressure_diff * 1.5
+            status_candidate = "NEUTRAL"
+        if acc > 60:
+            flow_score = min(100, flow_score + 15)
+        if dist > 50:
+            flow_score = max(0, flow_score - 20)
+        details['flow_score'] = flow_score
+        details['banker_pressure'] = round(banker, 1)
+        details['retail_pressure'] = round(retail, 1)
+        score += flow_score * 0.15
+
+        # ----- Layer 5: Fractal Structure Shift -----
+        struct_type, struct_score = InstitutionalIntentEngine._detect_fractal_structure(df)
+        details['structure_type'] = struct_type
+        details['structure_score'] = struct_score
+        score += struct_score * 0.12
+
+        # ----- Layer 6: Momentum Ignition -----
+        adx_series = compute_adx(df)
+        adx_current = adx_series.iloc[-1] if len(adx_series) > 0 else 20
+        adx_prev = adx_series.iloc[-2] if len(adx_series) > 1 else adx_current
+        adx_slope = adx_current - adx_prev
+        mom = MomentumFlowEngine.analyze_momentum_flow(df)
+        mom_health = mom.get("momentum_health", 50)
+        expansion = mom.get("trend_expansion", False)
+        if adx_slope > 0 and expansion and mom_health > 55:
+            mom_score = 85
+        elif adx_slope > 0 and mom_health > 50:
+            mom_score = 70
+        elif mom_health > 60:
+            mom_score = 60
+        else:
+            mom_score = 40
+        details['momentum_score'] = mom_score
+        details['adx_slope'] = round(adx_slope, 2)
+        score += mom_score * 0.15
+
+        # ----- Layer 7: Volume Context -----
+        vol = df['volume']
+        vol_ma = vol.rolling(20).mean().iloc[-1]
+        vol_ratio = vol.iloc[-1] / vol_ma if vol_ma > 0 else 1.0
+        vol_accel = vol.iloc[-5:].mean() / (vol.iloc[-10:-5].mean() + 1e-9)
+        vol_score = 0
+        if vol_ratio > 1.5 and vol_accel > 1.2:
+            vol_score = 85
+        elif vol_ratio > 1.2:
+            vol_score = 65
+        elif vol_ratio < 0.7:
+            vol_score = 20
+        else:
+            vol_score = 50
+        details['volume_score'] = vol_score
+        details['vol_ratio'] = round(vol_ratio, 2)
+        details['vol_accel'] = round(vol_accel, 2)
+        score += vol_score * 0.08
+
+        # ----- Layer 8: Institutional Narrative (the "Why") -----
+        narrative, narrative_score = InstitutionalIntentEngine._institutional_narrative(df, smart, pools, struct_type, price)
+        details['narrative'] = narrative
+        details['narrative_score'] = narrative_score
+        score += narrative_score * 0.13
+
+        # ----- Layer 9: Dynamic Probability Engine (regime‑adaptive weights) -----
+        regime = MEMORY.get("regime", "RANGE")
+        weights = InstitutionalIntentEngine._get_regime_weights(regime)
+        final_score = (
+            liq_score * weights['liquidity'] +
+            absorption_score * weights['absorption'] +
+            vol_score * weights['volatility'] +
+            flow_score * weights['institutional_flow'] +
+            struct_score * weights['structure'] +
+            mom_score * weights['momentum'] +
+            vol_score * weights['volume'] +
+            narrative_score * weights['narrative']
+        ) / 100
+        final_score = max(0, min(100, final_score))
+
+        # Determine overall status
+        if final_score >= 70:
+            if pressure_diff > 10 or (acc > 50 and dist < 30):
+                status = "ACCUMULATION"
+            elif pressure_diff < -10 or (dist > 50 and acc < 30):
+                status = "DISTRIBUTION"
+            else:
+                status = "NEUTRAL"
+        else:
+            status = "NEUTRAL"
+
+        details['regime_weights'] = weights
+        details['regime'] = regime
+        return round(final_score, 2), status, details
+
+    @staticmethod
+    def _detect_absorption_sequence(df, window=4):
+        if len(df) < window:
+            return 0, False
+        last_n = df.iloc[-window:]
+        vol_avg = last_n['volume'].mean()
+        overall_avg = df['volume'].iloc[-20:].mean()
+        vol_ratio = vol_avg / overall_avg if overall_avg > 0 else 1.0
+        body_range_ratios = []
+        for i in range(window):
+            candle = last_n.iloc[i]
+            body = abs(candle['close'] - candle['open'])
+            range_ = candle['high'] - candle['low']
+            body_range_ratios.append(body / range_ if range_ > 0 else 1.0)
+        avg_br_ratio = sum(body_range_ratios) / window
+        is_absorption = vol_ratio > 1.2 and avg_br_ratio < 0.35
+        wick_score = 0
+        for i in range(window):
+            candle = last_n.iloc[i]
+            upper_wick = candle['high'] - max(candle['open'], candle['close'])
+            lower_wick = min(candle['open'], candle['close']) - candle['low']
+            if upper_wick > (candle['high'] - candle['low']) * 0.4:
+                wick_score += 1
+            if lower_wick > (candle['high'] - candle['low']) * 0.4:
+                wick_score += 1
+        wick_absorption = wick_score >= window * 0.75
+        if is_absorption and wick_absorption:
+            return 80, True
+        elif is_absorption:
+            return 60, True
+        else:
+            return max(0, 50 - (vol_ratio - 1) * 30), False
+
+    @staticmethod
+    def _detect_fractal_structure(df):
+        if len(df) < 30:
+            return "NONE", 0
+        internal_high = df['high'].iloc[-6:-1].max()
+        internal_low = df['low'].iloc[-6:-1].min()
+        curr_close = df['close'].iloc[-1]
+        internal_break_up = curr_close > internal_high
+        internal_break_down = curr_close < internal_low
+        external_high = df['high'].iloc[-21:-1].max()
+        external_low = df['low'].iloc[-21:-1].min()
+        external_break_up = curr_close > external_high
+        external_break_down = curr_close < external_low
+        if external_break_up or external_break_down:
+            return "EXTERNAL", 90
+        elif internal_break_up or internal_break_down:
+            return "INTERNAL", 60
+        else:
+            return "NONE", 30
+
+    @staticmethod
+    def _institutional_narrative(df, smart, pools, struct_type, price):
+        narrative = []
+        confidence = 0
+        side = "BUY" if smart.get("institutional_bias") == "BUY" else "SELL"
+        if side == "BUY" and pools.get("low_pools") and price < pools["low_pools"][0]:
+            narrative.append("Sweep of major low")
+            confidence += 20
+        if side == "SELL" and pools.get("high_pools") and price > pools["high_pools"][0]:
+            narrative.append("Sweep of major high")
+            confidence += 20
+        if smart.get("accumulation_strength", 0) > 60:
+            narrative.append("Accumulation strength")
+            confidence += 15
+        if struct_type in ("INTERNAL", "EXTERNAL"):
+            narrative.append(f"{struct_type} structure break")
+            confidence += 15
+        supports, resistances = get_clustered_zones(df, lookback=60)
+        if side == "BUY" and resistances:
+            next_res = min([r for r in resistances if r > price], default=price*2)
+            if (next_res - price) / price > 0.03:
+                narrative.append("Room to run")
+                confidence += 10
+        if side == "SELL" and supports:
+            next_sup = max([s for s in supports if s < price], default=price*0.5)
+            if (price - next_sup) / price > 0.03:
+                narrative.append("Room to run")
+                confidence += 10
+        return " | ".join(narrative) if narrative else "NEUTRAL", min(100, confidence)
+
+    @staticmethod
+    def _get_regime_weights(regime):
+        if regime == "RANGE":
+            return {
+                'liquidity': 20, 'absorption': 18, 'volatility': 10,
+                'institutional_flow': 15, 'structure': 12, 'momentum': 5,
+                'volume': 8, 'narrative': 12
+            }
+        elif regime == "TREND":
+            return {
+                'liquidity': 12, 'absorption': 12, 'volatility': 10,
+                'institutional_flow': 18, 'structure': 15, 'momentum': 18,
+                'volume': 8, 'narrative': 7
+            }
+        elif regime == "NEWS":
+            return {
+                'liquidity': 10, 'absorption': 15, 'volatility': 5,
+                'institutional_flow': 20, 'structure': 10, 'momentum': 10,
+                'volume': 20, 'narrative': 10
+            }
+        else:
+            return {k: 12.5 for k in ['liquidity','absorption','volatility','institutional_flow','structure','momentum','volume','narrative']}
+
+
+# ============================================================
+# NEW: DYNAMIC TRADE MANAGER
+# ============================================================
+class DynamicTradeManager:
+    """
+    Manages an active trade with adaptive SL, multi-stage TP, runner mode,
+    and institutional-based exit decisions.
+    """
+    def __init__(self, symbol, side, entry, qty, atr, initial_sl, tp1, tp2):
+        self.symbol = symbol
+        self.side = side
+        self.entry = entry
+        self.qty = qty
+        self.atr = atr
+        self.sl = initial_sl
+        self.tp1 = tp1
+        self.tp2 = tp2
+        self.tp1_hit = False
+        self.tp2_hit = False
+        self.trailing_activated = False
+        self.trailing_stop = 0.0
+        self.runner_active = False
+        self.peak_price = entry
+        self.peak_roe = 0.0
+        self.drawdown = 0.0
+        self.lifecycle = "LIVE"
+        self.last_update = time.time()
+        self.smart_exit_triggered = False
+        self.partial_closed = False
+
+    def update(self, current_price, df, ob, atr):
+        self.last_update = time.time()
+        roe = self.calculate_roe(current_price)
+        self.peak_price = max(self.peak_price, current_price) if self.side == "BUY" else min(self.peak_price, current_price)
+        self.peak_roe = max(self.peak_roe, roe)
+        self.drawdown = max(0, (self.peak_roe - roe) if self.peak_roe > 0 else 0)
+
+        # ---- 1. Dynamic Stop Loss ----
+        if roe > 0.4 and not self.trailing_activated:
+            self.trailing_activated = True
+            self.trailing_stop = current_price - atr * 0.8 if self.side == "BUY" else current_price + atr * 0.8
+            log_execution(f"[DYN_SL] Trailing activated for {self.symbol} at ROE={roe:.2f}%", "INFO")
+
+        if self.trailing_activated:
+            if self.side == "BUY":
+                new_stop = current_price - atr * 1.2
+                if new_stop > self.trailing_stop:
+                    self.trailing_stop = new_stop
+            else:
+                new_stop = current_price + atr * 1.2
+                if new_stop < self.trailing_stop:
+                    self.trailing_stop = new_stop
+            if (self.side == "BUY" and current_price <= self.trailing_stop) or \
+               (self.side == "SELL" and current_price >= self.trailing_stop):
+                self.lifecycle = "SL_HIT"
+                log_execution(f"[DYN_SL] Stop hit at {current_price:.4f}", "WARN")
+                return "EXIT"
+
+        # ---- 2. Multi-Stage Take Profit ----
+        if not self.tp1_hit:
+            if (self.side == "BUY" and current_price >= self.tp1) or (self.side == "SELL" and current_price <= self.tp1):
+                self.tp1_hit = True
+                log_execution(f"[TP1] Hit for {self.symbol} at {current_price:.4f}", "SUCCESS")
+                return "PARTIAL"
+        if self.tp1_hit and not self.tp2_hit:
+            if (self.side == "BUY" and current_price >= self.tp2) or (self.side == "SELL" and current_price <= self.tp2):
+                self.tp2_hit = True
+                self.runner_active = True
+                log_execution(f"[TP2] Hit for {self.symbol} at {current_price:.4f}", "SUCCESS")
+                return "TP2"
+
+        # ---- 3. Runner Management ----
+        if self.tp1_hit and self.runner_active:
+            if self.drawdown > 3.0:
+                log_execution(f"[RUNNER] Drawdown {self.drawdown:.1f}% – tightening", "WARN")
+                if self.side == "BUY":
+                    self.trailing_stop = max(self.trailing_stop, current_price - atr * 0.6)
+                else:
+                    self.trailing_stop = min(self.trailing_stop, current_price + atr * 0.6)
+
+        # ---- 4. Institutional Exit Signals ----
+        if self.tp1_hit:
+            smart = SmartMoneyEngine.analyze_smart_money(df)
+            mom = MomentumFlowEngine.analyze_momentum_flow(df)
+            if smart.get("distribution_risk", 0) > 60 and mom.get("momentum_decay", False):
+                self.lifecycle = "INSTITUTIONAL_EXIT"
+                log_execution(f"[INST_EXIT] Distribution risk {smart['distribution_risk']:.1f}, momentum decay", "WARN")
+                return "EXIT"
+
+        # ---- 5. Structure Loss Check ----
+        struct_type, _ = InstitutionalIntentEngine._detect_fractal_structure(df)
+        if struct_type == "EXTERNAL" and self.side == "BUY" and df['close'].iloc[-1] < df['close'].iloc[-3]:
+            return "EXIT"
+        if struct_type == "EXTERNAL" and self.side == "SELL" and df['close'].iloc[-1] > df['close'].iloc[-3]:
+            return "EXIT"
+
+        return "HOLD"
+
+    def calculate_roe(self, price):
+        if self.side == "BUY":
+            return ((price - self.entry) / self.entry) * 100
+        else:
+            return ((self.entry - price) / self.entry) * 100
+
+
+# ============================================================
+# NEW: WATCHLIST PRIORITY MANAGER
+# ============================================================
+class WatchlistPriorityManager:
+    @staticmethod
+    def update_priorities():
+        """
+        Scans watchlist and assigns higher priority to symbols approaching
+        institutional conditions. Prevents premature removal.
+        """
+        now = time.time()
+        watchlist = MEMORY.get("watchlist", {})
+        for sym, entry in list(watchlist.items()):
+            if now - entry.get("last_update", 0) > 3600:
+                continue
+            df = get_ohlcv_safe(sym, 100)
+            if df is None:
+                continue
+            intent_score, status, details = InstitutionalIntentEngine.detect(df, None, sym)
+            if intent_score > 60:
+                entry["priority"] = intent_score
+                entry["intent_status"] = status
+                entry["priority_until"] = now + 7200
+                log_execution(f"[PRIORITY] {sym} priority boosted to {intent_score:.1f}", "INFO")
+        sorted_watch = sorted(watchlist.items(), key=lambda x: x[1].get("priority", 0), reverse=True)
+        MEMORY["watchlist"] = dict(sorted_watch)
 
 
 # ========== TRADE STATE MACHINE (UNCHANGED) ==========
@@ -2518,7 +2910,6 @@ class LiveTradeManager:
         now = time.time()
         if now - self.last_log_ts < 5:
             return
-        self.last_log_ts = now
         if not STATE.get("open"):
             return
         roe = STATE.get("roe_pct", 0.0)
@@ -5166,6 +5557,15 @@ def narrative_debug():
 
 # ========== SMART INSTITUTIONAL ENTRY ENGINE ==========
 def check_institutional_entry(symbol, side, df, ob, atr, price):
+    # --- NEW: Institutional Intent Gatekeeper ---
+    intent_score, intent_status, intent_details = InstitutionalIntentEngine.detect(df, ob, symbol)
+    if intent_score < 75:
+        log_execution(f"[INTENT] {symbol} {side} intent score {intent_score} < 75 – abort.", "WARN")
+        return False, None, f"Intent score {intent_score}"
+    MEMORY[f"intent_{symbol}"] = intent_details
+    log_execution(f"[INTENT] {symbol} {side} score={intent_score} status={intent_status}", "SUCCESS")
+
+    # --- Original pipeline continues ---
     reasons = []
     pools = build_liquidity_pools(df)
     swept_high, swept_low = detect_sweep(df, pools)
@@ -6894,6 +7294,8 @@ def promote_to_queue():
         side = data.get('side', 'BUY')
         sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
 
+        # --- NEW: Use IntentScore for candidate priority ---
+        intent_score, _, _ = InstitutionalIntentEngine.detect(df, ob, sym)
         metrics = ZoneMetrics()
         candidate = ExecutionCandidate(
             symbol=sym,
@@ -6911,8 +7313,9 @@ def promote_to_queue():
             original_reason=data.get('reason', 'Watchlist promotion'),
             signal_type=data.get('source', 'watchlist')
         )
+        candidate.priority_score = intent_score  # Set priority to intent score
         queue.add_candidate(candidate)
-        log_execution(f"[QUEUE] Promoted {sym} {side} from watchlist", "INFO", debounce_key=f"promote_{sym}", debounce_sec=60)
+        log_execution(f"[QUEUE] Promoted {sym} {side} from watchlist (Intent: {intent_score:.1f})", "INFO", debounce_key=f"promote_{sym}", debounce_sec=60)
 
 def process_queue_entry():
     """Select best candidate and attempt entry via existing execute_entry."""
@@ -7210,6 +7613,41 @@ def dashboard():
     </div>
     """
     
+    # ===== NEW PANELS: INTENT ENGINE & DYNAMIC TRADE =====
+    intent_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">🔮 Institutional Intent Engine (9 Layers)</div>
+      <div class="grid" style="grid-template-columns: repeat(4,1fr);">
+        <div class="card">Score<div id="intent-score" class="green">-</div></div>
+        <div class="card">Status<div id="intent-status">-</div></div>
+        <div class="card">Liquidity<div id="intent-liq">-</div></div>
+        <div class="card">Absorption<div id="intent-abs">-</div></div>
+        <div class="card">Volatility<div id="intent-vol">-</div></div>
+        <div class="card">Flow<div id="intent-flow">-</div></div>
+        <div class="card">Structure<div id="intent-struct">-</div></div>
+        <div class="card">Momentum<div id="intent-mom">-</div></div>
+        <div class="card">Volume<div id="intent-vol-ctx">-</div></div>
+        <div class="card">Narrative<div id="intent-narr">-</div></div>
+        <div class="card">Regime Weights<div id="intent-weights">-</div></div>
+      </div>
+    </div>
+    """
+    
+    dynamic_trade_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">⚡ Dynamic Trade Management</div>
+      <div class="grid" style="grid-template-columns: repeat(4,1fr);">
+        <div class="card">Current ROE<div id="dyn-roe">-</div></div>
+        <div class="card">Trailing Active<div id="dyn-trail">❌</div></div>
+        <div class="card">TP1 Hit<div id="dyn-tp1">❌</div></div>
+        <div class="card">TP2 Hit<div id="dyn-tp2">❌</div></div>
+        <div class="card">Runner Active<div id="dyn-runner">❌</div></div>
+        <div class="card">Drawdown<div id="dyn-dd">0.0%</div></div>
+        <div class="card">Lifecycle<div id="dyn-lifecycle">-</div></div>
+      </div>
+    </div>
+    """
+    
     flow_section_html = """
     <div class="section smart-layer">
       <div class="title">🧠 Institutional Flow Intelligence</div>
@@ -7316,6 +7754,8 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 {scanner_v2_section}
 {queue_panel_html}
 {supervisor_panel_html}
+{intent_panel_html}
+{dynamic_trade_panel_html}
 {flow_section_html}
 {continuation_panel_html}
 {thesis_panel_html}
@@ -7589,6 +8029,38 @@ function updateUI(d) {{
     }} else {{
         document.getElementById("queue-panel").style.display = "none";
     }}
+    // === NEW: Intent Engine Panel ===
+    if (d.intent_engine) {{
+        const ie = d.intent_engine;
+        document.getElementById("intent-score").innerText = ie.score || 0;
+        document.getElementById("intent-status").innerText = ie.status || "NEUTRAL";
+        if (ie.details) {{
+            document.getElementById("intent-liq").innerText = ie.details.liquidity_score || "-";
+            document.getElementById("intent-abs").innerText = ie.details.absorption_score || "-";
+            document.getElementById("intent-vol").innerText = ie.details.volatility_score || "-";
+            document.getElementById("intent-flow").innerText = ie.details.flow_score || "-";
+            document.getElementById("intent-struct").innerText = ie.details.structure_score || "-";
+            document.getElementById("intent-mom").innerText = ie.details.momentum_score || "-";
+            document.getElementById("intent-vol-ctx").innerText = ie.details.volume_score || "-";
+            document.getElementById("intent-narr").innerText = ie.details.narrative || "-";
+            if (ie.details.regime_weights) {{
+                let w = ie.details.regime_weights;
+                let wStr = `Liq:${w.liquidity} Abs:${w.absorption} Vol:${w.volatility} Fl:${w.institutional_flow} Struct:${w.structure} Mom:${w.momentum} VolCtx:${w.volume} Narr:${w.narrative}`;
+                document.getElementById("intent-weights").innerText = wStr;
+            }}
+        }}
+    }}
+    // === NEW: Dynamic Trade Management ===
+    if (d.dynamic_trade) {{
+        const dt = d.dynamic_trade;
+        document.getElementById("dyn-roe").innerHTML = dt.roe?.toFixed(2) + "%" || "-";
+        document.getElementById("dyn-trail").innerHTML = dt.trailing_active ? "✅" : "❌";
+        document.getElementById("dyn-tp1").innerHTML = dt.tp1_hit ? "✅" : "❌";
+        document.getElementById("dyn-tp2").innerHTML = dt.tp2_hit ? "✅" : "❌";
+        document.getElementById("dyn-runner").innerHTML = dt.runner_active ? "✅" : "❌";
+        document.getElementById("dyn-dd").innerHTML = dt.drawdown?.toFixed(1) + "%" || "0.0%";
+        document.getElementById("dyn-lifecycle").innerText = dt.lifecycle || "-";
+    }}
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
 async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
@@ -7734,6 +8206,32 @@ def data():
                 "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
             }
 
+        # --- NEW: Intent Engine data ---
+        intent_data = {}
+        current_symbol = STATE.get("current_symbol")
+        if current_symbol:
+            intent_data = MEMORY.get(f"intent_{current_symbol}", {})
+        else:
+            # show first available intent
+            for key, val in MEMORY.items():
+                if key.startswith("intent_"):
+                    intent_data = val
+                    break
+
+        # --- NEW: Dynamic Trade data ---
+        dynamic_trade_data = {}
+        if STATE.get("open") and "dynamic_manager" in STATE:
+            mgr = STATE["dynamic_manager"]
+            dynamic_trade_data = {
+                "roe": mgr.calculate_roe(STATE.get("mark_price", STATE["entry"])),
+                "trailing_active": mgr.trailing_activated,
+                "tp1_hit": mgr.tp1_hit,
+                "tp2_hit": mgr.tp2_hit,
+                "runner_active": mgr.runner_active,
+                "drawdown": mgr.drawdown,
+                "lifecycle": mgr.lifecycle
+            }
+
         payload = {
             "balance": bal,
             "free_balance": free_bal,
@@ -7770,6 +8268,8 @@ def data():
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
+            "intent_engine": intent_data,
+            "dynamic_trade": dynamic_trade_data,
             **live_data
         }
         # Add queue status
@@ -8411,6 +8911,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         initial_conf = ConfidenceEngine.apply_institutional_modifiers(initial_conf, smart_money, momentum, continuation_strength)
         initial_conf = max(0, min(95, initial_conf))
 
+    # --- NEW: add intent score to confidence ---
+    intent_info = MEMORY.get(f"intent_{symbol}", {})
+    intent_score = intent_info.get("score", 0)
+    if intent_score >= 85:
+        initial_conf += 15
+    elif intent_score >= 75:
+        initial_conf += 10
+    initial_conf = min(100, initial_conf)
+
     STATE["current_confidence"] = initial_conf
     STATE["market_regime"] = regime_class
 
@@ -8455,6 +8964,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         _live_manager.set_entry_atr(atr_val)
+        # Create dynamic manager for paper mode
+        STATE["dynamic_manager"] = DynamicTradeManager(
+            symbol, side, price, qty, atr_val, sl, tp1, tp2
+        )
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
@@ -8513,6 +9026,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         _live_manager.set_entry_atr(atr_val)
+        # Create dynamic manager
+        STATE["dynamic_manager"] = DynamicTradeManager(
+            symbol, side, price, qty, atr_val, sl, tp1, tp2
+        )
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
@@ -8533,6 +9050,7 @@ def main_loop_sniper():
     last_flow_update = 0
     last_universe_build = 0
     last_discovery_scan = 0
+    last_priority_update = 0
     watchlist_rotation = None
     try:
         ex.load_markets()
@@ -8558,6 +9076,11 @@ def main_loop_sniper():
             if now - last_discovery_scan > GLOBAL_SCAN_INTERVAL:
                 global_discovery_scan()
                 last_discovery_scan = now
+
+            # ---- Watchlist Priority Update (every 5 min) ----
+            if now - last_priority_update > 300:
+                WatchlistPriorityManager.update_priorities()
+                last_priority_update = now
 
             # ---- Execution Queue integration ----
             if USE_EXECUTION_QUEUE:
