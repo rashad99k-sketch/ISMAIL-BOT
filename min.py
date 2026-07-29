@@ -10,14 +10,6 @@
 # - Execution Queue Dynamic Priority
 # - Dashboard extensions (Intent, Lifecycle, Probability)
 # ====================================================================
-# ====================================================================
-# REBUILD (2026-07-29):
-# - Unified Trade Management Brain (UTMB)
-# - Centralized decision making for exit, partial close, trailing, SL
-# - All executions verified against exchange
-# - Professional Telegram reporting on trade close
-# - PPE and other engines become recommendation-only
-# ====================================================================
 
 import os
 import time
@@ -493,12 +485,12 @@ class InstitutionalIntentEngine:
 
 
 # ============================================================
-# NEW: DYNAMIC TRADE MANAGER (Now a recommendation engine)
+# NEW: DYNAMIC TRADE MANAGER
 # ============================================================
 class DynamicTradeManager:
     """
     Manages an active trade with adaptive SL, multi-stage TP, runner mode,
-    and institutional-based exit decisions. (Recommendation-only; no direct execution)
+    and institutional-based exit decisions.
     """
     def __init__(self, symbol, side, entry, qty, atr, initial_sl, tp1, tp2):
         self.symbol = symbol
@@ -523,21 +515,17 @@ class DynamicTradeManager:
         self.partial_closed = False
 
     def update(self, current_price, df, ob, atr):
-        """Returns a recommendation dict: action, sl, trail_stop, etc."""
         self.last_update = time.time()
         roe = self.calculate_roe(current_price)
         self.peak_price = max(self.peak_price, current_price) if self.side == "BUY" else min(self.peak_price, current_price)
         self.peak_roe = max(self.peak_roe, roe)
         self.drawdown = max(0, (self.peak_roe - roe) if self.peak_roe > 0 else 0)
 
-        recommendation = {"action": "HOLD", "sl": self.sl, "trail_stop": self.trailing_stop, "tp1_hit": self.tp1_hit, "tp2_hit": self.tp2_hit, "runner_active": self.runner_active}
-
         # ---- 1. Dynamic Stop Loss ----
         if roe > 0.4 and not self.trailing_activated:
             self.trailing_activated = True
             self.trailing_stop = current_price - atr * 0.8 if self.side == "BUY" else current_price + atr * 0.8
             log_execution(f"[DYN_SL] Trailing activated for {self.symbol} at ROE={roe:.2f}%", "INFO")
-            recommendation["trail_activated"] = True
 
         if self.trailing_activated:
             if self.side == "BUY":
@@ -552,29 +540,20 @@ class DynamicTradeManager:
                (self.side == "SELL" and current_price >= self.trailing_stop):
                 self.lifecycle = "SL_HIT"
                 log_execution(f"[DYN_SL] Stop hit at {current_price:.4f}", "WARN")
-                recommendation["action"] = "FULL_EXIT"
-                recommendation["reason"] = "Trailing stop hit"
-                return recommendation
+                return "EXIT"
 
         # ---- 2. Multi-Stage Take Profit ----
         if not self.tp1_hit:
             if (self.side == "BUY" and current_price >= self.tp1) or (self.side == "SELL" and current_price <= self.tp1):
                 self.tp1_hit = True
                 log_execution(f"[TP1] Hit for {self.symbol} at {current_price:.4f}", "SUCCESS")
-                recommendation["action"] = "PARTIAL_CLOSE"
-                recommendation["tp1_hit"] = True
-                recommendation["partial_ratio"] = 0.5
-                return recommendation
+                return "PARTIAL"
         if self.tp1_hit and not self.tp2_hit:
             if (self.side == "BUY" and current_price >= self.tp2) or (self.side == "SELL" and current_price <= self.tp2):
                 self.tp2_hit = True
                 self.runner_active = True
                 log_execution(f"[TP2] Hit for {self.symbol} at {current_price:.4f}", "SUCCESS")
-                recommendation["action"] = "PARTIAL_CLOSE"
-                recommendation["tp2_hit"] = True
-                recommendation["runner_active"] = True
-                recommendation["partial_ratio"] = 0.5  # close remaining half
-                return recommendation
+                return "TP2"
 
         # ---- 3. Runner Management ----
         if self.tp1_hit and self.runner_active:
@@ -584,8 +563,6 @@ class DynamicTradeManager:
                     self.trailing_stop = max(self.trailing_stop, current_price - atr * 0.6)
                 else:
                     self.trailing_stop = min(self.trailing_stop, current_price + atr * 0.6)
-                recommendation["sl"] = self.trailing_stop
-                recommendation["trail_stop"] = self.trailing_stop
 
         # ---- 4. Institutional Exit Signals ----
         if self.tp1_hit:
@@ -594,22 +571,16 @@ class DynamicTradeManager:
             if smart.get("distribution_risk", 0) > 60 and mom.get("momentum_decay", False):
                 self.lifecycle = "INSTITUTIONAL_EXIT"
                 log_execution(f"[INST_EXIT] Distribution risk {smart['distribution_risk']:.1f}, momentum decay", "WARN")
-                recommendation["action"] = "FULL_EXIT"
-                recommendation["reason"] = "Institutional exit"
-                return recommendation
+                return "EXIT"
 
         # ---- 5. Structure Loss Check ----
         struct_type, _ = InstitutionalIntentEngine._detect_fractal_structure(df)
         if struct_type == "EXTERNAL" and self.side == "BUY" and df['close'].iloc[-1] < df['close'].iloc[-3]:
-            recommendation["action"] = "FULL_EXIT"
-            recommendation["reason"] = "Structure break (external bearish)"
-            return recommendation
+            return "EXIT"
         if struct_type == "EXTERNAL" and self.side == "SELL" and df['close'].iloc[-1] > df['close'].iloc[-3]:
-            recommendation["action"] = "FULL_EXIT"
-            recommendation["reason"] = "Structure break (external bullish)"
-            return recommendation
+            return "EXIT"
 
-        return recommendation
+        return "HOLD"
 
     def calculate_roe(self, price):
         if self.side == "BUY":
@@ -619,11 +590,15 @@ class DynamicTradeManager:
 
 
 # ============================================================
-# NEW: WATCHLIST PRIORITY MANAGER (unchanged)
+# NEW: WATCHLIST PRIORITY MANAGER
 # ============================================================
 class WatchlistPriorityManager:
     @staticmethod
     def update_priorities():
+        """
+        Scans watchlist and assigns higher priority to symbols approaching
+        institutional conditions. Prevents premature removal.
+        """
         now = time.time()
         watchlist = MEMORY.get("watchlist", {})
         for sym, entry in list(watchlist.items()):
@@ -642,7 +617,7 @@ class WatchlistPriorityManager:
         MEMORY["watchlist"] = dict(sorted_watch)
 
 
-# ========== TRADE STATE MACHINE (unchanged) ==========
+# ========== TRADE STATE MACHINE (UNCHANGED) ==========
 class TradeStateMachine:
     STATES = {
         "ACCUMULATION": 0,
@@ -924,58 +899,6 @@ def tg_close(symbol, pnl_pct, duration_min, side):
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
-
-# ----- NEW: Professional Trade Report -----
-def send_trade_report(symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, peak_roe, exit_reason, status, duration_min, partial=False, remaining_pct=0, runner_active=False):
-    """
-    Sends a detailed trade report upon full close or partial close.
-    """
-    if status == "PROFIT":
-        icon = "✅"
-        title = "Trade Closed Successfully"
-        status_line = "🟢 Status: PROFIT"
-    elif status == "LOSS":
-        icon = "❌"
-        title = "Trade Closed"
-        status_line = "🔴 Status: LOSS"
-    else:
-        icon = "🟡"
-        title = "Partial Profit Taken"
-        status_line = "🟡 Partial Profit Taken"
-
-    side_str = "LONG" if side == "BUY" else "SHORT"
-    side_emoji = "🟢" if side == "BUY" else "🔴"
-
-    if status in ("PROFIT", "LOSS"):
-        msg = f"""<b>{icon} {title}</b>
-
-{status_line}
-
-📈 Symbol: {symbol}
-📊 Side: {side_emoji} {side_str}
-💰 Entry Price: {entry_price:.4f}
-🏁 Exit Price: {exit_price:.4f}
-💵 Realized PnL: {pnl_usdt:+.2f} USDT
-📈 Final ROE: {pnl_pct:+.2f}%
-🏆 Peak ROE: {peak_roe:+.2f}%
-🔒 Profit Protected: {'✅' if pnl_pct > 0 else '❌'}
-🧠 Exit Reason: {exit_reason}
-✅ Exchange Verification: Position Fully Closed & Confirmed
-🕒 Close Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-⏱ Duration: {duration_min:.1f} min"""
-    else:  # partial
-        msg = f"""<b>{icon} {title}</b>
-
-{status_line}
-💵 Closed Position: {100 - remaining_pct:.1f}%
-📊 Remaining Position: {remaining_pct:.1f}%
-📈 Current ROE: {pnl_pct:+.2f}%
-🏆 Peak ROE: {peak_roe:+.2f}%
-🏃 Runner Active: {'✅' if runner_active else '❌'}
-🔒 Profit Protection Enabled: {'✅' if pnl_pct > 0 else '❌'}
-✅ Exchange Verification: Partial Close Confirmed
-🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
-    send_once(msg, f"trade_report_{symbol}_{int(time.time())}", 10)
 
 # ========== CONFIGURATION ==========
 API_KEY = os.getenv("BINGX_API_KEY", "")
@@ -2019,697 +1942,488 @@ class ContinuationProbabilityEngine:
 
 _continuation_engine = ContinuationProbabilityEngine()
 
-# ============================================================
-# ===== NEW: UNIFIED TRADE MANAGEMENT BRAIN (UTMB) =====
-# ============================================================
-class UnifiedTradeManagementBrain:
-    """
-    Single source of truth for all trade management decisions.
-    All executions are verified against exchange.
-    """
-    def __init__(self, exchange_sync, recovery_guard, event_bus):
-        self.exchange_sync = exchange_sync
-        self.recovery_guard = recovery_guard
-        self.event_bus = event_bus
-        self.brain = InstitutionalTradeBrain()
-        self.last_eval = 0
-        self.peak_roe = 0.0
-        self.peak_price = 0.0
-        self.trailing_active = False
-        self.trail_stop = 0.0
+# ========== LIVE TRADE MANAGEMENT SYSTEM (FIXED) ==========
+class TradeLifecycleState(Enum):
+    IDLE = "IDLE"
+    OPEN_REQUESTED = "OPEN_REQUESTED"
+    OPEN_PENDING_CONFIRMATION = "OPEN_PENDING_CONFIRMATION"
+    LIVE = "LIVE"
+    PARTIALLY_CLOSED = "PARTIALLY_CLOSED"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    RECOVERING = "RECOVERING"
+    ERROR_DEGRADED = "ERROR_DEGRADED"
+
+class PositionSnapshot:
+    def __init__(self):
+        self.symbol = None
+        self.side = None
+        self.qty = 0.0
+        self.entry_price = 0.0
+        self.mark_price = 0.0
+        self.unrealized_pnl = 0.0
+        self.realized_pnl = 0.0
+        self.roe_pct = 0.0
+        self.leverage = LEVERAGE
+        self.margin = 0.0
+        self.liquidation_price = 0.0
         self.tp1_hit = False
         self.tp2_hit = False
-        self.runner_active = False
+        self.trailing_active = False
+        self.trailing_stop = 0.0
+        self.sl_price = 0.0
         self.partial_closed = False
-        self.profit_lock_activated = False
-        self.smart_sl = 0.0
-        self.smart_tp1 = 0.0
-        self.smart_tp2 = 0.0
-        self.entry_atr = 0.0
-        self.last_decision = "HOLD"
-        self.decision_reason = ""
+        self.stale = False
+        self.updated_at = 0.0
+        self.source = "unknown"
 
-    def evaluate_and_act(self, symbol):
-        """Main entry point for trade management. Called periodically."""
-        if not STATE.get("open") or STATE.get("current_symbol") != symbol:
-            return
-
-        # 1. Sync position from exchange
-        mark_price, unrealized, margin, roe = sync_position_state(symbol)
-        if mark_price is None:
-            # Position closed externally; clean up
-            if STATE.get("open"):
-                log_execution(f"[UTMB] Position on {symbol} closed externally. Cleaning state.", "WARN")
-                self._finalize_trade(symbol)
-            return
-
-        # 2. Get market data
-        df = get_ohlcv_safe(symbol, 50)
-        if df is None:
-            return
-        atr = compute_atr(df).iloc[-1] if len(df) > 14 else mark_price * 0.01
-        ob = get_orderbook_cached(symbol, limit=10)
-
-        # 3. Update internal peak tracking
-        if roe > self.peak_roe:
-            self.peak_roe = roe
-            self.peak_price = mark_price
-            STATE["peak_roe"] = self.peak_roe
-            STATE["peak_price"] = self.peak_price
-
-        drawdown = max(0, self.peak_roe - roe)
-        STATE["drawdown_from_peak"] = drawdown
-
-        # 4. Gather recommendations from all engines
-        recommendation = self._gather_recommendations(df, mark_price, atr, ob, roe)
-
-        # 5. Decide action
-        decision = self._decide(recommendation, roe, drawdown, df, mark_price, atr)
-
-        # 6. Execute action if needed
-        if decision["action"] == "FULL_CLOSE":
-            self._execute_full_close(symbol, roe, decision["reason"])
-        elif decision["action"] == "PARTIAL_CLOSE":
-            ratio = decision.get("ratio", 0.5)
-            self._execute_partial_close(symbol, roe, ratio, decision["reason"])
-        elif decision["action"] == "ADJUST_SL":
-            self._adjust_stop_loss(symbol, decision["sl"])
-        elif decision["action"] == "ACTIVATE_TRAIL":
-            self._activate_trailing(symbol, decision["trail_stop"])
-        elif decision["action"] == "UPDATE_STATE":
-            # Update state based on recommendations (e.g., tp1_hit, runner)
-            self._update_state(recommendation)
-
-    def _gather_recommendations(self, df, price, atr, ob, roe):
-        """Collects recommendations from all engines."""
-        side = STATE["side"]
-        entry = STATE["entry"]
-        smart = SmartMoneyEngine.analyze_smart_money(df)
-        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-        adx = compute_adx(df).iloc[-1] if len(df) > 14 else 20
-        regime = MarketRegimeClassifier.classify(df)
-        trade_state = self.brain.update(smart, momentum, adx, regime)
-
-        # State machine outputs
-        trail_mult = self.brain.get_trail_multiplier()
-        delay_tp1 = self.brain.should_delay_tp1()
-        aggressive_profit_lock = self.brain.should_aggressive_profit_lock()
-        hard_exit = self.brain.should_hard_exit()
-
-        # Continuation evaluation
-        market_state = {
-            "atr": atr,
-            "adx": adx,
-            "di_plus": smart.get("banker_pressure", 50),
-            "di_minus": smart.get("retailer_pressure", 50),
-            "trend_health": 5,  # placeholder
-            "weak_pullback": False,
-            "counter_displacement": 0.0,
-            "volume_ratio": df['volume'].iloc[-1] / df['volume'].iloc[-10:-1].mean() if len(df) >= 10 else 1.0,
-            "structure_aligned": False,
-            "df": df,
-            "last_candle": df.iloc[-1].to_dict(),
-            "continuation_pressure": 50
+    def to_dict(self):
+        return {
+            "symbol": self.symbol,
+            "side": self.side,
+            "qty": self.qty,
+            "entry_price": self.entry_price,
+            "mark_price": self.mark_price,
+            "unrealized_pnl": self.unrealized_pnl,
+            "realized_pnl": self.realized_pnl,
+            "roe_pct": self.roe_pct,
+            "leverage": self.leverage,
+            "margin": self.margin,
+            "liquidation_price": self.liquidation_price,
+            "tp1_hit": self.tp1_hit,
+            "tp2_hit": self.tp2_hit,
+            "trailing_active": self.trailing_active,
+            "trailing_stop": self.trailing_stop,
+            "sl_price": self.sl_price,
+            "partial_closed": self.partial_closed,
+            "stale": self.stale,
+            "updated_at": self.updated_at,
+            "source": self.source
         }
-        thesis_dict = STATE.get("trade_thesis", {})
-        cont_eval = _continuation_engine.evaluate(side, df, market_state, thesis_dict)
-        cont_prob = cont_eval.continuation_probability
-        hold_quality = cont_eval.hold_quality
 
-        # PPE recommendation (refactored)
-        ppe_recommendation = self._get_ppe_recommendation(df, price, atr, roe)
+class EventBus:
+    def __init__(self):
+        self._handlers = {}
+        self._queue = qlib.Queue()
+        self._running = True
+        threading.Thread(target=self._process, daemon=True).start()
 
-        # DynamicTradeManager recommendation
-        dyn_manager = STATE.get("dynamic_manager")
-        dyn_rec = {}
-        if dyn_manager:
-            dyn_rec = dyn_manager.update(price, df, ob, atr)
-        else:
-            # create a new one if not exists (should exist after entry)
-            dyn_manager = DynamicTradeManager(symbol, side, entry, STATE["qty"], atr, STATE.get("synthetic_sl", 0), STATE.get("synthetic_tp1", 0), STATE.get("tp2_price", 0))
-            STATE["dynamic_manager"] = dyn_manager
-            dyn_rec = dyn_manager.update(price, df, ob, atr)
+    def subscribe(self, event_type, handler):
+        if event_type not in self._handlers:
+            self._handlers[event_type] = []
+        self._handlers[event_type].append(handler)
 
-        # Combine all
-        rec = {
-            "trade_state": trade_state,
-            "trail_mult": trail_mult,
-            "delay_tp1": delay_tp1,
-            "aggressive_profit_lock": aggressive_profit_lock,
-            "hard_exit": hard_exit,
-            "continuation_probability": cont_prob,
-            "hold_quality": hold_quality,
-            "cont_eval": cont_eval,
-            "ppe": ppe_recommendation,
-            "dyn": dyn_rec,
-            "smart": smart,
-            "momentum": momentum,
-            "adx": adx,
-            "regime": regime,
-            "atr": atr
-        }
-        return rec
+    def emit(self, event_type, data=None):
+        self._queue.put((event_type, data))
 
-    def _get_ppe_recommendation(self, df, price, atr, roe):
-        """
-        Refactored from apply_50_50_profit_engine: returns recommendation dict, no execution.
-        """
-        rec = {
-            "action": "HOLD",
-            "sl": STATE.get("synthetic_sl", 0),
-            "trail_stop": STATE.get("trail_stop", 0),
-            "trail_active": STATE.get("trail_activated", False),
-            "tp1_hit": STATE.get("tp1_hit", False),
-            "runner_mode": STATE.get("runner_mode", False),
-            "profit_lock_activated": STATE.get("profit_lock_activated", False),
-            "trail_tightened": STATE.get("trail_tightened", False)
-        }
-        # Use logic from original PPE but only set recommendations
-        # (We'll keep the logic here)
-        if len(df) < 2:
-            return rec
-        idx = len(df) - 1
-        state_ppe = {
-            "symbol": STATE["current_symbol"],
-            "trail_active": STATE.get("trail_activated", False),
-            "tp1_done": STATE.get("tp1_hit", False),
-            "tp1_hit": STATE.get("tp1_hit", False),
-            "runner_mode": STATE.get("runner_mode", False),
-            "max_price": STATE.get("max_price", STATE["entry"]),
-            "min_price": STATE.get("min_price", STATE["entry"]),
-            "sl": STATE.get("synthetic_sl", 0.0),
-            "trail_stop": STATE.get("trail_stop", 0.0),
-            "remaining_qty": STATE.get("remaining_qty", STATE["qty"]),
-            "smart_trail_mult": STATE.get("smart_trail_mult", 1.5),
-            "smart_money": SmartMoneyEngine.analyze_smart_money(df),
-            "momentum_flow": MomentumFlowEngine.analyze_momentum_flow(df),
-            "profit_lock_activated": STATE.get("profit_lock_activated", False),
-            "trail_tightened": STATE.get("trail_tightened", False)
-        }
-        # Call original PPE logic but with no execution
-        # We'll copy the logic from apply_50_50_profit_engine and replace close_partial with rec updates
-        # (Original function is large; we'll replicate core logic)
-        # For brevity, we'll call a helper or replicate here.
-        # Since the original function is long, we'll assume it's replicated with no execution.
-        # (In production, we would extract the logic to a separate function.)
-        # For now, we'll use a simplified version:
-        high = df['high'].iloc[-1]
-        low = df['low'].iloc[-1]
-        state_ppe["max_price"] = max(state_ppe["max_price"], high)
-        state_ppe["min_price"] = min(state_ppe["min_price"], low)
-        dist_risk = state_ppe["smart_money"].get("distribution_risk", 0)
-        mom_health = state_ppe["momentum_flow"].get("momentum_health", 50)
-        cont_strength = state_ppe["momentum_flow"].get("continuation_strength", 50)
+    def _process(self):
+        while self._running:
+            try:
+                event_type, data = self._queue.get(timeout=0.1)
+                for handler in self._handlers.get(event_type, []):
+                    try:
+                        handler(data)
+                    except Exception as e:
+                        log_execution(f"[EVENT] handler error: {e}", "ERROR")
+            except qlib.Empty:
+                continue
+            except Exception:
+                continue
 
-        if dist_risk > 45 and not state_ppe["profit_lock_activated"]:
-            rec["action"] = "PARTIAL_CLOSE"
-            rec["ratio"] = 0.5
-            rec["reason"] = "Distribution risk >45"
-            rec["profit_lock_activated"] = True
-            return rec
+class ExchangeSyncService:
+    def __init__(self, event_bus):
+        self.event_bus = event_bus
+        self._last_snapshot = PositionSnapshot()
+        self._reconcile_count = 0
+        self._last_reconcile = 0
 
-        if mom_health < -8 and roe > 2 and not state_ppe["tp1_hit"]:
-            rec["action"] = "PARTIAL_CLOSE"
-            rec["ratio"] = 0.5
-            rec["reason"] = "Negative momentum health"
-            return rec
-
-        if not state_ppe["trail_active"] and roe >= 1.5:
-            rec["action"] = "ACTIVATE_TRAIL"
-            if STATE["side"] == "BUY":
-                trail_stop = price - 1.2 * atr
-            else:
-                trail_stop = price + 1.2 * atr
-            rec["trail_stop"] = trail_stop
-            rec["trail_active"] = True
-            rec["sl"] = STATE["entry"]  # break even
-            return rec
-
-        # Trail update
-        if state_ppe["trail_active"]:
-            trail_mult = state_ppe["smart_trail_mult"]
-            if STATE["side"] == "BUY":
-                new_stop = state_ppe["max_price"] - trail_mult * atr
-                if new_stop > state_ppe["trail_stop"]:
-                    rec["trail_stop"] = new_stop
-            else:
-                new_stop = state_ppe["min_price"] + trail_mult * atr
-                if new_stop < state_ppe["trail_stop"]:
-                    rec["trail_stop"] = new_stop
-
-        # Runner mode detection
-        adx_series = compute_adx(df)
-        if not state_ppe["runner_mode"] and len(adx_series) > idx:
-            adx_val = adx_series.iloc[idx]
-            if adx_val >= 25:
-                rec["runner_mode"] = True
-
-        # Check if trail stop hit
-        if state_ppe["trail_active"] and state_ppe["trail_stop"]:
-            if (STATE["side"] == "BUY" and price <= state_ppe["trail_stop"]) or (STATE["side"] == "SELL" and price >= state_ppe["trail_stop"]):
-                rec["action"] = "FULL_CLOSE"
-                rec["reason"] = "Trailing stop hit"
-                return rec
-
-        # ADX weakening exit
-        if state_ppe["runner_mode"] and len(adx_series) >= 2:
-            adx_now = adx_series.iloc[idx]
-            adx_prev = adx_series.iloc[idx-1]
-            last_candle = df.iloc[-1]
-            is_bearish = last_candle['close'] < last_candle['open']
-            is_bullish = last_candle['close'] > last_candle['open']
-            if (STATE["side"] == "BUY" and adx_now < adx_prev and is_bearish) or (STATE["side"] == "SELL" and adx_now < adx_prev and is_bullish):
-                rec["action"] = "FULL_CLOSE"
-                rec["reason"] = "Momentum weakness (ADX decreasing)"
-                return rec
-
-        # Structure break
-        bos_up, bos_down = detect_bos(df, lookback=5)
-        if state_ppe["runner_mode"]:
-            if (STATE["side"] == "BUY" and bos_down) or (STATE["side"] == "SELL" and bos_up):
-                rec["action"] = "FULL_CLOSE"
-                rec["reason"] = "Structure break (BOS)"
-                return rec
-
-        if state_ppe["momentum_flow"].get("greed_state", False) and roe > 4 and not state_ppe["profit_lock_activated"]:
-            rec["action"] = "PARTIAL_CLOSE"
-            rec["ratio"] = 0.5
-            rec["reason"] = "Greed state"
-            rec["profit_lock_activated"] = True
-            return rec
-
-        rec["sl"] = state_ppe["sl"]
-        rec["trail_stop"] = state_ppe["trail_stop"]
-        rec["trail_active"] = state_ppe["trail_active"]
-        rec["tp1_hit"] = state_ppe["tp1_hit"]
-        rec["runner_mode"] = state_ppe["runner_mode"]
-        rec["profit_lock_activated"] = state_ppe["profit_lock_activated"]
-        rec["trail_tightened"] = state_ppe["trail_tightened"]
-        rec["max_price"] = state_ppe["max_price"]
-        rec["min_price"] = state_ppe["min_price"]
-        return rec
-
-    def _decide(self, rec, roe, drawdown, df, price, atr):
-        """Combines all recommendations into a final decision."""
-        decision = {"action": "HOLD", "reason": ""}
-
-        # 1. Check hard exit from state machine
-        if rec.get("hard_exit", False):
-            decision["action"] = "FULL_CLOSE"
-            decision["reason"] = "Hard exit triggered by state machine"
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-
-        # 2. Check aggressive profit lock
-        if rec.get("aggressive_profit_lock", False) and not self.profit_lock_activated:
-            decision["action"] = "PARTIAL_CLOSE"
-            decision["ratio"] = 0.5
-            decision["reason"] = "Aggressive profit lock"
-            self.profit_lock_activated = True
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-
-        # 3. Check if continuation probability is very low
-        cont_prob = rec.get("continuation_probability", 0.5)
-        if cont_prob < 0.3 and roe > 0:
-            decision["action"] = "FULL_CLOSE"
-            decision["reason"] = f"Very low continuation probability ({cont_prob:.2f})"
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-
-        # 4. Check PPE recommendation
-        ppe = rec.get("ppe", {})
-        if ppe.get("action") == "FULL_CLOSE":
-            decision["action"] = "FULL_CLOSE"
-            decision["reason"] = ppe.get("reason", "PPE full close")
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-        if ppe.get("action") == "PARTIAL_CLOSE":
-            decision["action"] = "PARTIAL_CLOSE"
-            decision["ratio"] = ppe.get("ratio", 0.5)
-            decision["reason"] = ppe.get("reason", "PPE partial close")
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-        if ppe.get("action") == "ACTIVATE_TRAIL":
-            decision["action"] = "ACTIVATE_TRAIL"
-            decision["trail_stop"] = ppe.get("trail_stop", 0)
-            self.last_decision = decision["action"]
-            self.decision_reason = "Activating trailing stop"
-            return decision
-
-        # 5. Check dynamic manager recommendation
-        dyn = rec.get("dyn", {})
-        if dyn.get("action") == "FULL_EXIT":
-            decision["action"] = "FULL_CLOSE"
-            decision["reason"] = dyn.get("reason", "Dynamic manager exit")
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-        if dyn.get("action") == "PARTIAL_CLOSE":
-            decision["action"] = "PARTIAL_CLOSE"
-            decision["ratio"] = dyn.get("partial_ratio", 0.5)
-            decision["reason"] = "TP hit or partial close"
-            self.last_decision = decision["action"]
-            self.decision_reason = decision["reason"]
-            return decision
-
-        # 6. Check trailing stop hit (from our own tracking)
-        if self.trailing_active and self.trail_stop > 0:
-            if (STATE["side"] == "BUY" and price <= self.trail_stop) or (STATE["side"] == "SELL" and price >= self.trail_stop):
-                decision["action"] = "FULL_CLOSE"
-                decision["reason"] = "Trailing stop hit"
-                self.last_decision = decision["action"]
-                self.decision_reason = decision["reason"]
-                return decision
-
-        # 7. Check synthetic SL (if set)
-        synthetic_sl = STATE.get("synthetic_sl", 0)
-        if synthetic_sl > 0:
-            if (STATE["side"] == "BUY" and price <= synthetic_sl) or (STATE["side"] == "SELL" and price >= synthetic_sl):
-                decision["action"] = "FULL_CLOSE"
-                decision["reason"] = "Synthetic stop loss hit"
-                self.last_decision = decision["action"]
-                self.decision_reason = decision["reason"]
-                return decision
-
-        # 8. Update trailing stop if not yet activated but ROE > threshold
-        if not self.trailing_active and roe > 1.5:
-            decision["action"] = "ACTIVATE_TRAIL"
-            if STATE["side"] == "BUY":
-                trail_stop = price - atr * 1.2
-            else:
-                trail_stop = price + atr * 1.2
-            decision["trail_stop"] = trail_stop
-            self.last_decision = decision["action"]
-            self.decision_reason = "Activating trailing stop at ROE >1.5%"
-            return decision
-
-        # 9. Update trailing stop continuously
-        if self.trailing_active:
-            if STATE["side"] == "BUY":
-                new_trail = price - atr * rec.get("trail_mult", 1.5)
-                if new_trail > self.trail_stop:
-                    self.trail_stop = new_trail
-                    STATE["trail_stop"] = self.trail_stop
-                    decision["action"] = "UPDATE_STATE"
-            else:
-                new_trail = price + atr * rec.get("trail_mult", 1.5)
-                if new_trail < self.trail_stop:
-                    self.trail_stop = new_trail
-                    STATE["trail_stop"] = self.trail_stop
-                    decision["action"] = "UPDATE_STATE"
-
-        # 10. If we hold, update state with any changes from recommendations
-        decision["action"] = "HOLD"
-        self.last_decision = "HOLD"
-        self.decision_reason = "No exit condition triggered"
-        return decision
-
-    def _execute_full_close(self, symbol, roe, reason):
-        """Execute full close and verify."""
-        log_execution(f"[UTMB] Executing FULL_CLOSE for {symbol} due to: {reason}", "WARN")
-        # Use existing close_position_full but ensure verification
-        success = close_position_full()
-        if success:
-            # verify position zero
-            pos = fetch_position(symbol) if not PAPER_MODE else None
-            if PAPER_MODE:
-                if paper["position"] is None:
-                    # Already closed in close_position_full
-                    pass
-            else:
-                if pos is None or float(pos.get('contracts', 0)) == 0:
-                    log_execution(f"[UTMB] Full close confirmed for {symbol}", "SUCCESS")
-                    self._finalize_trade(symbol, roe, reason)
-                else:
-                    log_execution(f"[UTMB] Full close failed: position still open {pos}", "ERROR")
-                    # retry? maybe use recovery
-                    self.recovery_guard.check_and_recover(symbol)
-        else:
-            log_execution(f"[UTMB] Full close failed for {symbol}", "ERROR")
-
-    def _execute_partial_close(self, symbol, roe, ratio, reason):
-        """Execute partial close and verify."""
-        log_execution(f"[UTMB] Executing PARTIAL_CLOSE ({ratio*100:.0f}%) for {symbol} due to: {reason}", "INFO")
-        # Use close_partial with verification
-        # We need to ensure close_partial verifies and updates STATE
-        # But close_partial currently doesn't verify; we'll modify it later.
-        # For now, we'll call close_partial and then verify.
-        close_partial(ratio)
-        # After partial close, verify position reduced
+    def fetch_live_snapshot(self, symbol):
         if PAPER_MODE:
-            remaining = paper["position"]["remaining_qty"] if paper["position"] else 0
-            STATE["remaining_qty"] = remaining
-            TRADE_STATE["qty"] = remaining
-        else:
-            time.sleep(1)  # wait for exchange update
+            return self._paper_snapshot(symbol)
+        try:
             pos = fetch_position(symbol)
-            if pos:
-                current_qty = float(pos.get('contracts', 0))
-                STATE["remaining_qty"] = current_qty
-                TRADE_STATE["qty"] = current_qty
-                log_execution(f"[UTMB] Partial close confirmed. Remaining qty: {current_qty:.6f}", "SUCCESS")
-                # Send partial report
-                send_trade_report(
-                    symbol=symbol,
-                    side=STATE["side"],
-                    entry_price=STATE["entry"],
-                    exit_price=STATE.get("mark_price", STATE["entry"]),
-                    pnl_pct=roe,
-                    pnl_usdt=STATE.get("unrealized_pnl_usdt", 0),
-                    peak_roe=self.peak_roe,
-                    exit_reason=reason,
-                    status="PARTIAL",
-                    duration_min=(time.time() - STATE["entry_time"]) / 60,
-                    partial=True,
-                    remaining_pct=(current_qty / STATE["qty"]) * 100,
-                    runner_active=self.runner_active
-                )
+            if pos is None:
+                if STATE.get("open"):
+                    self.event_bus.emit("position_closed_external", {"symbol": symbol})
+                return None
+            snapshot = PositionSnapshot()
+            snapshot.symbol = symbol
+            snapshot.side = 'BUY' if pos.get('side', '').lower() == 'long' else 'SELL'
+            snapshot.qty = safe_float(pos.get('contracts', 0))
+            snapshot.entry_price = safe_float(pos.get('entryPrice', 0))
+            snapshot.mark_price = safe_float(pos.get('markPrice', 0))
+            snapshot.unrealized_pnl = safe_float(pos.get('unrealizedPnl', 0))
+            snapshot.margin = safe_float(pos.get('initialMargin', 0))
+            snapshot.leverage = safe_float(pos.get('leverage', LEVERAGE))
+            snapshot.liquidation_price = safe_float(pos.get('liquidationPrice', 0))
+            if snapshot.margin > 0:
+                snapshot.roe_pct = (snapshot.unrealized_pnl / snapshot.margin) * 100
             else:
-                log_execution(f"[UTMB] Partial close failed: position vanished?", "ERROR")
-        # Update state
-        self.tp1_hit = True
-        STATE["tp1_hit"] = True
-        # Update dynamic manager if exists
-        if STATE.get("dynamic_manager"):
-            STATE["dynamic_manager"].tp1_hit = True
+                raw_move = (snapshot.mark_price - snapshot.entry_price)/snapshot.entry_price*100 if snapshot.side=="BUY" else (snapshot.entry_price - snapshot.mark_price)/snapshot.entry_price*100
+                snapshot.roe_pct = raw_move * snapshot.leverage
+            snapshot.updated_at = time.time()
+            snapshot.source = "rest_sync"
+            self._last_snapshot = snapshot
+            return snapshot
+        except Exception as e:
+            log_execution(f"[SYNC] REST snapshot error: {e}", "ERROR")
+            return None
 
-    def _adjust_stop_loss(self, symbol, new_sl):
-        """Adjust synthetic stop loss."""
-        STATE["synthetic_sl"] = new_sl
-        log_execution(f"[UTMB] SL adjusted to {new_sl:.4f}", "INFO")
+    def _paper_snapshot(self, symbol):
+        if not STATE.get("open") or STATE.get("current_symbol") != symbol:
+            return None
+        snap = PositionSnapshot()
+        snap.symbol = symbol
+        snap.side = STATE["side"]
+        snap.qty = STATE["qty"]
+        snap.entry_price = STATE["entry"]
+        snap.mark_price = get_ticker_safe(symbol) or snap.entry_price
+        snap.unrealized_pnl = (snap.mark_price - snap.entry_price) * snap.qty if snap.side == "BUY" else (snap.entry_price - snap.mark_price) * snap.qty
+        snap.margin = snap.entry_price * snap.qty / LEVERAGE
+        snap.roe_pct = (snap.unrealized_pnl / snap.margin) * 100 if snap.margin else 0
+        snap.updated_at = time.time()
+        snap.source = "paper"
+        return snap
 
-    def _activate_trailing(self, symbol, trail_stop):
-        """Activate trailing stop."""
-        self.trailing_active = True
-        self.trail_stop = trail_stop
-        STATE["trail_activated"] = True
-        STATE["trail_stop"] = trail_stop
-        log_execution(f"[UTMB] Trailing stop activated at {trail_stop:.4f}", "INFO")
-
-    def _update_state(self, rec):
-        """Update internal state based on recommendations."""
-        ppe = rec.get("ppe", {})
-        dyn = rec.get("dyn", {})
-        if ppe.get("tp1_hit", False) or dyn.get("tp1_hit", False):
-            self.tp1_hit = True
-            STATE["tp1_hit"] = True
-        if ppe.get("runner_mode", False) or dyn.get("runner_active", False):
-            self.runner_active = True
-            STATE["runner_mode"] = True
-        if ppe.get("profit_lock_activated", False):
-            self.profit_lock_activated = True
-            STATE["profit_lock_activated"] = True
-        if ppe.get("trail_active", False):
-            self.trailing_active = True
-            STATE["trail_activated"] = True
-        if ppe.get("trail_stop", 0) > 0:
-            self.trail_stop = ppe.get("trail_stop")
-            STATE["trail_stop"] = self.trail_stop
-        if ppe.get("sl", 0) > 0:
-            STATE["synthetic_sl"] = ppe.get("sl")
-        # Update max/min
-        STATE["max_price"] = ppe.get("max_price", STATE.get("max_price", STATE["entry"]))
-        STATE["min_price"] = ppe.get("min_price", STATE.get("min_price", STATE["entry"]))
-
-    def _finalize_trade(self, symbol, roe=0.0, reason="External close"):
-        """Clean up after trade closure and send report."""
-        if not STATE.get("open"):
+    def reconcile(self, symbol, local_state):
+        now = time.time()
+        if now - self._last_reconcile < 10:
             return
-        # Get final stats
-        final_roe = roe if roe != 0 else STATE.get("roe_pct", 0)
-        final_pnl = STATE.get("unrealized_pnl_usdt", 0)
-        entry_price = STATE["entry"]
-        exit_price = STATE.get("mark_price", entry_price)
-        side = STATE["side"]
-        duration = (time.time() - STATE.get("entry_time", time.time())) / 60
-        status = "PROFIT" if final_roe >= 0 else "LOSS"
-
-        # Send report
-        send_trade_report(
-            symbol=symbol,
-            side=side,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            pnl_pct=final_roe,
-            pnl_usdt=final_pnl,
-            peak_roe=self.peak_roe,
-            exit_reason=reason,
-            status=status,
-            duration_min=duration,
-            partial=False
-        )
-
-        # Update performance
-        PERF["total_pnl_pct"] += final_roe
-        PERF["total_pnl_usdt"] += final_pnl
-        PERF["trades"] += 1
-        if final_roe >= 0:
-            PERF["wins"] += 1
-        else:
-            PERF["losses"] += 1
-        PERF["last_trade"] = {"result": "WIN" if final_roe>=0 else "LOSS", "pnl_pct": final_roe}
-
-        # Clear state
+        self._last_reconcile = now
+        log_execution(f"[RECONCILIATION] Starting for {symbol}", "INFO")
+        self._reconcile_count += 1
+        snap = self.fetch_live_snapshot(symbol)
+        if snap is None:
+            if local_state.get("open"):
+                log_execution(f"[RECONCILIATION] Position vanished, marking closed", "WARN")
+                self.event_bus.emit("force_close_local")
+            return
         with _TRADE_LOCK:
-            STATE["open"] = False
-            STATE["side"] = None
-            STATE["current_symbol"] = None
-            STATE["tp1_hit"] = False
-            STATE["tp2_hit"] = False
-            STATE["trail_activated"] = False
-            STATE["profit_lock_activated"] = False
-            STATE["runner_mode"] = False
-            STATE["trail_tightened"] = False
-            STATE["partial_closed"] = False
-            STATE["scale_ins"] = 0
+            STATE["entry"] = snap.entry_price
+            STATE["qty"] = snap.qty
+            STATE["remaining_qty"] = snap.qty
+            STATE["side"] = snap.side
+            STATE["mark_price"] = snap.mark_price
+            STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
+            STATE["roe_pct"] = snap.roe_pct
+            STATE["margin"] = snap.margin
+            STATE["liquidation_price"] = snap.liquidation_price
             TRADE_STATE.update({
-                "in_position": False,
-                "symbol": None,
-                "side": None,
-                "entry": 0.0,
-                "qty": 0.0,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "trail_on": False,
-                "zone": None,
-                "location": None,
-                "reason": []
+                "symbol": symbol,
+                "side": snap.side,
+                "entry": snap.entry_price,
+                "qty": snap.qty,
+                "last_update_ts": time.time()
             })
-            DASHBOARD_STATE["live_trade_mode"] = False
-            clear_position_dashboard()
-        # Reset UTMB state for next trade
-        self.peak_roe = 0.0
-        self.peak_price = 0.0
-        self.trailing_active = False
-        self.trail_stop = 0.0
-        self.tp1_hit = False
-        self.tp2_hit = False
-        self.runner_active = False
-        self.partial_closed = False
-        self.profit_lock_activated = False
-        # Remove dynamic manager
-        if "dynamic_manager" in STATE:
-            del STATE["dynamic_manager"]
+            if not STATE.get("open"):
+                STATE["open"] = True
+                STATE["current_symbol"] = symbol
+                STATE["entry_time"] = time.time()
+        log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}", "SUCCESS")
+        self.event_bus.emit("reconciled", snap)
 
-# ========== LIVE TRADE MANAGER (WRAPPER) ==========
-class LiveTradeManager:
-    def __init__(self, event_bus, exchange_sync, recovery_guard):
+class RecoveryGuard:
+    def __init__(self, event_bus, exchange_sync):
         self.event_bus = event_bus
         self.exchange_sync = exchange_sync
-        self.recovery = recovery_guard
-        self.lifecycle_state = TradeLifecycleState.IDLE
-        self.current_snapshot = None
-        self.last_management_ts = 0
-        self.last_log_ts = 0
-        self.last_live_debug_ts = 0
-        self.last_heavy_calc_ts = 0
-        self.last_position_sync_ts = 0
-        self.brain = InstitutionalTradeBrain()
-        # Instantiate UTMB
-        self.utmb = UnifiedTradeManagementBrain(exchange_sync, recovery_guard, event_bus)
-        event_bus.subscribe("reconciled", self._on_reconciled)
-        event_bus.subscribe("force_close_local", self._force_close)
-        event_bus.subscribe("lifecycle_change", self._set_lifecycle)
+        self.recovery_attempts = 0
+        self.last_recovery = 0
 
-    def _set_lifecycle(self, state):
-        self.lifecycle_state = state
-        log_execution(f"[LIFECYCLE] New state: {state.value}", "INFO")
-        DASHBOARD_STATE["lifecycle_state"] = state.value
-
-    def _on_reconciled(self, snapshot):
-        self.current_snapshot = snapshot
-        DASHBOARD_STATE["live_trade_mode"] = True
-        if self.lifecycle_state == TradeLifecycleState.RECOVERING:
-            self.lifecycle_state = TradeLifecycleState.LIVE
-
-    def _force_close(self, _):
-        if STATE["open"]:
-            close_position_full()
-            self.lifecycle_state = TradeLifecycleState.CLOSED
-            DASHBOARD_STATE["live_trade_mode"] = False
-
-    def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
-        self.lifecycle_state = TradeLifecycleState.OPEN_PENDING_CONFIRMATION
-        self.event_bus.emit("lifecycle_change", TradeLifecycleState.OPEN_PENDING_CONFIRMATION)
-        log_execution(f"[LIFECYCLE] Trade open requested for {symbol} {side}", "INFO")
-
-    def set_entry_atr(self, entry_atr):
-        STATE["entry_atr"] = entry_atr
-        base_sl_mult = 1.6
-        if STATE["side"] == "BUY":
-            STATE["synthetic_sl"] = STATE["entry"] - entry_atr * base_sl_mult
-        else:
-            STATE["synthetic_sl"] = STATE["entry"] + entry_atr * base_sl_mult
-        log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f}", "INFO")
-        # Also set in UTMB
-        self.utmb.smart_sl = STATE["synthetic_sl"]
-
-    def manage_live_trade(self):
-        if not (STATE.get("open") and STATE.get("current_symbol")):
-            if self.lifecycle_state not in (TradeLifecycleState.IDLE, TradeLifecycleState.CLOSED):
-                self.lifecycle_state = TradeLifecycleState.IDLE
-                DASHBOARD_STATE["live_trade_mode"] = False
-            return
-        # Delegate to UTMB
-        self.utmb.evaluate_and_act(STATE["current_symbol"])
-        # Update dashboard periodically
+    def check_and_recover(self, symbol):
         now = time.time()
-        if now - self.last_log_ts > 5:
-            self._log_live_status()
-            self.last_log_ts = now
+        if self.recovery_attempts > 5 and now - self.last_recovery < 300:
+            log_execution("[RECOVERY] Too many attempts, cooling down", "WARN")
+            return False
+        log_execution(f"[RECOVERY] Entering RECOVERING mode for {symbol}", "WARN")
+        self.event_bus.emit("lifecycle_change", TradeLifecycleState.RECOVERING)
+        success = False
+        for attempt in range(3):
+            try:
+                snap = self.exchange_sync.fetch_live_snapshot(symbol)
+                if snap is not None:
+                    self.recovery_attempts = 0
+                    self.last_recovery = now
+                    self.event_bus.emit("recovery_success", snap)
+                    success = True
+                    break
+                time.sleep(1)
+            except:
+                continue
+        if not success:
+            log_execution("[RECOVERY] Failed to recover, staying in degraded", "ERROR")
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.ERROR_DEGRADED)
+            self.recovery_attempts += 1
+            self.last_recovery = now
+        return success
 
-    def _log_live_status(self):
-        if not STATE.get("open"):
+# ========== INSTITUTIONAL TREND ENGINE ==========
+class TrendState(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    PROBATION_BULLISH = "PROBATION_BULLISH"
+    PROBATION_BEARISH = "PROBATION_BEARISH"
+    CHOP = "CHOP"
+
+class InstitutionalTrendEngine:
+    def __init__(self):
+        self.trend_state = TrendState.CHOP
+        self.trend_persistence = 0
+        self.last_state_change = 0
+        self.state_confidence = 0.0
+
+    def analyze_adx_momentum(self, adx_series):
+        if adx_series is None or len(adx_series) < 10:
+            return {"value": 20, "slope": 0, "acceleration": 0, "state": "UNKNOWN", "rising": False}
+        current = adx_series.iloc[-1]
+        slope = adx_series.iloc[-1] - adx_series.iloc[-4] if len(adx_series) >= 4 else 0
+        accel = slope - (adx_series.iloc[-4] - adx_series.iloc[-7]) if len(adx_series) >= 7 else 0
+        if current < 18:
+            state = "CHOP"
+        elif 18 <= current < 25:
+            state = "EMERGING"
+        elif 25 <= current < 35:
+            state = "HEALTHY"
+        elif 35 <= current < 45:
+            state = "STRONG"
+        else:
+            state = "EXHAUSTION"
+        return {"value": current, "slope": slope, "acceleration": accel, "state": state, "rising": slope > 0}
+
+    def analyze_di_pressure(self, df):
+        plus_di, minus_di, _, _ = get_di_components(df)
+        if plus_di is None or minus_di is None:
+            return {"dominant": "NEUTRAL", "spread": 0, "persistent": False}
+        spread = plus_di - minus_di
+        dominant = "BUY" if plus_di > minus_di else "SELL" if minus_di > plus_di else "NEUTRAL"
+        persistent = False
+        if len(df) >= 6:
+            buy_count = 0
+            sell_count = 0
+            for i in range(-5, 0):
+                p, m, _, _ = get_di_components(df.iloc[:i+1] if i < 0 else df)
+                if p is not None and m is not None:
+                    if p > m:
+                        buy_count += 1
+                    elif m > p:
+                        sell_count += 1
+            if dominant == "BUY" and buy_count >= 4:
+                persistent = True
+            elif dominant == "SELL" and sell_count >= 4:
+                persistent = True
+        return {"dominant": dominant, "spread": spread, "persistent": persistent}
+
+    def analyze_pullback(self, df, side, atr):
+        if len(df) < 5:
+            return "NO_PULLBACK"
+        last = df.iloc[-1]
+        prev_candles = df.iloc[-5:-1]
+        if side == "SELL":
+            bullish_candles = [c for i, c in prev_candles.iterrows() if c['close'] > c['open']]
+            if not bullish_candles and last['close'] <= last['open']:
+                return "NO_PULLBACK"
+            avg_body = sum(abs(c['close'] - c['open']) for _, c in prev_candles.iterrows()) / len(prev_candles)
+            upper_wicks = sum((c['high'] - max(c['close'], c['open'])) for _, c in prev_candles.iterrows()) / len(prev_candles)
+            vol = df['volume'].iloc[-1]
+            avg_vol = df['volume'].iloc[-10:-1].mean()
+            di = self.analyze_di_pressure(df)
+            adx_mom = self.analyze_adx_momentum(compute_adx(df))
+            weak_conditions = (avg_body < atr * 0.4 and upper_wicks > avg_body and vol < avg_vol * 0.8 and di["dominant"] == "SELL" and adx_mom["rising"] and adx_mom["state"] in ("HEALTHY", "STRONG"))
+            if weak_conditions:
+                return "WEAK_PULLBACK"
+            if last['close'] > last['open'] and last['close'] > prev_candles['close'].max():
+                if vol > avg_vol * 1.5 and di["dominant"] == "BUY" and not adx_mom["rising"]:
+                    return "REVERSAL"
+            return "STRONG_PULLBACK"
+        else:
+            bearish_candles = [c for i, c in prev_candles.iterrows() if c['close'] < c['open']]
+            if not bearish_candles and last['close'] >= last['open']:
+                return "NO_PULLBACK"
+            avg_body = sum(abs(c['close'] - c['open']) for _, c in prev_candles.iterrows()) / len(prev_candles)
+            lower_wicks = sum((min(c['open'], c['close']) - c['low']) for _, c in prev_candles.iterrows()) / len(prev_candles)
+            vol = df['volume'].iloc[-1]
+            avg_vol = df['volume'].iloc[-10:-1].mean()
+            di = self.analyze_di_pressure(df)
+            adx_mom = self.analyze_adx_momentum(compute_adx(df))
+            weak_conditions = (avg_body < atr * 0.4 and lower_wicks > avg_body and vol < avg_vol * 0.8 and di["dominant"] == "BUY" and adx_mom["rising"] and adx_mom["state"] in ("HEALTHY", "STRONG"))
+            if weak_conditions:
+                return "WEAK_PULLBACK"
+            if last['close'] < last['open'] and last['close'] < prev_candles['close'].min():
+                if vol > avg_vol * 1.5 and di["dominant"] == "SELL" and not adx_mom["rising"]:
+                    return "REVERSAL"
+            return "STRONG_PULLBACK"
+
+    def calculate_exit_score(self, ctx):
+        score = 0
+        if ctx.get("di_flip", False): score += 3
+        if ctx.get("adx_collapse", False): score += 2
+        if ctx.get("strong_reclaim", False): score += 3
+        if ctx.get("exhaustion", False): score += 4
+        if ctx.get("htf_opposite", False): score += 2
+        if ctx.get("momentum_loss", False): score += 2
+        if ctx.get("failed_continuation", False): score += 2
+        return score
+
+    def is_chop(self, df):
+        adx = compute_adx(df)
+        if adx is None or len(adx) < 20:
+            return True
+        adx_val = adx.iloc[-1]
+        plus_di, minus_di, _, _ = get_di_components(df)
+        if plus_di is None or minus_di is None:
+            return True
+        di_spread = abs(plus_di - minus_di)
+        atr = compute_atr(df).iloc[-1]
+        atr_ma = compute_atr(df).rolling(20).mean().iloc[-1] if len(df) >= 20 else atr
+        atr_flat = abs(atr - atr_ma) / atr_ma < 0.1 if atr_ma > 0 else True
+        vol_state = classify_volume(df)
+        low_volume = vol_state in ("exhaustion", "neutral") and df['volume'].iloc[-1] < df['volume'].rolling(20).mean().iloc[-1] * 0.7
+        return adx_val < 18 and di_spread < 5 and atr_flat and low_volume
+
+    def update_trend_state(self, df, ob):
+        adx_series = compute_adx(df)
+        adx_mom = self.analyze_adx_momentum(adx_series)
+        di_pressure = self.analyze_di_pressure(df)
+        chop = self.is_chop(df)
+        now = time.time()
+        if chop:
+            if self.trend_state != TrendState.CHOP:
+                self.trend_state = TrendState.CHOP
+                self.last_state_change = now
+                self.trend_persistence = 0
+                self.state_confidence = 0.0
             return
-        roe = STATE.get("roe_pct", 0.0)
-        side = STATE.get("side", "?")
-        entry = STATE.get("entry", 0.0)
-        mark = STATE.get("mark_price", 0.0)
-        pnl_usdt = STATE.get("unrealized_pnl_usdt", 0.0)
-        margin = STATE.get("margin", 0.0)
-        sl = STATE.get("synthetic_sl", 0.0)
-        tp1 = STATE.get("synthetic_tp1", 0.0)
-        trail = STATE.get("trail_activated", False)
-        tp1_hit = STATE.get("tp1_hit", False)
-        direction_icon = "🟢" if side == "BUY" else "🔴"
-        roe_color = color_pnl(roe)
-        pnl_color = GREEN if pnl_usdt >= 0 else RED
-        state_str = self.brain.current_trade_state
-        log_msg = (f"{BLUE}[LIVE_MGMT]{RESET} {direction_icon} {STATE['current_symbol']} {side} | "
-                   f"Entry: {entry:.2f} | Mark: {mark:.2f} | ROE: {roe_color} | "
-                   f"PnL: {pnl_color}{pnl_usdt:.2f} USDT{RESET} | Margin: {margin:.2f} | "
-                   f"SL: {sl:.2f} | TP1: {tp1:.2f} | Trail: {'✅' if trail else '❌'} | TP1 Hit: {'✅' if tp1_hit else '❌'} | "
-                   f"State: {state_str}")
-        log_execution(log_msg, "INFO")
+        bullish = (di_pressure["dominant"] == "BUY" and adx_mom["rising"] and adx_mom["state"] in ("HEALTHY", "STRONG"))
+        bearish = (di_pressure["dominant"] == "SELL" and adx_mom["rising"] and adx_mom["state"] in ("HEALTHY", "STRONG"))
+        if bullish and not bearish:
+            target_state = TrendState.BULLISH
+        elif bearish and not bullish:
+            target_state = TrendState.BEARISH
+        else:
+            target_state = TrendState.CHOP
+        if target_state != self.trend_state:
+            if self.trend_state in (TrendState.BULLISH, TrendState.BEARISH):
+                if self.trend_state == TrendState.BULLISH and target_state == TrendState.BEARISH:
+                    self.trend_state = TrendState.PROBATION_BEARISH
+                elif self.trend_state == TrendState.BEARISH and target_state == TrendState.BULLISH:
+                    self.trend_state = TrendState.PROBATION_BULLISH
+                else:
+                    self.trend_state = target_state
+                self.last_state_change = now
+                self.trend_persistence = 0
+                self.state_confidence = 0.3
+            elif self.trend_state in (TrendState.PROBATION_BULLISH, TrendState.PROBATION_BEARISH):
+                if now - self.last_state_change > 3600:
+                    self.trend_state = target_state
+                    self.state_confidence = 0.6
+            else:
+                self.trend_state = target_state
+                self.last_state_change = now
+                self.trend_persistence = 0
+                self.state_confidence = 0.5
+        else:
+            self.trend_persistence += 1
+            self.state_confidence = min(1.0, self.state_confidence + 0.02)
 
-# ========== EXCHANGE POSITION SYNC (UPDATED) ==========
-# (Keep existing functions, but UTMB will use them)
+    def should_enter(self, side, df, ob, atr, price):
+        if self.is_chop(df):
+            return False, "CHOP market"
+        if side == "BUY" and self.trend_state not in (TrendState.BULLISH, TrendState.PROBATION_BULLISH):
+            return False, f"Trend not bullish ({self.trend_state.value})"
+        if side == "SELL" and self.trend_state not in (TrendState.BEARISH, TrendState.PROBATION_BEARISH):
+            return False, f"Trend not bearish ({self.trend_state.value})"
+        pullback = self.analyze_pullback(df, side, atr)
+        if pullback == "REVERSAL":
+            return False, "Strong reversal detected"
+        if pullback == "STRONG_PULLBACK":
+            return False, "Pullback too strong"
+        adx_series = compute_adx(df)
+        adx_mom = self.analyze_adx_momentum(adx_series)
+        if adx_mom["state"] not in ("HEALTHY", "STRONG", "EMERGING"):
+            return False, f"ADX weak ({adx_mom['state']})"
+        di = self.analyze_di_pressure(df)
+        if not di["persistent"] and di["spread"] < 3:
+            return False, "DI not persistent"
+        return True, f"Trend {self.trend_state.value}, Pullback={pullback}"
+
+    def get_trend_health(self, df, side):
+        adx_mom = self.analyze_adx_momentum(compute_adx(df))
+        di = self.analyze_di_pressure(df)
+        health = 5
+        if adx_mom["rising"]: health += 2
+        if adx_mom["state"] == "HEALTHY": health += 1
+        elif adx_mom["state"] == "STRONG": health += 2
+        elif adx_mom["state"] == "EXHAUSTION": health -= 2
+        if di["persistent"]: health += 2
+        if side == "BUY" and di["dominant"] == "BUY": health += 1
+        elif side == "SELL" and di["dominant"] == "SELL": health += 1
+        else: health -= 2
+        return max(0, min(10, health))
+
+    def should_hold(self, df, side, atr, current_roe):
+        pullback = self.analyze_pullback(df, side, atr)
+        adx_mom = self.analyze_adx_momentum(compute_adx(df))
+        di = self.analyze_di_pressure(df)
+        if pullback == "WEAK_PULLBACK" and adx_mom["rising"] and di["persistent"]:
+            return True, "Weak pullback, trend healthy"
+        if adx_mom["value"] > 25 and di["dominant"] == side:
+            return True, f"ADX {adx_mom['value']:.1f} still strong"
+        if current_roe > 3.0 and pullback != "REVERSAL":
+            return True, "High profit, allowing pullback"
+        return False, "Trend weakening"
+
+    def compute_exit_score_live(self, df, side, entry_price, current_price, atr):
+        adx_series = compute_adx(df)
+        adx_mom = self.analyze_adx_momentum(adx_series)
+        di = self.analyze_di_pressure(df)
+        last = df.iloc[-1]
+        di_flip = (side == "BUY" and di["dominant"] == "SELL") or (side == "SELL" and di["dominant"] == "BUY")
+        adx_collapse = adx_mom["value"] < 18 or (adx_mom["slope"] < -2 and adx_mom["state"] in ("HEALTHY", "STRONG"))
+        if side == "SELL":
+            strong_reclaim = current_price > entry_price and current_price > last['open']
+        else:
+            strong_reclaim = current_price < entry_price and current_price < last['open']
+        exhaustion = adx_mom["state"] == "EXHAUSTION" and not adx_mom["rising"]
+        momentum_loss = adx_mom["slope"] < -1 and adx_mom["acceleration"] < 0
+        failed_cont = False
+        if side == "SELL" and last['close'] > last['open']:
+            if last['high'] - last['low'] > atr * 1.2:
+                failed_cont = True
+        elif side == "BUY" and last['close'] < last['open']:
+            if last['high'] - last['low'] > atr * 1.2:
+                failed_cont = True
+        ctx = {"di_flip": di_flip, "adx_collapse": adx_collapse, "strong_reclaim": strong_reclaim,
+               "exhaustion": exhaustion, "htf_opposite": False, "momentum_loss": momentum_loss,
+               "failed_continuation": failed_cont}
+        return self.calculate_exit_score(ctx)
+
+trend_engine = InstitutionalTrendEngine()
+
+# ========== INSTITUTIONAL TRADE BRAIN ==========
+class InstitutionalTradeBrain:
+    def __init__(self):
+        self.state_machine = TradeStateMachine()
+        self.last_update = 0
+        self.current_trade_state = "RANGE_CHOP"
+
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str):
+        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime)
+        self.last_update = time.time()
+        return self.current_trade_state
+
+    def get_trail_multiplier(self) -> float:
+        return self.state_machine.get_trail_multiplier()
+
+    def should_delay_tp1(self) -> bool:
+        return self.state_machine.should_delay_tp1()
+
+    def should_aggressive_profit_lock(self) -> bool:
+        return self.state_machine.should_aggressive_profit_lock()
+
+    def should_hard_exit(self) -> bool:
+        return self.state_machine.should_hard_exit()
+
+    def get_patience_level(self) -> str:
+        return self.state_machine.get_patience_level()
 
 # ========== FIXED: ORDER VERIFICATION HELPER ==========
 def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
@@ -2916,15 +2630,724 @@ def close_position_full():
     finally:
         _closing_in_progress = False
 
-# ========== FIXED: apply_50_50_profit_engine (now a recommendation only) ==========
-# (We have integrated its logic into UTMB._get_ppe_recommendation)
-# The original function is removed to avoid execution.
+# ========== FIXED: apply_50_50_profit_engine without overriding trail_active ==========
+def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
+    if roe_pct is None:
+        return "HOLD", state.get("sl", 0.0), state.get("trail_stop", 0.0)
+    high = df['high'].iloc[-1]
+    low = df['low'].iloc[-1]
+    state["max_price"] = max(state["max_price"], high)
+    state["min_price"] = min(state["min_price"], low)
+    smart = state.get("smart_money", {})
+    mom = state.get("momentum_flow", {})
+    dist_risk = smart.get("distribution_risk", 0)
+    continuation_strength = mom.get("continuation_strength", 50)
+    momentum_health = mom.get("momentum_health", 50)
+    institutional_bias = smart.get("institutional_bias", "NEUTRAL")
+    
+    if dist_risk > 45 and not state.get("profit_lock_activated", False):
+        log_execution("[PPE] Distribution risk >45 – activating profit lock", "WARN")
+        if not state.get("tp1_done", False):
+            close_partial(0.5)
+        state["profit_lock_activated"] = True
+    
+    climax_risk = mom.get("climax_risk", 0)
+    if climax_risk > 50 and state.get("trail_active", False):
+        if not state.get("trail_tightened", False):
+            state["smart_trail_mult"] = max(0.6, state.get("smart_trail_mult", 1.5) * 0.7)
+            state["trail_tightened"] = True
+            log_execution(f"[PPE] Climax risk {climax_risk:.1f} > 50 – tightened trail to {state['smart_trail_mult']:.2f}x", "WARN")
+    
+    if momentum_health < -8 and roe_pct > 2 and not state.get("tp1_hit", False):
+        log_execution("[PPE] Negative momentum health – exiting partial to lock profit", "WARN")
+        close_partial(0.5)
+        state["sl"] = entry
+        return "HOLD", state["sl"], state.get("trail_stop", 0.0)
+    
+    if not state.get("trail_active", False) and roe_pct >= 1.5:
+        state["sl"] = entry
+        if side == "BUY":
+            state["trail_stop"] = price - 1.2 * atr
+        else:
+            state["trail_stop"] = price + 1.2 * atr
+        state["trail_active"] = True
+        log_execution(f"[PPE] {state['symbol']} Stage1: BE SL, trail_active @ 1.2xATR (ROE={roe_pct:.2f}%)", "INFO")
+        return "HOLD", state["sl"], state["trail_stop"]
+    
+    remaining = state.get("remaining_qty", 0)
+    adx_series = compute_adx(df)
+    if not state.get("runner_mode", False) and len(adx_series) > idx:
+        adx_val = adx_series.iloc[idx]
+        if adx_val >= 25:
+            state["runner_mode"] = True
+            log_execution(f"[PPE] {state['symbol']} Stage3: Runner mode activated (ADX={adx_val:.1f})", "INFO")
+    
+    trail_mult = state.get("smart_trail_mult", 1.5)
+    if state.get("trail_active", False):
+        if side == "BUY":
+            new_stop = state["max_price"] - trail_mult * atr
+            if new_stop > state.get("trail_stop", 0):
+                state["trail_stop"] = new_stop
+        else:
+            new_stop = state["min_price"] + trail_mult * atr
+            if new_stop < state.get("trail_stop", float('inf')):
+                state["trail_stop"] = new_stop
+    
+    if state.get("trail_active", False) and state.get("trail_stop", 0):
+        if (side == "BUY" and price <= state["trail_stop"]) or (side == "SELL" and price >= state["trail_stop"]):
+            log_execution(f"[PPE] {state['symbol']} Exit: trailing stop hit at price {price:.4f}", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    if state.get("runner_mode", False) and len(adx_series) >= 2:
+        adx_now = adx_series.iloc[idx]
+        adx_prev = adx_series.iloc[idx-1]
+        last_candle = df.iloc[-1]
+        is_bearish = last_candle['close'] < last_candle['open']
+        is_bullish = last_candle['close'] > last_candle['open']
+        if (side == "BUY" and adx_now < adx_prev and is_bearish) or (side == "SELL" and adx_now < adx_prev and is_bullish):
+            log_execution(f"[PPE] {state['symbol']} Exit: momentum weakness (ADX decreasing)", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    bos_up, bos_down = detect_bos(df, lookback=5)
+    if state.get("runner_mode", False):
+        if (side == "BUY" and bos_down) or (side == "SELL" and bos_up):
+            log_execution(f"[PPE] {state['symbol']} Exit: structure break (BOS)", "WARN")
+            return "EXIT", state["sl"], state["trail_stop"]
+    
+    if mom.get("greed_state", False) and roe_pct > 4 and not state.get("profit_lock_activated", False):
+        log_execution(f"[PPE] Profit lock activated: greed state, ROE={roe_pct:.2f}%", "WARN")
+        if not state.get("tp1_done", False):
+            close_partial(0.5)
+        state["profit_lock_activated"] = True
+    
+    return "HOLD", state["sl"], state["trail_stop"]
 
 # ========== REAL EXCHANGE ORDERS (ONLY ENTRY, PARTIAL, FULL CLOSE) ==========
 # No native SL/TP orders are sent.
 
-# ========== TRADE STATE & PERFORMANCE TRACKING (unchanged) ==========
-# (STATE, TRADE_STATE, PERF already defined)
+# ========== LIVE TRADE MANAGER WITH SYNTHETIC PROTECTION (FIXED) ==========
+class LiveTradeManager:
+    def __init__(self, event_bus, exchange_sync, recovery_guard):
+        self.event_bus = event_bus
+        self.exchange_sync = exchange_sync
+        self.recovery = recovery_guard
+        self.lifecycle_state = TradeLifecycleState.IDLE
+        self.current_snapshot = None
+        self.last_management_ts = 0
+        self.last_log_ts = 0
+        self.last_live_debug_ts = 0
+        self.last_heavy_calc_ts = 0
+        self.last_position_sync_ts = 0
+        self.continuation_pressure_engine = ContinuationPressureEngine()
+        self.thesis_failure_engine = ThesisFailureEngine()
+        self.confidence_engine = ConfidenceEngine()
+        self.regime_classifier = MarketRegimeClassifier()
+        self.brain = InstitutionalTradeBrain()
+        event_bus.subscribe("reconciled", self._on_reconciled)
+        event_bus.subscribe("force_close_local", self._force_close)
+        event_bus.subscribe("lifecycle_change", self._set_lifecycle)
+
+    def _set_lifecycle(self, state):
+        self.lifecycle_state = state
+        log_execution(f"[LIFECYCLE] New state: {state.value}", "INFO")
+        DASHBOARD_STATE["lifecycle_state"] = state.value
+
+    def _on_reconciled(self, snapshot):
+        self.current_snapshot = snapshot
+        DASHBOARD_STATE["live_trade_mode"] = True
+        if self.lifecycle_state == TradeLifecycleState.RECOVERING:
+            self.lifecycle_state = TradeLifecycleState.LIVE
+
+    def _force_close(self, _):
+        if STATE["open"]:
+            close_position_full()
+            self.lifecycle_state = TradeLifecycleState.CLOSED
+            DASHBOARD_STATE["live_trade_mode"] = False
+
+    def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
+        self.lifecycle_state = TradeLifecycleState.OPEN_PENDING_CONFIRMATION
+        self.event_bus.emit("lifecycle_change", TradeLifecycleState.OPEN_PENDING_CONFIRMATION)
+        log_execution(f"[LIFECYCLE] Trade open requested for {symbol} {side}", "INFO")
+
+    def set_entry_atr(self, entry_atr):
+        STATE["entry_atr"] = entry_atr
+        base_sl_mult = 1.6
+        if STATE["side"] == "BUY":
+            STATE["synthetic_sl"] = STATE["entry"] - entry_atr * base_sl_mult
+        else:
+            STATE["synthetic_sl"] = STATE["entry"] + entry_atr * base_sl_mult
+        log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f}", "INFO")
+
+    def _compute_tp1_hold_score(self, smart: dict, momentum: dict, adx: float, adx_slope: float,
+                                 trade_state: str, continuation_eval: ContinuationEvaluation,
+                                 distribution_risk: float, rejection_detected: bool,
+                                 failed_breakout: bool, roe: float) -> int:
+        score = 0
+        if smart.get("smart_money_dominant", False):
+            score += 4
+        banker = smart.get("banker_pressure", 50)
+        retail = smart.get("retailer_pressure", 50)
+        if banker > retail + 10:
+            score += 3
+        cont_strength = momentum.get("continuation_strength", 0)
+        if cont_strength > 70:
+            score += 4
+        mom_health = momentum.get("momentum_health", 50)
+        if mom_health > 65:
+            score += 2
+        if momentum.get("trend_expansion", False):
+            score += 3
+        if continuation_eval.continuation_probability > 0.75:
+            score += 3
+        if trade_state in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK"):
+            score += 3
+        if adx > 25 and adx_slope > 0:
+            score += 2
+        if momentum.get("exhaustion_risk", 0) > 50:
+            score -= 5
+        if momentum.get("climax_risk", 0) > 60:
+            score -= 4
+        if distribution_risk > 45:
+            score -= 6
+        if smart.get("retail_euphoria", False):
+            score -= 3
+        if momentum.get("momentum_decay", False):
+            score -= 4
+        if trade_state in ("PROFIT_DEFENSE", "DISTRIBUTION", "LIQUIDITY_EXHAUSTION", "MOMENTUM_COLLAPSE"):
+            score -= 5
+        if failed_breakout:
+            score -= 5
+        if rejection_detected:
+            score -= 4
+        if continuation_eval.continuation_probability < 0.45:
+            score -= 5
+        if roe > 80:
+            score -= 8
+        elif roe > 50:
+            score -= 4
+        elif roe > 20:
+            score -= 2
+        return max(0, min(20, score))
+
+    def _compute_institutional_exit_warning(self, smart: dict, momentum: dict,
+                                             distribution_risk: float, continuation_prob: float,
+                                             rejection_detected: bool, adx_slope: float,
+                                             di_spread_change: float) -> int:
+        warning = 0
+        if smart.get("banker_pressure", 50) < 45:
+            warning += 1
+        if smart.get("retailer_pressure", 50) > 60:
+            warning += 1
+        if distribution_risk > 50:
+            warning += 2
+        if momentum.get("exhaustion_risk", 0) > 60:
+            warning += 1
+        if momentum.get("climax_risk", 0) > 70:
+            warning += 1
+        if momentum.get("momentum_decay", False):
+            warning += 2
+        if continuation_prob < 0.5:
+            warning += 1
+        if rejection_detected:
+            warning += 1
+        if adx_slope < -2:
+            warning += 1
+        if di_spread_change < -5:
+            warning += 1
+        return min(5, warning)
+
+    def _apply_runner_defense(self, roe: float, peak_roe: float, drawdown: float,
+                               exit_warning: int, continuation_prob: float,
+                               trail_mult: float) -> float:
+        mult = trail_mult
+        if STATE.get("tp1_hit", False):
+            mult *= 0.9
+            if roe > 50:
+                mult *= 0.85
+            if drawdown > 12:
+                mult *= 0.7
+            if exit_warning >= 3:
+                mult *= 0.6
+            if continuation_prob < 0.55:
+                mult *= 0.8
+        return max(0.5, min(4.0, mult))
+
+    def _update_peak_profit(self, roe: float, price: float):
+        if roe > STATE.get("peak_roe", 0.0):
+            STATE["peak_roe"] = roe
+            STATE["peak_price"] = price
+            STATE["peak_unrealized_pnl"] = STATE.get("unrealized_pnl_usdt", 0.0)
+        peak = STATE.get("peak_roe", roe)
+        if peak > 0:
+            drawdown = peak - roe
+            STATE["drawdown_from_peak"] = max(0.0, drawdown)
+        else:
+            STATE["drawdown_from_peak"] = 0.0
+
+    def manage_live_trade(self):
+        if not (STATE.get("open") and STATE.get("current_symbol")):
+            if self.lifecycle_state not in (TradeLifecycleState.IDLE, TradeLifecycleState.CLOSED):
+                self.lifecycle_state = TradeLifecycleState.IDLE
+                DASHBOARD_STATE["live_trade_mode"] = False
+            return
+        now = time.time()
+        roe = STATE.get("roe_pct", 0.0)
+        adx = STATE.get("adx_live", 20.0)
+        calm_conditions = abs(roe) < 1.5 and 18 < adx < 30
+        target_interval = 5 if calm_conditions else 2
+        if now - self.last_management_ts < target_interval:
+            return
+        self.last_management_ts = now
+        symbol = STATE["current_symbol"]
+        with _TRADE_LOCK:
+            if now - self.last_position_sync_ts >= 10:
+                self.exchange_sync.reconcile(symbol, STATE)
+                self.last_position_sync_ts = now
+            self._apply_management(symbol, now)
+        self._log_live_status()
+
+    def _log_live_status(self):
+        now = time.time()
+        if now - self.last_log_ts < 5:
+            return
+        if not STATE.get("open"):
+            return
+        roe = STATE.get("roe_pct", 0.0)
+        side = STATE.get("side", "?")
+        entry = STATE.get("entry", 0.0)
+        mark = STATE.get("mark_price", 0.0)
+        pnl_usdt = STATE.get("unrealized_pnl_usdt", 0.0)
+        margin = STATE.get("margin", 0.0)
+        sl = STATE.get("synthetic_sl", 0.0)
+        tp1 = STATE.get("synthetic_tp1", 0.0)
+        trail = STATE.get("trail_activated", False)
+        tp1_hit = STATE.get("tp1_hit", False)
+        direction_icon = "🟢" if side == "BUY" else "🔴"
+        roe_color = color_pnl(roe)
+        pnl_color = GREEN if pnl_usdt >= 0 else RED
+        state_str = self.brain.current_trade_state
+        log_msg = (f"{BLUE}[LIVE_MGMT]{RESET} {direction_icon} {STATE['current_symbol']} {side} | "
+                   f"Entry: {entry:.2f} | Mark: {mark:.2f} | ROE: {roe_color} | "
+                   f"PnL: {pnl_color}{pnl_usdt:.2f} USDT{RESET} | Margin: {margin:.2f} | "
+                   f"SL: {sl:.2f} | TP1: {tp1:.2f} | Trail: {'✅' if trail else '❌'} | TP1 Hit: {'✅' if tp1_hit else '❌'} | "
+                   f"State: {state_str}")
+        log_execution(log_msg, "INFO")
+
+    def _apply_management(self, symbol, now):
+        if not STATE.get("open"):
+            return
+        if self.lifecycle_state != TradeLifecycleState.LIVE:
+            return
+
+        df_closed = get_ohlcv_safe(symbol, 50)
+        if df_closed is None:
+            return
+        mark_price = STATE.get("mark_price", get_ticker_safe(symbol))
+        if not mark_price:
+            return
+
+        df_live = get_live_hybrid_df(symbol, df_closed, mark_price)
+        atr = compute_atr(df_live).iloc[-1] if len(df_live) > 14 else mark_price * 0.01
+        side = STATE["side"]
+        entry = STATE["entry"]
+        roe = STATE.get("roe_pct", 0.0)
+
+        self._update_peak_profit(roe, mark_price)
+
+        ob = None
+
+        if now - self.last_heavy_calc_ts >= 5:
+            plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
+            if plus_di is None: plus_di = 20.0
+            if minus_di is None: minus_di = 20.0
+            if adx_now is None: adx_now = 20.0
+            if adx_slope is None: adx_slope = 0.0
+
+            pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
+            weak_pullback = (pullback_type == "WEAK_PULLBACK")
+            counter_displacement = 0.0
+            last_candle = df_live.iloc[-1]
+            if side == "SELL" and last_candle['close'] > last_candle['open']:
+                body = abs(last_candle['close'] - last_candle['open'])
+                if body > atr * 0.6:
+                    counter_displacement = body / atr
+            elif side == "BUY" and last_candle['close'] < last_candle['open']:
+                body = abs(last_candle['close'] - last_candle['open'])
+                if body > atr * 0.6:
+                    counter_displacement = body / atr
+            volume_ratio = df_live['volume'].iloc[-1] / df_live['volume'].iloc[-10:-1].mean() if len(df_live) >= 10 else 1.0
+            trend_health = trend_engine.get_trend_health(df_live, side)
+            struct_shift = detect_structure_shift(df_live)
+            structure_aligned = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
+            market_state = {
+                "atr": atr,
+                "adx": adx_now,
+                "adx_slope": adx_slope,
+                "di_plus": plus_di,
+                "di_minus": minus_di,
+                "trend_health": trend_health,
+                "weak_pullback": weak_pullback,
+                "counter_displacement": counter_displacement,
+                "volume_ratio": volume_ratio,
+                "df": df_live,
+                "last_candle": last_candle,
+                "structure_aligned": structure_aligned,
+                "continuation_pressure": 50
+            }
+
+            smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
+            momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
+
+            regime = self.regime_classifier.classify(df_live, ob)
+            trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
+            STATE["trade_state"] = trade_state
+            STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
+            STATE["delay_tp1"] = self.brain.should_delay_tp1()
+            STATE["adx_live"] = adx_now
+            STATE["di_plus_live"] = plus_di
+            STATE["di_minus_live"] = minus_di
+            STATE["smart_money"] = smart_money
+            STATE["momentum_flow"] = momentum
+            STATE["market_regime"] = regime
+
+            thesis_dict = STATE.get("trade_thesis", {})
+            cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
+            market_state["continuation_pressure"] = cont_pressure_score
+            continuation_eval = _continuation_engine.evaluate(side, df_live, market_state, thesis_dict)
+            STATE["continuation_probability"] = continuation_eval.continuation_probability
+            STATE["hold_quality"] = continuation_eval.hold_quality
+            STATE["counter_pressure"] = continuation_eval.counter_pressure
+            STATE["reclaim_risk"] = continuation_eval.reclaim_risk
+            STATE["trend_strength"] = continuation_eval.trend_strength
+            STATE["continuation_reasons"] = continuation_eval.reasons
+            STATE["continuation_pressure"] = cont_pressure_score
+
+            failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
+            STATE["thesis_failure_score"] = failure_score
+            if failed:
+                log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
+                if roe > 0:
+                    close_partial(0.5)
+                    STATE["synthetic_sl"] = entry
+                else:
+                    close_position_full()
+                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    return
+
+            old_conf = STATE.get("current_confidence", 50.0)
+            di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
+            new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
+            new_conf = ConfidenceEngine.apply_institutional_modifiers(new_conf, smart_money, momentum, continuation_eval.continuation_probability * 100)
+            STATE["current_confidence"] = new_conf
+            STATE["prev_di_spread"] = plus_di - minus_di
+
+            rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
+            rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
+            rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
+            failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
+
+            tp1_hold_score = self._compute_tp1_hold_score(
+                smart_money, momentum, adx_now, adx_slope, trade_state,
+                continuation_eval, smart_money.get("distribution_risk", 0),
+                rejection_detected, failed_breakout, roe
+            )
+            STATE["tp1_hold_score"] = tp1_hold_score
+
+            exit_warning = self._compute_institutional_exit_warning(
+                smart_money, momentum, smart_money.get("distribution_risk", 0),
+                continuation_eval.continuation_probability, rejection_detected,
+                adx_slope, di_spread_change
+            )
+            STATE["exit_warning"] = exit_warning
+
+            self.last_heavy_calc_ts = now
+        else:
+            adx_now = STATE.get("adx_live", 20.0)
+            plus_di = STATE.get("di_plus_live", 20.0)
+            minus_di = STATE.get("di_minus_live", 20.0)
+            smart_money = STATE.get("smart_money", {})
+            momentum = STATE.get("momentum_flow", {})
+            trade_state = STATE.get("trade_state", "RANGE_CHOP")
+            continuation_eval = ContinuationEvaluation(
+                continuation_probability=STATE.get("continuation_probability", 0.5),
+                trend_strength=STATE.get("trend_strength", 0.5),
+                exhaustion_probability=0.0,
+                reclaim_risk=STATE.get("reclaim_risk", 0.0),
+                counter_pressure=STATE.get("counter_pressure", 0.0),
+                confidence=0.5,
+                reasons=STATE.get("continuation_reasons", []),
+                should_hold=STATE.get("continuation_probability", 0.5) >= 0.62,
+                hold_quality=STATE.get("hold_quality", "UNKNOWN")
+            )
+            tp1_hold_score = STATE.get("tp1_hold_score", 10)
+            exit_warning = STATE.get("exit_warning", 0)
+
+        if now - self.last_live_debug_ts >= 5:
+            self.last_live_debug_ts = now
+            log_execution(
+                f"[LIVE_DEBUG] {symbol} | ADX={adx_now:.1f} | DI+={plus_di:.1f} | DI-={minus_di:.1f} | "
+                f"ContProb={continuation_eval.continuation_probability:.2f} | MomHealth={momentum.get('momentum_health', 50):.1f} | "
+                f"DistRisk={smart_money.get('distribution_risk', 0):.1f} | TradeState={trade_state} | "
+                f"TrailMult={self.brain.get_trail_multiplier():.2f} | TP1Delay={self.brain.should_delay_tp1()} | "
+                f"TrailActive={STATE.get('trail_activated', False)} | SyntheticSL={STATE.get('synthetic_sl', 0):.4f} | ROE={roe:.2f}% | "
+                f"TP1HoldScore={tp1_hold_score} | ExitWarning={exit_warning}",
+                "INFO"
+            )
+
+        if self.brain.should_aggressive_profit_lock() and not STATE.get("profit_lock_activated", False):
+            log_execution(f"[PROFIT_LOCK] Aggressive profit lock triggered (state={trade_state})", "WARN")
+            if not STATE.get("tp1_hit", False):
+                close_partial(0.5)
+                STATE["tp1_hit"] = True
+                STATE["runner_mode"] = True
+            STATE["profit_lock_activated"] = True
+
+        if self.brain.should_hard_exit():
+            log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
+
+        entry_atr = STATE.get("entry_atr", atr)
+        base_sl_mult = 1.6
+        if smart_money.get("distribution_risk", 0) > 45:
+            base_sl_mult = 1.2
+        elif smart_money.get("distribution_risk", 0) > 65:
+            base_sl_mult = 0.8
+        if side == "BUY":
+            synthetic_sl = entry - entry_atr * base_sl_mult
+            if STATE.get("tp1_hit", False):
+                synthetic_sl = max(synthetic_sl, entry)
+        else:
+            synthetic_sl = entry + entry_atr * base_sl_mult
+            if STATE.get("tp1_hit", False):
+                synthetic_sl = min(synthetic_sl, entry)
+        STATE["synthetic_sl"] = synthetic_sl
+
+        if (side == "BUY" and mark_price <= synthetic_sl) or (side == "SELL" and mark_price >= synthetic_sl):
+            log_execution(f"[SYNTHETIC_SL] Hit at {mark_price:.4f} (SL={synthetic_sl:.4f})", "WARN")
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
+
+        if not STATE.get("tp1_hit", False):
+            if tp1_hold_score >= 8:
+                log_execution(f"[TP1_DELAY] Hold score {tp1_hold_score} >= 8, delaying TP1", "INFO")
+                tp1_price = entry * (1 + 0.04) if side == "BUY" else entry * (1 - 0.04)
+                STATE["synthetic_tp1"] = tp1_price
+            else:
+                log_execution(f"[TP1_EXECUTE] Hold score {tp1_hold_score} < 8, executing TP1 partial close", "SUCCESS")
+                close_partial(0.5)
+                STATE["tp1_hit"] = True
+                STATE["synthetic_sl"] = entry
+                tg_tp_hit(symbol, 1, roe)
+                STATE["runner_mode"] = True
+                STATE["trail_activated"] = True
+                self._update_peak_profit(roe, mark_price)
+
+        if STATE.get("tp1_hit", False):
+            peak_roe = STATE.get("peak_roe", roe)
+            drawdown = STATE.get("drawdown_from_peak", 0.0)
+            base_trail_mult = self.brain.get_trail_multiplier()
+            adjusted_mult = self._apply_runner_defense(roe, peak_roe, drawdown, exit_warning,
+                                                        continuation_eval.continuation_probability,
+                                                        base_trail_mult)
+            STATE["smart_trail_mult"] = adjusted_mult
+
+            tp2_pct = 0.05
+            if continuation_eval.continuation_probability > 0.8:
+                tp2_pct = 0.08
+            tp2_price = entry * (1 + tp2_pct) if side == "BUY" else entry * (1 - tp2_pct)
+            STATE["tp2_price"] = tp2_price
+            if not STATE.get("tp2_hit", False):
+                if (side == "BUY" and mark_price >= tp2_price) or (side == "SELL" and mark_price <= tp2_price):
+                    log_execution(f"[SYNTHETIC_TP2] Hit at {mark_price:.4f}", "SUCCESS")
+                    close_position_full()
+                    STATE["tp2_hit"] = True
+                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    return
+
+        trail_mult = STATE.get("smart_trail_mult", 1.5)
+        if smart_money.get("distribution_risk", 0) > 45:
+            trail_mult *= 0.7
+        if momentum.get("momentum_health", 50) < 30:
+            trail_mult *= 0.8
+        if continuation_eval.continuation_probability > 0.8:
+            trail_mult *= 1.2
+        trail_mult = max(0.5, min(4.5, trail_mult))
+
+        if roe > 1.5:
+            if not STATE.get("trail_activated", False):
+                STATE["trail_activated"] = True
+                STATE["trail_stop"] = synthetic_sl
+                log_execution(f"[TRAIL] Activated with multiplier {trail_mult}", "INFO")
+            if side == "BUY":
+                new_trail = mark_price - trail_mult * atr
+                if new_trail > STATE.get("trail_stop", 0):
+                    STATE["trail_stop"] = new_trail
+            else:
+                new_trail = mark_price + trail_mult * atr
+                if new_trail < STATE.get("trail_stop", float('inf')):
+                    STATE["trail_stop"] = new_trail
+            if (side == "BUY" and mark_price <= STATE.get("trail_stop", 0)) or (side == "SELL" and mark_price >= STATE.get("trail_stop", float('inf'))):
+                log_execution(f"[TRAIL] Stop hit at {mark_price:.4f} (trail={STATE['trail_stop']:.4f})", "WARN")
+                close_position_full()
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
+        else:
+            pass
+
+        if USE_PPE:
+            state_ppe = {
+                "symbol": symbol,
+                "trail_active": STATE.get("trail_activated", False),
+                "tp1_done": STATE.get("tp1_hit", False),
+                "tp1_hit": STATE.get("tp1_hit", False),
+                "runner_mode": STATE.get("runner_mode", False),
+                "max_price": STATE.get("max_price", entry),
+                "min_price": STATE.get("min_price", entry),
+                "sl": STATE.get("synthetic_sl", 0.0),
+                "trail_stop": STATE.get("trail_stop", 0.0),
+                "remaining_qty": STATE.get("remaining_qty", STATE["qty"]),
+                "smart_trail_mult": trail_mult,
+                "smart_money": smart_money,
+                "momentum_flow": momentum,
+                "profit_lock_activated": STATE.get("profit_lock_activated", False),
+                "trail_tightened": STATE.get("trail_tightened", False)
+            }
+            idx = len(df_live) - 1
+            action, new_sl, new_trail = apply_50_50_profit_engine(
+                df_live, idx, mark_price, atr, side, entry, state_ppe, roe, trade_state=trade_state
+            )
+            STATE["synthetic_sl"] = new_sl
+            STATE["trail_stop"] = new_trail
+            if state_ppe.get("trail_active", False):
+                STATE["trail_activated"] = state_ppe["trail_active"]
+            if state_ppe.get("tp1_hit", False):
+                STATE["tp1_hit"] = state_ppe["tp1_hit"]
+            if state_ppe.get("runner_mode", False):
+                STATE["runner_mode"] = state_ppe["runner_mode"]
+            STATE["max_price"] = state_ppe["max_price"]
+            STATE["min_price"] = state_ppe["min_price"]
+            if state_ppe.get("profit_lock_activated", False):
+                STATE["profit_lock_activated"] = state_ppe["profit_lock_activated"]
+            STATE["trail_tightened"] = state_ppe["trail_tightened"]
+            TRADE_STATE["trail_on"] = STATE["trail_activated"]
+            TRADE_STATE["tp1_hit"] = STATE["tp1_hit"]
+            if action == "EXIT":
+                close_position_full()
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
+
+        if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
+            close_position_full()
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            DASHBOARD_STATE["live_trade_mode"] = False
+            return
+
+_event_bus = EventBus()
+_exchange_sync = ExchangeSyncService(_event_bus)
+_recovery_guard = RecoveryGuard(_event_bus, _exchange_sync)
+_live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
+
+def sync_position_state(symbol=None):
+    if PAPER_MODE:
+        if STATE.get("open"):
+            price = get_ticker_safe(STATE["current_symbol"])
+            if price:
+                raw_pnl = (price - STATE["entry"])/STATE["entry"]*100 if STATE["side"]=="BUY" else (STATE["entry"]-price)/STATE["entry"]*100
+                roe_pct = raw_pnl * LEVERAGE
+                STATE["roe_pct"] = roe_pct
+                STATE["mark_price"] = price
+                STATE["unrealized_pnl_usdt"] = (price - STATE["entry"]) * STATE["qty"] if STATE["side"]=="BUY" else (STATE["entry"] - price) * STATE["qty"]
+                return price, 0.0, 0.0, roe_pct
+        return None, None, None, None
+
+    if not symbol and STATE.get("open"):
+        symbol = STATE["current_symbol"]
+    if not symbol:
+        return None, None, None, None
+
+    snap = _exchange_sync.fetch_live_snapshot(symbol)
+    if snap is None:
+        if STATE.get("open"):
+            log_execution(f"[POS_SYNC] Position closed externally on {symbol}, cleaning state", "WARN")
+            with _TRADE_LOCK:
+                STATE["open"] = False
+                TRADE_STATE["in_position"] = False
+                _live_manager.lifecycle_state = TradeLifecycleState.CLOSED
+                DASHBOARD_STATE["live_trade_mode"] = False
+        return None, None, None, None
+
+    with _TRADE_LOCK:
+        if not STATE.get("open"):
+            STATE["open"] = True
+            STATE["side"] = snap.side
+            STATE["entry"] = snap.entry_price
+            STATE["qty"] = snap.qty
+            STATE["remaining_qty"] = snap.qty
+            STATE["current_symbol"] = symbol
+            STATE["entry_time"] = time.time()
+            TRADE_STATE.update({
+                "in_position": True,
+                "symbol": symbol,
+                "side": snap.side,
+                "entry": snap.entry_price,
+                "qty": snap.qty,
+                "last_update_ts": time.time()
+            })
+            _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty, 0.0, 0.0, 0.0)
+        else:
+            STATE["entry"] = snap.entry_price
+            STATE["qty"] = snap.qty
+            STATE["remaining_qty"] = snap.qty
+            STATE["side"] = snap.side
+            TRADE_STATE.update({
+                "entry": snap.entry_price,
+                "qty": snap.qty,
+                "side": snap.side
+            })
+
+        STATE["margin"] = snap.margin
+        STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
+        STATE["roe_pct"] = snap.roe_pct
+        STATE["leverage"] = snap.leverage
+        STATE["mark_price"] = snap.mark_price
+        STATE["liquidation_price"] = snap.liquidation_price
+
+    return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
+
+def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
+    if PAPER_MODE:
+        return 0.0, 0.0
+    try:
+        sym = normalize_symbol(symbol)
+        since = int((time.time() - lookback_seconds) * 1000)
+        trades = safe_api_call(ex.fetch_my_trades, sym, limit=100, params={'since': since})
+        if not trades:
+            return 0.0, 0.0
+        pnl_usdt = 0.0
+        for trade in trades:
+            side = trade['side'].lower()
+            qty = trade['amount']
+            price = trade['price']
+            cost = qty * price
+            if side == 'buy':
+                pnl_usdt -= cost
+            else:
+                pnl_usdt += cost
+        balance = get_balance_safe()
+        pnl_pct = (pnl_usdt / balance * 100) if balance > 0 else 0.0
+        return pnl_usdt, pnl_pct
+    except Exception as e:
+        log_execution(f"[REALIZED_PNL] Error: {e}", "WARN")
+        return 0.0, 0.0
 
 # ========== INDICATORS ==========
 def rma(series, period):
@@ -5578,8 +6001,22 @@ def scaling_logic(symbol, df, ind):
     return False
 
 def council_exit(df, price):
-    # This function is now deprecated; UTMB handles exits.
-    # We keep a stub for compatibility but it does nothing.
+    adx_series = compute_adx(df)
+    adx = adx_series.iloc[-1] if adx_series is not None else 0
+    if adx < 18:
+        log_execution(f"Exit: ADX dropped to {adx:.1f}", "WARN")
+        close_position_full()
+        return True
+    if STATE["side"] == "BUY" and price < STATE.get("synthetic_sl", 0):
+        log_execution(f"Stop loss hit at {price:.4f}", "WARN")
+        tg_sl_hit(STATE["current_symbol"], (price - STATE["entry"])/STATE["entry"]*100 if STATE["side"]=="BUY" else (STATE["entry"]-price)/STATE["entry"]*100)
+        close_position_full()
+        return True
+    elif STATE["side"] == "SELL" and price > STATE.get("synthetic_sl", 0):
+        log_execution(f"Stop loss hit at {price:.4f}", "WARN")
+        tg_sl_hit(STATE["current_symbol"], (STATE["entry"]-price)/STATE["entry"]*100)
+        close_position_full()
+        return True
     return False
 
 def update_pnl_and_learning(pnl_pct):
@@ -8773,10 +9210,16 @@ def main_loop_sniper():
                 if price and price > 0:
                     df = get_ohlcv_safe(sym, 50)
                     if df is not None:
-                        # Old council_exit removed, UTMB handles exits
-                        # No direct close here
-                        pass
-                    # ... (other logic like scaling)
+                        if council_exit(df, price):
+                            finalize_trade_with_reality(sym)
+                            clear_position_dashboard()
+                            STATE["open"] = False
+                            TRADE_STATE["in_position"] = False
+                            continue
+                        atr = compute_atr(df).iloc[-1]
+                        scaling_logic(sym, df, None)
+                        current_pnl = STATE.get("roe_pct", 0.0)
+                        update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
             if emergency_kill_switch_active():
                 if STATE["open"]:
                     close_position_full()
