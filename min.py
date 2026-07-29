@@ -8044,9 +8044,12 @@ function updateUI(d) {{
             document.getElementById("intent-vol-ctx").innerText = ie.details.volume_score || "-";
             document.getElementById("intent-narr").innerText = ie.details.narrative || "-";
             if (ie.details.regime_weights) {{
-                let w = ie.details.regime_weights;
-                let wStr = `Liq:${w.liquidity} Abs:${w.absorption} Vol:${w.volatility} Fl:${w.institutional_flow} Struct:${w.structure} Mom:${w.momentum} VolCtx:${w.volume} Narr:${w.narrative}`;
-                document.getElementById("intent-weights").innerText = wStr;
+                const w = ie.details.regime_weights;
+                // Fixed: use `w` safely
+                if (w) {{
+                    let wStr = `Liq:${w.liquidity} Abs:${w.absorption} Vol:${w.volatility} Fl:${w.institutional_flow} Struct:${w.structure} Mom:${w.momentum} VolCtx:${w.volume} Narr:${w.narrative}`;
+                    document.getElementById("intent-weights").innerText = wStr;
+                }}
             }}
         }}
     }}
