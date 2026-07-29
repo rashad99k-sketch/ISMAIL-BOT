@@ -40,6 +40,14 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+# ========== ENUM FOR TRADE LIFECYCLE ==========
+class TradeLifecycleState(Enum):
+    IDLE = "IDLE"
+    OPEN_PENDING_CONFIRMATION = "OPEN_PENDING_CONFIRMATION"
+    LIVE = "LIVE"
+    RECOVERING = "RECOVERING"
+    CLOSED = "CLOSED"
+
 # ========== FALLBACK LOGGING ==========
 if 'log_execution' not in dir():
     def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
