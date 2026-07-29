@@ -6094,6 +6094,25 @@ def radar_score(df):
         score += 2
     return score
 
+# ===== NEW: Store Intent for Symbol =====
+def store_intent_for_symbol(symbol):
+    """Fetch OHLCV and orderbook, run InstitutionalIntentEngine.detect, store in MEMORY."""
+    try:
+        df = get_ohlcv_safe(symbol, 100)
+        if df is None or not validate_dataframe(df, 30):
+            return
+        ob = get_orderbook_cached(symbol, limit=10)
+        intent_score, intent_status, intent_details = InstitutionalIntentEngine.detect(df, ob, symbol)
+        if intent_score >= 0:
+            MEMORY[f"intent_{symbol}"] = {
+                "score": intent_score,
+                "status": intent_status,
+                "details": intent_details
+            }
+            log_execution(f"[INTENT] Stored for {symbol}: score={intent_score}, status={intent_status}", "INFO", debounce_key=f"intent_store_{symbol}", debounce_sec=60)
+    except Exception as e:
+        log_execution(f"[INTENT_STORE] Error for {symbol}: {e}", "WARN")
+
 def rebuild_radar_watchlist():
     symbols = get_usdt_perp_symbols()
     candidates = []
@@ -6105,6 +6124,8 @@ def rebuild_radar_watchlist():
             score = radar_score(df)
             if score > 0:
                 candidates.append({"symbol": sym, "score": score})
+                # Store intent for this symbol
+                store_intent_for_symbol(sym)
         except Exception:
             continue
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -6124,6 +6145,8 @@ def refresh_radar_watchlist():
             score = radar_score(df)
             if score > 0:
                 updated.append({"symbol": sym, "score": score})
+                # Refresh intent
+                store_intent_for_symbol(sym)
         except Exception:
             continue
     updated.sort(key=lambda x: x["score"], reverse=True)
@@ -7179,8 +7202,10 @@ def global_discovery_scan():
     buy, sell = smart_scanner_v2()
     for b in buy[:5]:
         candidates.append({"symbol": b["symbol"], "score": b["score"], "side": "BUY", "source": "scanner_v2"})
+        store_intent_for_symbol(b["symbol"])
     for s in sell[:5]:
         candidates.append({"symbol": s["symbol"], "score": s["score"], "side": "SELL", "source": "scanner_v2"})
+        store_intent_for_symbol(s["symbol"])
 
     # 2. RF Scanner
     rf_candidates = scan_market_rf(top_n=20)
@@ -7188,13 +7213,14 @@ def global_discovery_scan():
         side = r.get("rf_signal")
         if side in ("BUY", "SELL"):
             candidates.append({"symbol": r["symbol"], "score": r["score"]*10, "side": side, "source": "rf"})
+            store_intent_for_symbol(r["symbol"])
 
     # 3. Fresh Liquidity Radar
     fresh = FreshLiquidityRadar.scan(all_symbols, limit=15)
     for f in fresh:
-        # determine side based on momentum? For now we assign both sides
         candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "BUY", "source": "fresh"})
         candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "SELL", "source": "fresh"})
+        store_intent_for_symbol(f["symbol"])
 
     # 4. Random discovery (10% of symbols)
     random.shuffle(all_symbols)
@@ -7202,6 +7228,7 @@ def global_discovery_scan():
         if not any(c["symbol"] == sym for c in candidates):
             candidates.append({"symbol": sym, "score": 0, "side": "BUY", "source": "random"})
             candidates.append({"symbol": sym, "score": 0, "side": "SELL", "source": "random"})
+            store_intent_for_symbol(sym)
 
     # Sort by score, keep top 40
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -7211,8 +7238,6 @@ def global_discovery_scan():
     for item in top_candidates:
         sym = item["symbol"]
         side = item["side"]
-        # Use existing record_watchlist_entry to add/update
-        # we need a narrative dict; we can create a minimal one
         narrative = {
             "sweep": False,
             "choch_bos": False,
@@ -7222,13 +7247,6 @@ def global_discovery_scan():
             "volume_confirmation": False,
             "rf_alignment": False
         }
-        # We don't have full narrative, just assign a basic score
-        # Let's call record_watchlist_entry with dummy narrative
-        # But we want to preserve existing entries; better to update only if new score is higher
-        existing = MEMORY.get("watchlist", {}).get(sym)
-        if existing and existing.get("score", 0) >= item["score"]:
-            continue
-        # Build a simple narrative based on source
         if item["source"] == "scanner_v2":
             narrative["sweep"] = True
         elif item["source"] == "rf":
@@ -7236,6 +7254,8 @@ def global_discovery_scan():
         elif item["source"] == "fresh":
             narrative["volume_confirmation"] = True
         record_watchlist_entry(sym, side, narrative, item["score"])
+        # Already stored intent above; but ensure it's stored for all
+        store_intent_for_symbol(sym)
 
     # Also update radar_top5 for compatibility
     radar_top = [{"symbol": c["symbol"], "score": c["score"]} for c in top_candidates[:5]]
@@ -8055,13 +8075,13 @@ function updateUI(d) {{
     // === NEW: Dynamic Trade Management ===
     if (d.dynamic_trade) {{
         const dt = d.dynamic_trade;
-        document.getElementById("dyn-roe").innerHTML = dt.roe?.toFixed(2) + "%" || "-";
+        document.getElementById("dyn-roe").innerHTML = dt.roe?.toFixed(2) + "%" || "0.00%";
         document.getElementById("dyn-trail").innerHTML = dt.trailing_active ? "✅" : "❌";
         document.getElementById("dyn-tp1").innerHTML = dt.tp1_hit ? "✅" : "❌";
         document.getElementById("dyn-tp2").innerHTML = dt.tp2_hit ? "✅" : "❌";
         document.getElementById("dyn-runner").innerHTML = dt.runner_active ? "✅" : "❌";
         document.getElementById("dyn-dd").innerHTML = dt.drawdown?.toFixed(1) + "%" || "0.0%";
-        document.getElementById("dyn-lifecycle").innerText = dt.lifecycle || "-";
+        document.getElementById("dyn-lifecycle").innerText = dt.lifecycle || "N/A";
     }}
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
@@ -8210,15 +8230,26 @@ def data():
 
         # --- NEW: Intent Engine data ---
         intent_data = {}
-        current_symbol = STATE.get("current_symbol")
-        if current_symbol:
-            intent_data = MEMORY.get(f"intent_{current_symbol}", {})
-        else:
-            # show first available intent
-            for key, val in MEMORY.items():
-                if key.startswith("intent_"):
-                    intent_data = val
-                    break
+        # Get current symbol or first radar symbol
+        target_symbol = STATE.get("current_symbol")
+        if not target_symbol:
+            # pick first from radar_top5 or default
+            radar = MEMORY.get("radar_top5", [])
+            if radar:
+                target_symbol = radar[0].get("symbol")
+            else:
+                target_symbol = DEFAULT_SYMBOL
+
+        # Retrieve stored intent for that symbol
+        if target_symbol:
+            intent_data = MEMORY.get(f"intent_{target_symbol}", {})
+            # If no data, try to compute on the fly
+            if not intent_data:
+                store_intent_for_symbol(target_symbol)
+                intent_data = MEMORY.get(f"intent_{target_symbol}", {})
+        # Fallback: if still empty, show a neutral placeholder
+        if not intent_data:
+            intent_data = {"score": 0, "status": "NEUTRAL", "details": {}}
 
         # --- NEW: Dynamic Trade data ---
         dynamic_trade_data = {}
@@ -8232,6 +8263,17 @@ def data():
                 "runner_active": mgr.runner_active,
                 "drawdown": mgr.drawdown,
                 "lifecycle": mgr.lifecycle
+            }
+        else:
+            # No trade: default values
+            dynamic_trade_data = {
+                "roe": 0.0,
+                "trailing_active": False,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "runner_active": False,
+                "drawdown": 0.0,
+                "lifecycle": "N/A"
             }
 
         payload = {
