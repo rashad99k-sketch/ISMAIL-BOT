@@ -650,7 +650,7 @@ class WatchlistPriorityManager:
         MEMORY["watchlist"] = dict(sorted_watch)
 
 
-# ========== TRADE STATE MACHINE (unchanged) ==========
+# ========== TRADE STATE MACHINE ==========
 class TradeStateMachine:
     STATES = {
         "ACCUMULATION": 0,
@@ -671,6 +671,10 @@ class TradeStateMachine:
         self.current_state = "RANGE_CHOP"
         self.last_state_change = 0
         self.state_confidence = 0.0
+
+    @property
+    def current_trade_state(self):
+        return self.current_state
 
     def update(self, smart: dict, momentum: dict, adx: float, regime: str) -> str:
         banker = smart.get("banker_pressure", 50)
@@ -2039,7 +2043,7 @@ class UnifiedTradeManagementBrain:
         self.exchange_sync = exchange_sync
         self.recovery_guard = recovery_guard
         self.event_bus = event_bus
-        self.brain = InstitutionalTradeBrain()
+        self.brain = TradeStateMachine()
         self.last_eval = 0
         self.peak_roe = 0.0
         self.peak_price = 0.0
@@ -2638,7 +2642,7 @@ class LiveTradeManager:
         self.last_live_debug_ts = 0
         self.last_heavy_calc_ts = 0
         self.last_position_sync_ts = 0
-        self.brain = InstitutionalTradeBrain()
+        self.brain = TradeStateMachine()
         # Instantiate UTMB
         self.utmb = UnifiedTradeManagementBrain(exchange_sync, recovery_guard, event_bus)
         event_bus.subscribe("reconciled", self._on_reconciled)
