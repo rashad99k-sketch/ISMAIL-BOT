@@ -40,6 +40,9 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+# ==== NEW: Institutional Intelligence Integration ====
+import institutional_intelligence as inst
+
 # ========== ENUM FOR TRADE LIFECYCLE ==========
 class TradeLifecycleState(Enum):
     IDLE = "IDLE"
@@ -2190,6 +2193,13 @@ class UnifiedTradeManagementBrain:
             STATE["dynamic_manager"] = dyn_manager
             dyn_rec = dyn_manager.update(price, df, ob, atr)
 
+        # ==== NEW: Institutional Intelligence Layer ====
+        inst_rec = None
+        try:
+            inst_rec = get_institutional_recommendation(STATE["current_symbol"], df, ob, atr, price)
+        except Exception as e:
+            log_execution(f"[UTMB] Institutional Intelligence failed: {e}", "WARN")
+
         # Combine all
         rec = {
             "trade_state": trade_state,
@@ -2206,7 +2216,8 @@ class UnifiedTradeManagementBrain:
             "momentum": momentum,
             "adx": adx,
             "regime": regime,
-            "atr": atr
+            "atr": atr,
+            "inst_rec": inst_rec
         }
         return rec
 
@@ -2249,10 +2260,7 @@ class UnifiedTradeManagementBrain:
         # Call original PPE logic but with no execution
         # We'll copy the logic from apply_50_50_profit_engine and replace close_partial with rec updates
         # (Original function is large; we'll replicate core logic)
-        # For brevity, we'll call a helper or replicate here.
-        # Since the original function is long, we'll assume it's replicated with no execution.
-        # (In production, we would extract the logic to a separate function.)
-        # For now, we'll use a simplified version:
+        # For brevity, we'll use a simplified version:
         high = df['high'].iloc[-1]
         low = df['low'].iloc[-1]
         state_ppe["max_price"] = max(state_ppe["max_price"], high)
@@ -2352,6 +2360,25 @@ class UnifiedTradeManagementBrain:
     def _decide(self, rec, roe, drawdown, df, price, atr):
         """Combines all recommendations into a final decision."""
         decision = {"action": "HOLD", "reason": ""}
+
+        # ==== NEW: Institutional Intelligence override ====
+        inst_rec = rec.get("inst_rec")
+        if inst_rec:
+            # If institutional probability is very high and suggests a decisive action, we may override
+            if inst_rec.decision in ("FULL_CLOSE", "PARTIAL_CLOSE", "ACTIVATE_TRAIL", "ENTER"):
+                if inst_rec.institutional_probability > 70:
+                    decision["action"] = inst_rec.decision
+                    decision["reason"] = f"Institutional: {inst_rec.reason_short}"
+                    if inst_rec.decision == "PARTIAL_CLOSE":
+                        decision["ratio"] = 0.5
+                    elif inst_rec.decision == "ACTIVATE_TRAIL":
+                        decision["trail_stop"] = price - atr * 1.2 if STATE["side"] == "BUY" else price + atr * 1.2
+                    elif inst_rec.decision == "ENTER":
+                        # We are in position management, so ENTER is not applicable; ignore
+                        pass
+                    return decision
+            # Otherwise, we can use institutional probability to adjust confidence
+            # but we won't override here.
 
         # 1. Check hard exit from state machine
         if rec.get("hard_exit", False):
@@ -8961,6 +8988,56 @@ def safe_main_loop():
             except Exception as log_err:
                 print(f"Failed to log: {log_err}")
             time.sleep(5)
+
+# ==== NEW: Institutional Intelligence Wrapper ====
+def get_institutional_recommendation(symbol, df, ob, atr, current_price):
+    """Wrapper to call the institutional intelligence layer."""
+    try:
+        # Prepare symbols for migration (use radar_top5 or default)
+        symbols_list = MEMORY.get("radar_top5", [])
+        if not symbols_list:
+            symbols_list = [symbol]  # fallback
+        # Extract symbol names
+        symbol_names = [s.get("symbol") if isinstance(s, dict) else s for s in symbols_list]
+        if symbol not in symbol_names:
+            symbol_names.append(symbol)
+        symbol_names = list(set(symbol_names))[:20]  # limit
+
+        rec = inst.run_institutional_intelligence(
+            symbol=symbol,
+            df=df,
+            ob=ob,
+            atr=atr,
+            current_price=current_price,
+            state=STATE,
+            memory=MEMORY,
+            compute_atr_func=compute_atr,
+            compute_adx_func=compute_adx,
+            compute_rsi_func=compute_rsi,
+            detect_bos_func=detect_bos,
+            detect_structure_shift_func=detect_structure_shift,
+            detect_order_block_func=detect_order_block,
+            detect_fvg_func=detect_fvg,
+            detect_sweep_func=detect_sweep,
+            build_liquidity_pools_func=build_liquidity_pools,
+            candle_rejection_func=candle_rejection,
+            detect_displacement_func=detect_displacement,
+            classify_volume_func=classify_volume,
+            get_clustered_zones_func=get_clustered_zones,
+            get_sector_func=get_sector,
+            get_ticker_safe_func=get_ticker_safe,
+            get_orderbook_cached_func=get_orderbook_cached,
+            SmartMoneyEngine_class=SmartMoneyEngine,
+            MomentumFlowEngine_class=MomentumFlowEngine,
+            log_execution_func=log_execution,
+            safe_json_func=safe_json,
+            df_getter_for_migration=get_ohlcv_safe,
+            symbols_list_for_migration=symbol_names
+        )
+        return rec
+    except Exception as e:
+        log_execution(f"[INST_WRAPPER] Error: {traceback.format_exc()}", "ERROR")
+        return None
 
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
