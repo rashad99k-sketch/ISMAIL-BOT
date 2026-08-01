@@ -55,6 +55,60 @@ if 'log_execution' not in dir():
         except:
             pass
 
+# ========== CONFIGURATION ==========
+API_KEY = os.getenv("BINGX_API_KEY", "")
+API_SECRET = os.getenv("BINGX_API_SECRET", "")
+PAPER_MODE = os.getenv("PAPER_MODE", "True") == "False"
+MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
+
+DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
+INTERVAL = os.getenv("INTERVAL", "15m")
+LEVERAGE = 10
+
+USE_PPE = True
+
+# === EXECUTION QUEUE CONFIGURATION ===
+USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
+QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
+QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
+QUEUE_PROMOTE_INTERVAL = int(os.getenv("QUEUE_PROMOTE_INTERVAL", "30"))
+
+GLOBAL_SCAN_INTERVAL = 60 * 20
+SCANNER_V2_INTERVAL = 60 * 20
+MICRO_SCAN_INTERVAL = 5
+TOP_LIQUID_COUNT = 80
+
+MAX_SPREAD_PERCENT_DEFAULT = 0.08
+MAX_SPREAD_PERCENT_VOLATILE = 0.15
+
+MAX_SCALE_INS = 2
+SCALE_IN_SIZE_PCT = 0.25
+SCALE_IN_PROFIT_PCT = 0.5
+RUNNER_PCT = 0.4
+TRAIL_ATR_MULT = 1.4
+ADVERSE_MOVE_ATR_MULT = 1.8
+MAX_DAILY_LOSS_PCT = 5.0
+MAX_CONSECUTIVE_LOSSES = 3
+COOLDOWN_MINUTES_LOSS = 10
+COOLDOWN_MINUTES_DRAWDOWN = 20
+
+SNAPSHOT_INTERVAL = 15
+BASE_SLEEP = 5
+KEEP_ALIVE_INTERVAL = 300
+BALANCE_SAFETY_FACTOR = 0.98
+INSUFFICIENT_MARGIN_COOLDOWN_SEC = 60
+
+SCAN_INTERVAL = 900
+WATCHLIST_REFRESH = 300
+RADAR_COOLDOWN_SEC = 1800
+LAST_ENTRY_PER_SYMBOL = {}
+
+INSUFFICIENT_MARGIN_COOLDOWN_UNTIL = None
+
+# ========== MISSING VARIABLES (تم إضافتها) ==========
+SNIPER_MODE = True
+CANDIDATE_SCAN_INTERVAL = 60
+
 # ========== INSTITUTIONAL ENGINES (UNCHANGED) ==========
 class SmartMoneyEngine:
     @staticmethod
@@ -643,7 +697,6 @@ class WatchlistPriorityManager:
         sorted_watch = sorted(watchlist.items(), key=lambda x: x[1].get("priority", 0), reverse=True)
         MEMORY["watchlist"] = dict(sorted_watch)
 
-
 # ========== TRADE STATE MACHINE ==========
 class TradeStateMachine:
     STATES = {
@@ -983,56 +1036,7 @@ def send_trade_report(symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, 
 🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
     send_once(msg, f"trade_report_{symbol}_{int(time.time())}", 10)
 
-# ========== CONFIGURATION ==========
-API_KEY = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
-PAPER_MODE = os.getenv("PAPER_MODE", "True") == "False"
-MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
-
-DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
-INTERVAL = os.getenv("INTERVAL", "15m")
-LEVERAGE = 10
-
-USE_PPE = True
-
-# === EXECUTION QUEUE CONFIGURATION (NEW) ===
-USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
-QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
-QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
-QUEUE_PROMOTE_INTERVAL = int(os.getenv("QUEUE_PROMOTE_INTERVAL", "30"))
-
-GLOBAL_SCAN_INTERVAL = 60 * 20
-SCANNER_V2_INTERVAL = 60 * 20
-MICRO_SCAN_INTERVAL = 5
-TOP_LIQUID_COUNT = 80
-
-MAX_SPREAD_PERCENT_DEFAULT = 0.08
-MAX_SPREAD_PERCENT_VOLATILE = 0.15
-
-MAX_SCALE_INS = 2
-SCALE_IN_SIZE_PCT = 0.25
-SCALE_IN_PROFIT_PCT = 0.5
-RUNNER_PCT = 0.4
-TRAIL_ATR_MULT = 1.4
-ADVERSE_MOVE_ATR_MULT = 1.8
-MAX_DAILY_LOSS_PCT = 5.0
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_MINUTES_LOSS = 10
-COOLDOWN_MINUTES_DRAWDOWN = 20
-
-SNAPSHOT_INTERVAL = 15
-BASE_SLEEP = 5
-KEEP_ALIVE_INTERVAL = 300
-BALANCE_SAFETY_FACTOR = 0.98
-INSUFFICIENT_MARGIN_COOLDOWN_SEC = 60
-
-SCAN_INTERVAL = 900
-WATCHLIST_REFRESH = 300
-RADAR_COOLDOWN_SEC = 1800
-LAST_ENTRY_PER_SYMBOL = {}
-
-INSUFFICIENT_MARGIN_COOLDOWN_UNTIL = None
-
+# ========== CONFIGURATION (already defined above) ==========
 ex = ccxt.bingx({
     "apiKey": API_KEY,
     "secret": API_SECRET,
@@ -6179,14 +6183,13 @@ def build_40_symbol_universe():
         if sym not in seen:
             seen.add(sym)
             unique_universe.append(sym)
+
     # ---- NEW: Self-Learning ranking ----
-    # Compute composite score using Intent + Liquidity Memory
+    sym_data = {}  # <-- تم تعريفه هنا
     for sym in unique_universe:
         intent_score = MEMORY.get(f"intent_{sym}", {}).get("score", 0)
         success_rate = _liquidity_memory.get_success_rate(sym)
-        # composite: 40% current intent, 60% historical success
         composite = (intent_score * 0.4) + (success_rate * 100 * 0.6)
-        # store in a dict for sorting
         sym_data[sym] = composite
     unique_universe.sort(key=lambda x: sym_data.get(x, 0), reverse=True)
 
@@ -6212,9 +6215,9 @@ class InstitutionalBehaviour(Enum):
     NEUTRAL = "NEUTRAL"
 
 class MarketStructure(Enum):
-    BOS = "BOS"              # Break of Structure
-    CHOCH = "CHOCH"          # Change of Character
-    MSS = "MSS"              # Market Structure Shift
+    BOS = "BOS"
+    CHOCH = "CHOCH"
+    MSS = "MSS"
     NONE = "NONE"
 
 class OpportunityType(Enum):
@@ -7320,12 +7323,94 @@ MEMORY = {
     "intent": {}
 }
 
-# Instantiate LiquidityMemory
+# ========== NEW: LiquidityMemory instance (after class definition) ==========
 _liquidity_memory = LiquidityMemory()
 
 # The rest of the code (EventBus, ExchangeSync, RecoveryGuard, TrendEngine, etc.) remains unchanged.
 # ... (all previously defined classes and functions are present)
 
+# ========== MISSING CLASSES (تم إضافتها لتجنب أي NameError) ==========
+class LiquidityMapping:
+    """خريطة السيولة لكل رمز (تُبنى في global_discovery_scan)."""
+    @staticmethod
+    def build_map(df, symbol):
+        pools = build_liquidity_pools(df)
+        eq_high, eq_low = detect_equal_highs_lows(df)
+        return {"pools": pools, "equal_highs": eq_high, "equal_lows": eq_low}
+
+class CapitalRotationDetector:
+    @staticmethod
+    def detect(symbols):
+        sector_volumes = {}
+        for sym in symbols[:50]:
+            sector = get_sector(sym)
+            df = get_ohlcv_safe(sym, 30)
+            if df is not None:
+                vol = df['volume'].iloc[-1]
+                sector_volumes[sector] = sector_volumes.get(sector, 0) + vol
+        if sector_volumes:
+            top = max(sector_volumes, key=sector_volumes.get)
+            return {"top_sector": top, "volumes": sector_volumes}
+        return {"top_sector": "OTHER", "volumes": {}}
+
+class MarketRotationMemory:
+    def __init__(self):
+        self.memory = {}
+
+    def update(self, sector, score):
+        self.memory[sector] = {"score": score, "timestamp": time.time()}
+
+    def get_trending_sectors(self, min_score=70):
+        now = time.time()
+        trending = []
+        for sector, data in self.memory.items():
+            if data["score"] >= min_score and now - data["timestamp"] < 3600:
+                trending.append(sector)
+        return trending
+
+class DynamicUniverse:
+    @staticmethod
+    def build(symbols, liquidity_memory):
+        scored = []
+        for sym in symbols:
+            success = liquidity_memory.get_success_rate(sym)
+            intent = MEMORY.get(f"intent_{sym}", {}).get("score", 0)
+            score = (success * 0.6) + (intent / 100 * 0.4)
+            scored.append((score, sym))
+        scored.sort(reverse=True)
+        return [sym for _, sym in scored]
+
+class AdaptiveWatchlist:
+    @staticmethod
+    def update(watchlist, scores, max_size=30):
+        combined = list(zip(scores, watchlist))
+        combined.sort(reverse=True)
+        return [sym for _, sym in combined[:max_size]]
+
+class InstitutionalOpportunityScore:
+    @staticmethod
+    def compute(symbol, df, ob, atr, side):
+        return compute_institutional_opportunity_score(symbol, df, ob, atr, side)
+
+class GCIS:
+    """Global Capital Intelligence System - يدمج جميع المؤشرات"""
+    @staticmethod
+    def evaluate(symbol, df, ob, atr):
+        intent_score, _, _ = InstitutionalIntentEngine.detect(df, ob, symbol)
+        smart = SmartMoneyEngine.analyze_smart_money(df)
+        mom = MomentumFlowEngine.analyze_momentum_flow(df)
+        regime = MarketRegimeClassifier.classify(df)
+        return {
+            "intent": intent_score,
+            "smart_money_bias": smart.get("institutional_bias"),
+            "momentum_health": mom.get("momentum_health"),
+            "regime": regime,
+            "overall_score": (intent_score * 0.4 +
+                              (smart.get("banker_pressure", 50) * 0.3) +
+                              (mom.get("momentum_health", 50) * 0.3))
+        }
+
+# ========== MAIN ==========
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=safe_main_loop, daemon=True).start()
