@@ -919,7 +919,7 @@ def tg_error(err_msg, error_type="EXECUTION"):
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 # FIX: PAPER_MODE parsing – 'True' => paper mode, 'False' => live
-PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
+PAPER_MODE = os.getenv("PAPER_MODE", "False").lower() == "true"
 MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
