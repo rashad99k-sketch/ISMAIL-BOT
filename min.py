@@ -12,7 +12,6 @@
 # - FIXES applied (2026-08-14): Dual authority, partial close, regime-aware TP1,
 #   pre-TP1 BE, healthy pullback, trigger confirmation, PAPER_MODE, MEMORY init,
 #   duplicate log, startup path validation.
-# - FIX: EntryAuthority._log() call with keyword arguments (2026-08-14)
 # ====================================================================
 
 import os
@@ -5004,8 +5003,8 @@ def smart_opportunity_selection():
         leg_class = "REVERSAL"
         sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr, df)
         reason_str = f"INST_SWEEP+CHOCH+RETEST | nscore={score:.1f}"
-        ok = final_entry_authority(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
-                                   trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
+                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
         if ok:
             return True
     return False
@@ -5738,8 +5737,8 @@ def decide_and_execute_v1(symbol, side, total_score, reasons, price, sl, tp1, tp
     if not should_enter:
         return False
     reason_str = f"DECISION_V1 score={total_score} reasons={reasons} | NARR={narrative['classification']}"
-    return final_entry_authority(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                 trade_type="DECISION_V1", entry_type="V1", classification=classification)
+    return execute_entry(side, symbol, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                         trade_type="DECISION_V1", entry_type="V1", classification=classification)
 
 def decision_score(df, ob, atr_val, side):
     vol_state = classify_volume(df)
@@ -5783,8 +5782,8 @@ def monitor_watchlist():
                     if not should_enter_narr:
                         continue
                     sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
-                    ok = final_entry_authority(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                               trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
+                    ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
+                                       trade_type="INSTITUTIONAL_V3", entry_type="SMART_EARLY", classification=classification)
                     if ok:
                         return True
             decision, dec_side, dec_info = smart_decision(df, ob, sym)
@@ -5796,8 +5795,8 @@ def monitor_watchlist():
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-                ok = final_entry_authority(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                           trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
+                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                                   trade_type="SMART", entry_type="STOP_HUNT", classification=classification)
                 if ok:
                     return True
             elif decision == "EXHAUSTION_ENTRY":
@@ -5808,8 +5807,8 @@ def monitor_watchlist():
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
                 reason_str = f"SMART_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-                ok = final_entry_authority(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                           trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
+                ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                                   trade_type="SMART", entry_type="EXHAUSTION", classification=classification)
                 if ok:
                     return True
         rf_engine = RFEngine(period=20, multiplier=3.5)
@@ -5846,15 +5845,15 @@ def monitor_watchlist():
             if total_score >= 7:
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "REVERSAL" if scenario_name=="REVERSAL" else "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
-                ok = final_entry_authority(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                           trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
+                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_SNIPER", classification=classification)
                 if ok:
                     return True
             elif total_score >= 5:
                 sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
                 reason_str = f"UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']} | {'+'.join(all_reasons[:3])}"
-                ok = final_entry_authority(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                           trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
+                ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                                   trade_type="SCENARIO_ENGINE", entry_type="UNIFIED_EARLY", classification=classification)
                 if ok:
                     return True
         ob = get_orderbook_cached(sym, limit=10)
@@ -5865,15 +5864,15 @@ def monitor_watchlist():
             if early_score_val >= 6:
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_SNIPER ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
-                ok = final_entry_authority(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                           trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_SNIPER", classification=classification)
                 if ok:
                     return True
             elif early_score_val >= 4:
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"EARLY_ENTRY ({','.join(early_reasons)}) score={early_score_val} | NARR={narrative['classification']}"
-                ok = final_entry_authority(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
-                                           trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, early_score_val, reason_str, atr_val,
+                                   trade_type="EARLY_ENGINE", entry_type="EARLY_ENTRY", classification=classification)
                 if ok:
                     return True
         supports, resistances = get_clustered_zones(df, lookback=120, cluster_pct=0.002)
@@ -5900,7 +5899,7 @@ def monitor_watchlist():
         TRADE_STATE["zone"] = "support" if side=="BUY" else "resistance"
         TRADE_STATE["location"] = location
         TRADE_STATE["reason"] = [scenario, adv_class, location, narrative['classification']]
-        ok = final_entry_authority(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, 0, reason_str, atr_val, trade_type, adv_class, classification)
         if ok:
             return True
     return False
@@ -6208,8 +6207,8 @@ def radar_entry_scan():
                 if not should_enter_narr:
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, side_try, "REVERSAL", atr_val, df)
-                ok = final_entry_authority(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
-                                           trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification)
+                ok = execute_entry(side_try, sym, price, sl, tp1, tp2, 85, reason_str, atr_val,
+                                   trade_type="RADAR_INST", entry_type="SMART_EARLY", classification=classification)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -6220,8 +6219,8 @@ def radar_entry_scan():
                 continue
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_STOP_HUNT mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-            ok = final_entry_authority(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                       trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification)
+            ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                               trade_type="RADAR_SMART", entry_type="RADAR_STOP_HUNT", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -6231,8 +6230,8 @@ def radar_entry_scan():
                 continue
             sl, tp1, tp2 = compute_sl_tp(price, dec_side, "REVERSAL", atr_val, df)
             reason_str = f"RADAR_EXHAUSTION zone={dec_info.get('zone')} mode={dec_info.get('mode')} | NARR={narrative['classification']}"
-            ok = final_entry_authority(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
-                                       trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification)
+            ok = execute_entry(dec_side, sym, price, sl, tp1, tp2, 8, reason_str, atr_val,
+                               trade_type="RADAR_SMART", entry_type="RADAR_EXHAUSTION", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -6256,8 +6255,8 @@ def radar_entry_scan():
                 continue
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_SNIPER ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
-            ok = final_entry_authority(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                       trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification)
+            ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_SNIPER", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -6267,8 +6266,8 @@ def radar_entry_scan():
                 continue
             sl, tp1, tp2 = compute_sl_tp(price, scenario_dir, "EARLY_TREND", atr_val, df)
             reason_str = f"RADAR_UNIFIED_EARLY ({scenario_name}) score={total_score} | NARR={narrative['classification']}"
-            ok = final_entry_authority(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
-                                       trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification)
+            ok = execute_entry(scenario_dir, sym, price, sl, tp1, tp2, total_score, reason_str, atr_val,
+                               trade_type="RADAR_SCENARIO", entry_type="RADAR_EARLY", classification=classification)
             if ok:
                 LAST_ENTRY_PER_SYMBOL[sym] = now
                 return True
@@ -6280,8 +6279,8 @@ def radar_entry_scan():
                     continue
                 sl, tp1, tp2 = compute_sl_tp(price, side, "EARLY_TREND", atr_val, df)
                 reason_str = f"RADAR_EARLY ({','.join(reasons)}) score={es} | NARR={narrative['classification']}"
-                ok = final_entry_authority(side, sym, price, sl, tp1, tp2, es, reason_str, atr_val,
-                                           trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification)
+                ok = execute_entry(side, sym, price, sl, tp1, tp2, es, reason_str, atr_val,
+                                   trade_type="RADAR_EARLY", entry_type="RADAR_SNIPER", classification=classification)
                 if ok:
                     LAST_ENTRY_PER_SYMBOL[sym] = now
                     return True
@@ -7398,7 +7397,7 @@ def process_queue_entry():
         return
 
     log_execution(f"[QUEUE] Attempting entry for {best.symbol} {best.side} (Score: {best.priority_score:.1f})", "INFO")
-    success = final_entry_authority(
+    success = execute_entry(
         best.side,
         best.symbol,
         best.price,
@@ -8412,7 +8411,7 @@ def manual_trade():
     tp1 = price*1.006 if side=="BUY" else price*0.994
     tp2 = price*1.02 if side=="BUY" else price*0.98
     classification = "SNIPER"
-    ok = final_entry_authority(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
+    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
     return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
 
 @app.route("/close", methods=["POST"])
@@ -8700,8 +8699,8 @@ def sniper_engine_v2():
                     tp1 = price * (1 - 0.004) if side == "SELL" else price * (1 + 0.004)
                     tp2 = price * (1 - 0.01) if side == "SELL" else price * (1 + 0.01)
                     reason_str = f"SNIPER_V2 {zone['type']} conf={conf_count} reasons={zone.get('reasons', [])} | NARR={narrative['classification']}"
-                    ok = final_entry_authority(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
-                                               trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
+                    ok = execute_entry(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
+                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
                     if ok:
                         log_execution(f"[SNIPER_V2] {sym} {side} entry executed", "SUCCESS")
                         zone["state"] = "USED"
@@ -8881,7 +8880,6 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
-# ========== ENTRY EXECUTION (UNCHANGED) ==========
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         log_execution(f"[ENTRY] Already in position, skipping {symbol}", "WARN")
@@ -9105,347 +9103,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return True
     else:
         return False
-
-# ============================================================
-# NEW: ADAPTIVE TWO-STAGE ENTRY AUTHORITY (CANDLE-AWARE)
-# ============================================================
-class EntryAuthority:
-    """
-    Candle-aware two-stage confirmation gate.
-    Prevents duplicate confirmations on the same candle and enables early entry
-    when structural hold is confirmed.
-    """
-    def __init__(self):
-        self._pending = {}  # key: (symbol, side) -> dict of setup state
-
-    def request_entry(self, side, symbol, price, sl, tp1, tp2, score, reason,
-                      atr_val, trade_type, entry_type, classification) -> bool:
-        # 1. Quick reject if already in position
-        if STATE.get("open") or TRADE_STATE.get("in_position"):
-            return False
-
-        # 2. Fetch OHLCV to get candle timestamps
-        df = get_ohlcv_safe(symbol, 60)
-        if df is None or len(df) < 2:
-            self._log(symbol, side, "REJECTED", reason="No data")
-            return False
-
-        current_ts = df['timestamp'].iloc[-1]
-        prev_ts = df['timestamp'].iloc[-2] if len(df) > 1 else None
-
-        key = (symbol, side)
-        pending = self._pending.get(key)
-
-        # 3. If pending exists and is dead, clean it
-        if pending and pending.get('state') in ('EXECUTED', 'INVALIDATED'):
-            del self._pending[key]
-            pending = None
-
-        # 4. If no pending, attempt to create a new trigger
-        if pending is None:
-            # Evaluate trigger quality using existing engines
-            trigger_ok, trigger_state = self._evaluate_trigger(df, side, price, atr_val, reason)
-            if not trigger_ok:
-                self._log(symbol, side, "REJECTED", reason="Trigger criteria not met")
-                return False
-
-            # Create pending setup
-            self._pending[key] = {
-                'symbol': symbol,
-                'side': side,
-                'trigger_candle_ts': current_ts,
-                'trigger_state': trigger_state,
-                'created_at': time.time(),
-                'state': 'TRIGGERED',        # waiting for validation
-                'validation_candle_ts': None,
-                'confirmation_count': 0,      # number of distinct validation candles
-                'invalidation_reason': None,
-                'executed': False,
-                'price': price,
-                'sl': sl,
-                'tp1': tp1,
-                'tp2': tp2,
-                'score': score,
-                'reason': reason,
-                'atr_val': atr_val,
-                'trade_type': trade_type,
-                'entry_type': entry_type,
-                'classification': classification
-            }
-            self._log(symbol, side, "TRIGGERED", trigger_state=trigger_state)
-            return False  # not yet entered
-
-        # 5. Existing pending setup – re‑evaluate
-        # Check if we are on the same candle as trigger
-        if current_ts == pending['trigger_candle_ts']:
-            # Still on trigger candle – only check invalidation, no entry yet
-            invalid, reason_inv = self._check_invalidation(df, side, price, atr_val, pending)
-            if invalid:
-                self._invalidate(key, reason_inv)
-                return False
-            # Stay pending, no entry
-            return False
-
-        # 6. New candle – validation stage
-        # If we already validated this candle, don't double count
-        if pending['validation_candle_ts'] == current_ts:
-            # Already validated this candle; re-check invalidation and late entry
-            invalid, reason_inv = self._check_invalidation(df, side, price, atr_val, pending)
-            if invalid:
-                self._invalidate(key, reason_inv)
-                return False
-            # Check late entry
-            late, late_reason = self._check_late_entry(df, side, price, atr_val, pending)
-            if late:
-                self._invalidate(key, late_reason)
-                return False
-            # If we are already validated and not executed, we might allow entry now
-            if pending['state'] == 'VALIDATED' and not pending['executed']:
-                # Check if we can enter early (adaptive)
-                if self._allow_early_entry(df, side, price, atr_val, pending):
-                    return self._execute(pending)
-            return False
-
-        # 7. First time we see this candle as validation
-        pending['validation_candle_ts'] = current_ts
-        pending['confirmation_count'] += 1
-
-        # Evaluate validation: structural hold, no thesis failure
-        validation_ok, validation_reason = self._evaluate_validation(df, side, price, atr_val, pending)
-        if not validation_ok:
-            self._invalidate(key, validation_reason)
-            return False
-
-        # Mark as validated
-        pending['state'] = 'VALIDATED'
-
-        # Check late entry
-        late, late_reason = self._check_late_entry(df, side, price, atr_val, pending)
-        if late:
-            self._invalidate(key, late_reason)
-            return False
-
-        # 8. Decide if we can enter early or need more validation
-        if self._allow_early_entry(df, side, price, atr_val, pending):
-            return self._execute(pending)
-        else:
-            # Wait for further validation (e.g., require stronger confirmation)
-            self._log(symbol, side, "WAITING", reason="Additional validation required")
-            return False
-
-    # ---------- Helper methods ----------
-    def _evaluate_trigger(self, df, side, price, atr_val, reason):
-        """Use existing engines to decide if this request is a valid trigger."""
-        ob = get_orderbook_cached(df.symbol if hasattr(df, 'symbol') else 'BTC/USDT', 10)
-        # Reuse check_institutional_entry for reversal setups
-        # For trend continuations, we can rely on the caller's reason/score
-        # but we add extra structural checks.
-        try:
-            should_enter, _, _ = check_institutional_entry(df.symbol if hasattr(df, 'symbol') else 'BTC/USDT',
-                                                           side, df, ob, atr_val, price)
-            if should_enter:
-                return True, "INSTITUTIONAL_TRIGGER"
-        except:
-            pass
-
-        # Fallback: use existing early_score/decision_score
-        # We'll compute a simple composite score
-        score = 0
-        # Sweep
-        pools = build_liquidity_pools(df)
-        swept_high, swept_low = detect_sweep(df, pools)
-        if (side == "BUY" and swept_low) or (side == "SELL" and swept_high):
-            score += 25
-        # Structure shift
-        struct_shift = detect_structure_shift(df)
-        bos_up, bos_down = detect_bos(df)
-        if (side == "BUY" and (struct_shift == "bullish_shift" or bos_up)) or \
-           (side == "SELL" and (struct_shift == "bearish_shift" or bos_down)):
-            score += 25
-        # Displacement
-        vol_state = classify_volume(df)
-        if detect_displacement(df, side, atr_val, vol_state, body_atr_threshold=0.8, volume_expansion_required=False):
-            score += 20
-        # Volume expansion
-        if vol_state in ("expansion", "spike"):
-            score += 15
-        # Institutional intent
-        intent_score, _, _ = InstitutionalIntentEngine.detect(df, ob, df.symbol if hasattr(df, 'symbol') else 'BTC/USDT')
-        if intent_score >= 75:
-            score += 15
-        # Zone strength
-        zones = get_smart_zones(df.symbol if hasattr(df, 'symbol') else 'BTC/USDT', df, ob)
-        zone_strength = 0
-        if side == "BUY" and zones["buy_zones"]:
-            zone_strength = zones["buy_zones"][0]["strength"]
-        elif side == "SELL" and zones["sell_zones"]:
-            zone_strength = zones["sell_zones"][0]["strength"]
-        if zone_strength >= 5:
-            score += 10
-
-        # Also consider caller's score (if any)
-        caller_score = score  # we already have score from arguments? Actually we have a score parameter.
-        # We'll blend: if caller_score is high, it can compensate.
-        # But we don't have caller_score here. We'll use the score passed in.
-        # However, the score passed is from the caller, we can add it.
-        # We'll use the passed score as additional evidence.
-        # The caller might have a score out of 10, etc. We'll normalize.
-        if score > 0:
-            # Use the score from the caller as an additional factor
-            # But we don't have it; we only have 'reason' string.
-            # We'll just trust the existing reason if it indicates a strong signal.
-            if "SNIPER" in reason or "INSTITUTIONAL" in reason or "STRONG" in reason:
-                score += 15
-
-        if score >= 60:
-            return True, f"TriggerScore={score}"
-        else:
-            return False, f"TriggerScore={score}"
-
-    def _evaluate_validation(self, df, side, price, atr_val, pending):
-        """Check that the thesis still holds and structure is intact."""
-        # Use ThesisFailureEngine
-        plus_di, minus_di, adx, adx_slope = get_di_components(df)
-        if plus_di is None: plus_di = 20
-        if minus_di is None: minus_di = 20
-        if adx is None: adx = 20
-        if adx_slope is None: adx_slope = 0
-        vol_state = classify_volume(df)
-        volume_ratio = df['volume'].iloc[-1] / df['volume'].iloc[-10:-1].mean() if len(df) >= 10 else 1.0
-        last_candle = df.iloc[-1]
-        market_state = {
-            'atr': atr_val,
-            'adx': adx,
-            'adx_slope': adx_slope,
-            'di_plus': plus_di,
-            'di_minus': minus_di,
-            'df': df,
-            'last_candle': last_candle,
-            'volume_ratio': volume_ratio,
-            'strong_reclaim': False,
-            'continuation_pressure': 50
-        }
-        thesis = {'sl': pending.get('sl', 0)}
-        failed, reasons, _ = ThesisFailureEngine.evaluate_failure(thesis, market_state, price, pending['price'], side)
-        if failed:
-            return False, f"Thesis failure: {reasons}"
-
-        # Also check structural break (BOS)
-        bos_up, bos_down = detect_bos(df)
-        if side == "BUY" and bos_down:
-            return False, "Bearish BOS"
-        if side == "SELL" and bos_up:
-            return False, "Bullish BOS"
-
-        return True, "Validation passed"
-
-    def _check_invalidation(self, df, side, price, atr_val, pending):
-        """Check if setup should be invalidated during trigger or validation."""
-        # Use same logic as _evaluate_validation but return bool, reason
-        ok, reason = self._evaluate_validation(df, side, price, atr_val, pending)
-        if not ok:
-            return True, reason
-        return False, None
-
-    def _check_late_entry(self, df, side, price, atr_val, pending):
-        """Reject if move has become too extended."""
-        entry_price = pending['price']
-        # If price moved more than 1.5 ATR from entry
-        if abs(price - entry_price) > 1.5 * atr_val:
-            return True, "Price extended >1.5 ATR"
-        # Use existing is_late_entry function
-        if is_late_entry(df, side):
-            return True, "Late entry detected"
-        return False, None
-
-    def _allow_early_entry(self, df, side, price, atr_val, pending):
-        """Decide if we can enter now (during validation candle) or need more confirmation."""
-        # High-quality setups (score > 80, institutional trigger) can enter immediately after validation.
-        if pending.get('score', 0) >= 80 or "INSTITUTIONAL" in pending.get('reason', ''):
-            return True
-
-        # Otherwise, require at least 2 distinct validation candles (i.e., confirmation_count >= 2)
-        # but we already incremented once, so if count >= 2 we allow.
-        # However, we could also allow if the validation candle is strong (e.g., displacement, strong volume).
-        # We'll use a quality check.
-        # Check if validation candle shows continuation (body > 0.6*range, close direction aligned)
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        range_ = last['high'] - last['low']
-        if range_ == 0:
-            return False
-        body_ratio = body / range_
-        if side == "BUY" and last['close'] > last['open'] and body_ratio > 0.5:
-            return True
-        if side == "SELL" and last['close'] < last['open'] and body_ratio > 0.5:
-            return True
-
-        # Also allow if there is a weak pullback (small candle in opposite direction) with structure hold.
-        if side == "BUY" and last['close'] < last['open'] and body < atr_val * 0.4:
-            # small bearish candle – could be a weak pullback
-            if detect_structure_shift(df) == "bullish_shift":
-                return True
-        if side == "SELL" and last['close'] > last['open'] and body < atr_val * 0.4:
-            if detect_structure_shift(df) == "bearish_shift":
-                return True
-
-        # If confirmation_count >= 2, allow entry (we have at least 2 validation candles)
-        if pending.get('confirmation_count', 0) >= 2:
-            return True
-
-        return False
-
-    def _invalidate(self, key, reason):
-        if key in self._pending:
-            self._pending[key]['state'] = 'INVALIDATED'
-            self._pending[key]['invalidation_reason'] = reason
-            self._log(self._pending[key]['symbol'], self._pending[key]['side'], "INVALIDATED", reason=reason)
-            del self._pending[key]
-
-    def _execute(self, pending):
-        """Call the existing execute_entry with pending parameters."""
-        self._log(pending['symbol'], pending['side'], "EXECUTING", reason="Early entry allowed")
-        success = execute_entry(
-            pending['side'],
-            pending['symbol'],
-            pending['price'],
-            pending['sl'],
-            pending['tp1'],
-            pending['tp2'],
-            pending['score'],
-            pending['reason'],
-            pending['atr_val'],
-            pending['trade_type'],
-            pending['entry_type'],
-            pending['classification']
-        )
-        if success:
-            pending['state'] = 'EXECUTED'
-            pending['executed'] = True
-            key = (pending['symbol'], pending['side'])
-            if key in self._pending:
-                del self._pending[key]
-            return True
-        else:
-            # If execution fails, invalidate setup
-            pending['state'] = 'INVALIDATED'
-            key = (pending['symbol'], pending['side'])
-            if key in self._pending:
-                del self._pending[key]
-            return False
-
-    def _log(self, symbol, side, status, **kwargs):
-        msg = f"[ENTRY-AUTH] {symbol} {side} Status={status}"
-        for k, v in kwargs.items():
-            msg += f" {k}={v}"
-        log_execution(msg, "INFO", debounce_key=f"entry_auth_{symbol}_{side}", debounce_sec=10)
-
-# Global instance
-_entry_authority = EntryAuthority()
-
-# Wrapper that all entry paths must call
-def final_entry_authority(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
-    return _entry_authority.request_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification)
 
 # ========== MAIN LOOP ==========
 def main_loop_sniper():
