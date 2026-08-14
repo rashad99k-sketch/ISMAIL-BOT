@@ -12,6 +12,7 @@
 # - FIXES applied (2026-08-14): Dual authority, partial close, regime-aware TP1,
 #   pre-TP1 BE, healthy pullback, trigger confirmation, PAPER_MODE, MEMORY init,
 #   duplicate log, startup path validation.
+# - FIX: EntryAuthority._log() call with keyword arguments (2026-08-14)
 # ====================================================================
 
 import os
@@ -9126,7 +9127,7 @@ class EntryAuthority:
         # 2. Fetch OHLCV to get candle timestamps
         df = get_ohlcv_safe(symbol, 60)
         if df is None or len(df) < 2:
-            self._log(symbol, side, "REJECTED", "No data")
+            self._log(symbol, side, "REJECTED", reason="No data")
             return False
 
         current_ts = df['timestamp'].iloc[-1]
@@ -9145,7 +9146,7 @@ class EntryAuthority:
             # Evaluate trigger quality using existing engines
             trigger_ok, trigger_state = self._evaluate_trigger(df, side, price, atr_val, reason)
             if not trigger_ok:
-                self._log(symbol, side, "REJECTED", "Trigger criteria not met")
+                self._log(symbol, side, "REJECTED", reason="Trigger criteria not met")
                 return False
 
             # Create pending setup
@@ -9229,7 +9230,7 @@ class EntryAuthority:
             return self._execute(pending)
         else:
             # Wait for further validation (e.g., require stronger confirmation)
-            self._log(symbol, side, "WAITING", "Additional validation required")
+            self._log(symbol, side, "WAITING", reason="Additional validation required")
             return False
 
     # ---------- Helper methods ----------
@@ -9403,7 +9404,7 @@ class EntryAuthority:
 
     def _execute(self, pending):
         """Call the existing execute_entry with pending parameters."""
-        self._log(pending['symbol'], pending['side'], "EXECUTING", "Early entry allowed")
+        self._log(pending['symbol'], pending['side'], "EXECUTING", reason="Early entry allowed")
         success = execute_entry(
             pending['side'],
             pending['symbol'],
