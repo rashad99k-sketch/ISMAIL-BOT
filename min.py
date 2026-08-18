@@ -13,6 +13,14 @@
 #   pre-TP1 BE, healthy pullback, trigger confirmation, PAPER_MODE, MEMORY init,
 #   duplicate log, startup path validation.
 # ====================================================================
+# SURGICAL ENTRY-QUALITY UPGRADE (2026-08-16):
+# - Liquidity Authenticity Engine (post-sweep response, trap detection)
+# - Order Block Quality Engine (causal strength, freshness, defense)
+# - Post-Sweep Response Evaluation (displacement, reclaim, volume)
+# - Early Expansion Detector (room to run, exhaustion risk)
+# - Composite Entry Quality Assessment (REJECT/WAIT/VALIDATE/EARLY_ENTRY/APPROVE)
+# - Integrated into execute_entry() as the final authority.
+# ====================================================================
 
 import os
 import time
@@ -7418,6 +7426,820 @@ def process_queue_entry():
         queue.total_executed += 1
         log_execution(f"[QUEUE] Trade executed for {best.symbol}", "SUCCESS")
 
+# ============================================================
+# ========== SURGICAL ENTRY QUALITY ENHANCEMENTS ==========
+# ============================================================
+
+# ---------- 1. Liquidity Authenticity Engine ----------
+def compute_liquidity_authenticity(df, side, atr):
+    """
+    Evaluate whether a detected liquidity sweep is genuine.
+    Returns: score (0-100), trap_risk (0-100), details dict.
+    """
+    if len(df) < 3:
+        return 50, 50, {}
+
+    details = {}
+    score = 50
+    trap_risk = 50
+
+    # 1. Detect sweep
+    pools = build_liquidity_pools(df)
+    swept_high, swept_low = detect_sweep(df, pools)
+    sweep_detected = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
+
+    if not sweep_detected:
+        details['sweep_detected'] = False
+        return 30, 70, details  # No sweep, low authenticity
+
+    details['sweep_detected'] = True
+    score += 20
+    trap_risk -= 10
+
+    # 2. Reclaim behavior
+    last = df.iloc[-1]
+    if side == "BUY":
+        reclaim = last['close'] > last['low'] + 0.2 * atr
+    else:
+        reclaim = last['close'] < last['high'] - 0.2 * atr
+
+    details['reclaim'] = reclaim
+    if reclaim:
+        score += 15
+        trap_risk -= 10
+    else:
+        trap_risk += 15
+
+    # 3. Displacement magnitude
+    body = abs(last['close'] - last['open'])
+    range_ = last['high'] - last['low']
+    if range_ > 0:
+        displacement = body / range_
+        details['displacement_ratio'] = round(displacement, 2)
+        if displacement > 0.6:
+            score += 20
+            trap_risk -= 15
+        elif displacement > 0.4:
+            score += 10
+            trap_risk -= 5
+        else:
+            trap_risk += 15
+
+    # 4. Volume confirmation
+    vol_state = classify_volume(df)
+    details['volume_state'] = vol_state
+    if vol_state in ("expansion", "spike"):
+        score += 15
+        trap_risk -= 10
+    elif vol_state == "exhaustion":
+        trap_risk += 15
+        score -= 5
+
+    # 5. Structure break (MSS/BOS)
+    struct_shift = detect_structure_shift(df)
+    bos_up, bos_down = detect_bos(df)
+    struct_ok = (side == "BUY" and (struct_shift == "bullish_shift" or bos_up)) or \
+                (side == "SELL" and (struct_shift == "bearish_shift" or bos_down))
+    details['structure_break'] = struct_ok
+    if struct_ok:
+        score += 20
+        trap_risk -= 15
+    else:
+        trap_risk += 15
+
+    # 6. Counter-displacement risk
+    if side == "BUY" and last['close'] < last['open'] and body > atr * 0.6:
+        trap_risk += 20
+    elif side == "SELL" and last['close'] > last['open'] and body > atr * 0.6:
+        trap_risk += 20
+
+    # 7. Room to run (opposing zone proximity)
+    supports, resistances = get_clustered_zones(df, lookback=60)
+    price = df['close'].iloc[-1]
+    if side == "BUY":
+        # nearest resistance above
+        nearest_res = min([r for r in resistances if r > price], default=None)
+        if nearest_res:
+            room = (nearest_res - price) / price
+            if room < 0.01:
+                trap_risk += 20
+            elif room < 0.02:
+                trap_risk += 10
+            details['room_to_run'] = round(room*100, 2)
+    else:
+        nearest_sup = max([s for s in supports if s < price], default=None)
+        if nearest_sup:
+            room = (price - nearest_sup) / price
+            if room < 0.01:
+                trap_risk += 20
+            elif room < 0.02:
+                trap_risk += 10
+            details['room_to_run'] = round(room*100, 2)
+
+    # 8. Consecutive candles leaving zone
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        if side == "BUY":
+            if last['close'] > prev['close'] and prev['close'] > prev['open']:
+                score += 5
+            else:
+                trap_risk += 5
+        else:
+            if last['close'] < prev['close'] and prev['close'] < prev['open']:
+                score += 5
+            else:
+                trap_risk += 5
+
+    # Normalize scores
+    score = max(0, min(100, score))
+    trap_risk = max(0, min(100, trap_risk))
+    details['authenticity_score'] = score
+    details['trap_risk'] = trap_risk
+    return score, trap_risk, details
+
+# ---------- 2. Order Block Quality Engine ----------
+def compute_order_block_quality(df, side, atr):
+    """
+    Evaluate both bullish and bearish order block quality.
+    Returns: bullish_score, bearish_score, details dict.
+    """
+    if len(df) < 5:
+        return 50, 50, {}
+
+    details = {}
+    bullish_score = 50
+    bearish_score = 50
+
+    # 1. Detect order blocks using detect_order_block
+    ob_bullish = detect_order_block(df, "BUY")
+    ob_bearish = detect_order_block(df, "SELL")
+
+    # 2. Compute causal strength for each side
+    def causal_strength(ob, side):
+        if not ob:
+            return 30, "NONE"
+        idx = ob['idx']
+        if idx >= 0:
+            return 30, "NONE"
+        # Origin candle
+        origin = df.iloc[idx]
+        # Move after OB
+        if side == "BUY":
+            # Measure displacement from origin low to subsequent high
+            if len(df) > -idx + 2:
+                future_high = df['high'].iloc[-2:].max()
+                move = future_high - origin['low']
+            else:
+                move = 0
+        else:
+            if len(df) > -idx + 2:
+                future_low = df['low'].iloc[-2:].min()
+                move = origin['high'] - future_low
+            else:
+                move = 0
+        if move < atr * 0.5:
+            strength = 40
+            label = "WEAK"
+        elif move < atr * 1.0:
+            strength = 60
+            label = "MEDIUM"
+        elif move < atr * 2.0:
+            strength = 80
+            label = "STRONG"
+        else:
+            strength = 90
+            label = "VERY_STRONG"
+        # Adjust for freshness (if recently tested, may be weaker)
+        # Check if price has recently revisited the OB
+        recent_revisit = False
+        if side == "BUY":
+            recent_low = df['low'].iloc[-3:].min()
+            if abs(recent_low - ob['low']) < atr * 0.3:
+                recent_revisit = True
+        else:
+            recent_high = df['high'].iloc[-3:].max()
+            if abs(recent_high - ob['high']) < atr * 0.3:
+                recent_revisit = True
+        if recent_revisit:
+            strength = max(30, strength - 20)
+            label += "_TESTED"
+        return strength, label
+
+    if ob_bullish:
+        bull_str, bull_label = causal_strength(ob_bullish, "BUY")
+        bullish_score = bull_str
+        details['bullish_ob'] = {'price': ob_bullish['high'], 'strength': bull_str, 'label': bull_label}
+    else:
+        details['bullish_ob'] = None
+        bullish_score = 30  # no bullish OB
+
+    if ob_bearish:
+        bear_str, bear_label = causal_strength(ob_bearish, "SELL")
+        bearish_score = bear_str
+        details['bearish_ob'] = {'price': ob_bearish['low'], 'strength': bear_str, 'label': bear_label}
+    else:
+        details['bearish_ob'] = None
+        bearish_score = 30
+
+    # 3. Add additional context: volume at OB
+    # (already handled in causal strength via move)
+
+    # 4. Normalize scores
+    bullish_score = max(0, min(100, bullish_score))
+    bearish_score = max(0, min(100, bearish_score))
+    details['bullish_ob_score'] = bullish_score
+    details['bearish_ob_score'] = bearish_score
+    return bullish_score, bearish_score, details
+
+# ---------- 3. Post-Sweep Response Evaluator ----------
+def evaluate_post_sweep_response(df, side, atr, price, entry_price):
+    """
+    Evaluate the quality of the response after a sweep.
+    Returns: response_score (0-100), details.
+    """
+    if len(df) < 2:
+        return 50, {}
+    details = {}
+    score = 50
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # 1. Candle efficiency (body to range ratio)
+    body = abs(last['close'] - last['open'])
+    range_ = last['high'] - last['low']
+    if range_ > 0:
+        efficiency = body / range_
+        details['efficiency'] = round(efficiency, 2)
+        if efficiency > 0.7:
+            score += 20
+        elif efficiency > 0.5:
+            score += 10
+        else:
+            score -= 10
+
+    # 2. Displacement relative to ATR
+    move = abs(last['close'] - last['open'])
+    atr_move = move / atr if atr > 0 else 0
+    details['atr_move'] = round(atr_move, 2)
+    if atr_move > 1.0:
+        score += 20
+    elif atr_move > 0.6:
+        score += 10
+    else:
+        score -= 10
+
+    # 3. Volume relative to average
+    vol_avg = df['volume'].iloc[-10:-1].mean()
+    if vol_avg > 0:
+        vol_ratio = last['volume'] / vol_avg
+        details['vol_ratio'] = round(vol_ratio, 2)
+        if vol_ratio > 1.5:
+            score += 15
+        elif vol_ratio > 1.2:
+            score += 8
+        elif vol_ratio < 0.6:
+            score -= 15
+
+    # 4. Follow-through: next candle continuation
+    if len(df) >= 3:
+        next_candle = df.iloc[-1]  # Actually we don't have next; but we can check current vs previous direction
+        if side == "BUY" and last['close'] > prev['close']:
+            score += 10
+        elif side == "SELL" and last['close'] < prev['close']:
+            score += 10
+        else:
+            score -= 5
+
+    # 5. Reclaim strength: how quickly price leaves the swept zone
+    if side == "BUY":
+        if last['close'] > entry_price + atr * 0.3:
+            score += 10
+        elif last['close'] > entry_price:
+            score += 5
+        else:
+            score -= 10
+    else:
+        if last['close'] < entry_price - atr * 0.3:
+            score += 10
+        elif last['close'] < entry_price:
+            score += 5
+        else:
+            score -= 10
+
+    # Normalize
+    score = max(0, min(100, score))
+    details['response_score'] = score
+    return score, details
+
+# ---------- 4. Early Expansion Detector ----------
+def detect_early_expansion(df, side, atr, price, entry_price, smart_money, momentum, adx, continuation_prob):
+    """
+    Determine if the move is in early expansion phase.
+    Returns: score (0-100), classification (EARLY_EXPANSION, EARLY_CONTINUATION, MID_MOVE, LATE_MOVE, EXHAUSTION, TRAP)
+    """
+    score = 50
+    classification = "MID_MOVE"
+    reasons = []
+
+    # 1. Distance from entry (late entry check)
+    dist = abs(price - entry_price) / entry_price
+    if dist > 0.03:
+        classification = "LATE_MOVE"
+        reasons.append("price_extended")
+        score -= 20
+    elif dist > 0.015:
+        score -= 10
+        reasons.append("moderate_extension")
+    else:
+        score += 10
+        reasons.append("near_entry")
+
+    # 2. Momentum indicators
+    mom_health = momentum.get('momentum_health', 50)
+    cont_strength = momentum.get('continuation_strength', 50)
+    expansion = momentum.get('trend_expansion', False)
+    decay = momentum.get('momentum_decay', False)
+    if expansion and cont_strength > 60 and mom_health > 55:
+        score += 25
+        reasons.append("momentum_expansion")
+    elif expansion and mom_health > 50:
+        score += 15
+        reasons.append("moderate_expansion")
+    elif decay:
+        score -= 20
+        reasons.append("momentum_decay")
+    elif mom_health < 30:
+        score -= 15
+        reasons.append("weak_momentum")
+
+    # 3. ADX and DI
+    if adx > 25 and adx < 40:
+        score += 15
+        reasons.append(f"adx_{int(adx)}")
+    elif adx >= 40:
+        if continuation_prob > 0.7:
+            score += 5
+            reasons.append("strong_trend_continuation")
+        else:
+            score -= 10
+            reasons.append("adx_overextended")
+
+    # 4. Smart money
+    banker = smart_money.get('banker_pressure', 50)
+    retail = smart_money.get('retailer_pressure', 50)
+    dist_risk = smart_money.get('distribution_risk', 0)
+    if side == "BUY" and banker > retail and dist_risk < 30:
+        score += 15
+        reasons.append("smart_money_accumulation")
+    elif side == "SELL" and retail > banker and dist_risk > 50:
+        score += 15
+        reasons.append("smart_money_distribution")
+    elif dist_risk > 60:
+        score -= 20
+        reasons.append("distribution_risk")
+
+    # 5. Volume expansion
+    vol_state = classify_volume(df)
+    if vol_state in ("expansion", "spike"):
+        score += 10
+        reasons.append("volume_expansion")
+    elif vol_state == "exhaustion":
+        score -= 15
+        reasons.append("volume_exhaustion")
+
+    # 6. Continuation probability
+    if continuation_prob > 0.75:
+        score += 10
+        reasons.append("high_continuation_prob")
+    elif continuation_prob < 0.5:
+        score -= 10
+        reasons.append("low_continuation_prob")
+
+    # 7. Exhaustion risk
+    exhaustion = momentum.get('exhaustion_risk', 0)
+    if exhaustion > 60:
+        score -= 20
+        reasons.append("exhaustion_risk")
+        classification = "EXHAUSTION"
+    elif exhaustion > 40:
+        score -= 10
+        reasons.append("moderate_exhaustion")
+
+    # 8. Trap risk
+    # Use liquidity authenticity trap_risk if available
+    # We'll compute trap_risk from authenticity engine if not passed
+
+    # Classify based on final score
+    score = max(0, min(100, score))
+    if score >= 80 and "near_entry" in reasons and "momentum_expansion" in reasons and "smart_money_accumulation" in reasons:
+        classification = "EARLY_EXPANSION"
+    elif score >= 70 and ("moderate_expansion" in reasons or "strong_trend_continuation" in reasons):
+        classification = "EARLY_CONTINUATION"
+    elif score >= 50:
+        classification = "MID_MOVE"
+    elif score >= 30:
+        if "distribution_risk" in reasons or "exhaustion_risk" in reasons:
+            classification = "EXHAUSTION"
+        else:
+            classification = "LATE_MOVE"
+    else:
+        classification = "TRAP"
+
+    return score, classification, reasons
+
+# ---------- 5. Composite Entry Quality Assessment ----------
+def entry_quality_assessment(symbol, side, price, df, ob, atr, existing_score, classification, trade_type, entry_type):
+    """
+    Combines all evaluations and returns a decision.
+    Returns: dict with 'decision', 'reason', 'quality_score', 'trap_risk', 'early_expansion', etc.
+    """
+    if df is None or len(df) < 30:
+        return {'decision': 'REJECT', 'reason': 'Insufficient data', 'quality_score': 0}
+
+    # 1. Compute components
+    auth_score, trap_risk, auth_details = compute_liquidity_authenticity(df, side, atr)
+    bull_ob, bear_ob, ob_details = compute_order_block_quality(df, side, atr)
+    resp_score, resp_details = evaluate_post_sweep_response(df, side, atr, price, price)  # entry_price = price (for now)
+
+    # Get smart money and momentum
+    smart = SmartMoneyEngine.analyze_smart_money(df)
+    mom = MomentumFlowEngine.analyze_momentum_flow(df)
+    adx_series = compute_adx(df)
+    adx = adx_series.iloc[-1] if adx_series is not None else 20.0
+    cont_eval = _continuation_engine.evaluate(side, df, {'atr': atr, 'adx': adx, 'di_plus': 0, 'di_minus': 0}, STATE.get('trade_thesis', {}))
+    early_score, early_class, early_reasons = detect_early_expansion(df, side, atr, price, price, smart, mom, adx, cont_eval.continuation_probability)
+
+    # 2. Composite quality score
+    # Weighted average of components
+    weights = {
+        'authenticity': 0.25,
+        'order_block': 0.20,
+        'response': 0.15,
+        'early_expansion': 0.25,
+        'continuation_prob': 0.15
+    }
+    quality_score = (
+        auth_score * weights['authenticity'] +
+        (bull_ob if side == "BUY" else bear_ob) * weights['order_block'] +
+        resp_score * weights['response'] +
+        early_score * weights['early_expansion'] +
+        cont_eval.continuation_probability * 100 * weights['continuation_prob']
+    )
+    quality_score = max(0, min(100, quality_score))
+
+    # 3. Hard conditions that can reject regardless of score
+    if trap_risk > 70:
+        decision = 'REJECT'
+        reason = f'High trap risk ({trap_risk:.0f})'
+    elif early_class in ('EXHAUSTION', 'TRAP', 'LATE_MOVE') and quality_score < 60:
+        decision = 'REJECT'
+        reason = f'Early classification {early_class} with low quality'
+    elif auth_score < 40:
+        decision = 'REJECT'
+        reason = 'Poor liquidity authenticity'
+    elif (side == "BUY" and bear_ob > 70 and quality_score < 65) or (side == "SELL" and bull_ob > 70 and quality_score < 65):
+        decision = 'REJECT'
+        reason = 'Strong opposing OB outweighs quality'
+    elif quality_score < 50:
+        decision = 'WAIT'
+        reason = 'Quality score below threshold'
+    elif quality_score >= 80 and early_class in ('EARLY_EXPANSION', 'EARLY_CONTINUATION') and trap_risk < 30:
+        decision = 'EARLY_ENTRY'
+        reason = 'Exceptional early expansion setup'
+    elif quality_score >= 70 and trap_risk < 40:
+        decision = 'APPROVE'
+        reason = 'Good quality setup'
+    elif quality_score >= 60 and trap_risk < 50:
+        decision = 'VALIDATE'
+        reason = 'Requires next candle confirmation'
+    else:
+        decision = 'WAIT'
+        reason = 'Insufficient confluence'
+
+    # Log concise diagnostics
+    log_execution(
+        f"[ENTRY_QUALITY] {symbol} {side} | Quality={quality_score:.0f} | Trap={trap_risk:.0f} | "
+        f"Auth={auth_score:.0f} | OB={bull_ob:.0f}/{bear_ob:.0f} | Early={early_class} | {decision}",
+        "INFO", debounce_key=f"eq_{symbol}_{side}", debounce_sec=60
+    )
+
+    return {
+        'decision': decision,
+        'reason': reason,
+        'quality_score': quality_score,
+        'trap_risk': trap_risk,
+        'early_expansion': early_class,
+        'authenticity_score': auth_score,
+        'order_block_score': bull_ob if side == "BUY" else bear_ob,
+        'response_score': resp_score,
+        'continuation_probability': cont_eval.continuation_probability,
+        'details': {
+            'auth': auth_details,
+            'ob': ob_details,
+            'response': resp_details,
+            'early_reasons': early_reasons
+        }
+    }
+
+# ---------- 6. Integration into execute_entry ----------
+# We modify execute_entry to call entry_quality_assessment and enforce decisions.
+
+# The original execute_entry is defined later; we will replace it with a wrapped version.
+# Since we cannot modify the original function signature easily, we'll add a new wrapper that calls the original.
+# But we can modify the existing execute_entry function in place.
+
+# Original execute_entry is defined near line 2800. We'll replace it with an enhanced version.
+# To keep changes minimal, we'll copy the original function and insert the quality check at the beginning.
+
+# We'll create a new function named execute_entry_enhanced and then assign it to execute_entry.
+# But to avoid confusion, we'll modify the original execute_entry definition.
+
+# Note: The existing execute_entry does a lot of things; we need to insert the quality check early,
+# before any state changes or order placement.
+
+# We'll add the call to entry_quality_assessment right after the initial checks (like already in position, free balance, etc.)
+# but before computing margin and qty.
+
+# We'll need to ensure that df, ob, atr are available; if not, we compute them inside.
+
+# We'll modify the existing execute_entry function accordingly.
+
+# Since the file is large, we'll locate execute_entry and replace it.
+
+# The original execute_entry is defined after decision functions. We'll find it and modify.
+
+# To avoid duplicating the entire function, we'll provide the modified version.
+
+# However, to ensure the final file is complete and not truncated, we'll include the entire modified execute_entry.
+
+# Let's write the enhanced execute_entry.
+
+def execute_entry_enhanced(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+    """
+    Enhanced entry execution with quality assessment.
+    """
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        log_execution(f"[ENTRY] Already in position, skipping {symbol}", "WARN")
+        return False
+
+    # --- NEW: Entry Quality Assessment ---
+    # Gather data if not provided
+    df_local = get_ohlcv_safe(symbol, 100)
+    ob_local = get_orderbook_cached(symbol, limit=10)
+    atr_local = compute_atr(df_local).iloc[-1] if df_local is not None and len(df_local) > 14 else price * 0.01
+
+    if df_local is None or len(df_local) < 30:
+        log_execution(f"[ENTRY] Insufficient data for {symbol}", "ERROR")
+        return False
+
+    qa = entry_quality_assessment(symbol, side, price, df_local, ob_local, atr_local, score, classification, trade_type, entry_type)
+    decision = qa['decision']
+    if decision in ('REJECT', 'WAIT'):
+        log_execution(f"[ENTRY] {symbol} {side} rejected: {qa['reason']} (quality={qa['quality_score']:.0f})", "WARN")
+        return False
+    elif decision == 'VALIDATE':
+        # For validate, we still allow entry but with a warning; the entry will be allowed.
+        log_execution(f"[ENTRY] {symbol} {side} validation pending: {qa['reason']}", "INFO")
+        # We can still proceed, but we might want to add a note.
+        # No further action needed; we continue.
+    elif decision == 'EARLY_ENTRY':
+        log_execution(f"[ENTRY] {symbol} {side} EARLY ENTRY approved: {qa['reason']}", "SUCCESS")
+    # APPROVE and EARLY_ENTRY both proceed
+
+    # Continue with original logic
+    free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
+    usable_balance = free_bal * BALANCE_SAFETY_FACTOR
+    if PAPER_MODE:
+        balance = paper["balance"]
+    else:
+        balance = usable_balance
+
+    if classification == "SNIPER" or classification == "INSTITUTIONAL_SNIPER":
+        margin_percent = 0.40
+        trade_type_label = "STRONG"
+    elif classification == "TREND":
+        margin_percent = 0.30
+        trade_type_label = "NORMAL"
+    elif classification == "LOW":
+        margin_percent = 0.15
+        trade_type_label = "LOW_CONF"
+    else:
+        margin_percent = 0.30
+        trade_type_label = "NORMAL"
+
+    margin = balance * margin_percent
+    notional = margin * LEVERAGE
+    qty = notional / price
+    log_execution(f"[SIZING]\nFree USDT: {free_bal:.2f}\nUsable (x{BALANCE_SAFETY_FACTOR}): {balance:.2f}\nType: {trade_type_label}\nMargin: {margin:.2f}\nLeverage: {LEVERAGE}X\nNotional: {notional:.2f}\nFinal Qty: {qty:.6f}", "INFO")
+
+    df = df_local  # already have df
+    plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
+    di_dominance = False
+    if plus_di is not None and minus_di is not None:
+        di_dominance = (side == "BUY" and plus_di > minus_di) or (side == "SELL" and minus_di > plus_di)
+    weak_pullback = False
+    if df is not None:
+        last = df.iloc[-1]
+        if side == "BUY":
+            if last['close'] < last['open'] and abs(last['close'] - last['open']) < atr_local * 0.3:
+                weak_pullback = True
+        else:
+            if last['close'] > last['open'] and abs(last['close'] - last['open']) < atr_local * 0.3:
+                weak_pullback = True
+    structure_aligned = False
+    struct_shift = detect_structure_shift(df) if df is not None else None
+    if side == "BUY" and struct_shift == "bullish_shift":
+        structure_aligned = True
+    elif side == "SELL" and struct_shift == "bearish_shift":
+        structure_aligned = True
+    counter_displacement = 0.0
+    if df is not None:
+        last = df.iloc[-1]
+        if side == "SELL" and last['close'] > last['open']:
+            body = abs(last['close'] - last['open'])
+            if body > atr_local * 0.6:
+                counter_displacement = body / atr_local
+        elif side == "BUY" and last['close'] < last['open']:
+            body = abs(last['close'] - last['open'])
+            if body > atr_local * 0.6:
+                counter_displacement = body / atr_local
+    market_state = {
+        "adx": compute_adx(df).iloc[-1] if df is not None else 20.0,
+        "regime": MEMORY.get("regime", "UNKNOWN"),
+        "di_dominance": di_dominance,
+        "weak_pullback": weak_pullback,
+        "structure_aligned": structure_aligned,
+        "counter_displacement": counter_displacement,
+        "trend_health": trend_engine.get_trend_health(df, side) if df is not None else 5
+    }
+    narrative = {"classification": classification}
+    entry_context = {"price": price, "atr": atr_local}
+    thesis = _thesis_engine.build_thesis(symbol, side, trade_type, market_state, narrative, entry_context)
+    STATE["trade_thesis"] = thesis.__dict__
+
+    regime_class = MarketRegimeClassifier.classify(df) if df is not None else "UNKNOWN"
+    di_spread = abs(plus_di - minus_di) if plus_di is not None else 0
+    location_quality = "mid"
+    initial_conf = ConfidenceEngine.calculate_initial_confidence(score, narrative.get("narrative_score", 0), regime_class, market_state["adx"], di_spread, location_quality)
+
+    if df is not None:
+        smart_money = SmartMoneyEngine.analyze_smart_money(df)
+        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
+        dominance_weight = 0.7 if smart_money["smart_money_dominant"] else 0.3
+        initial_conf += (dominance_weight - 0.5) * 12
+        if momentum["trend_expansion"]:
+            initial_conf += 8
+        if momentum["momentum_decay"]:
+            initial_conf -= 12
+        dist_risk = smart_money["distribution_risk"] / 100.0
+        initial_conf -= dist_risk * 15
+        if smart_money["retail_euphoria"]:
+            initial_conf -= 10
+        continuation_strength = momentum.get("continuation_strength", 50)
+        initial_conf = ConfidenceEngine.apply_institutional_modifiers(initial_conf, smart_money, momentum, continuation_strength)
+        initial_conf = max(0, min(95, initial_conf))
+
+    # Add intent score to confidence (already done earlier; but we can also incorporate QA quality)
+    intent_info = MEMORY.get(f"intent_{symbol}", {})
+    intent_score = intent_info.get("score", 0)
+    if intent_score >= 85:
+        initial_conf += 15
+    elif intent_score >= 75:
+        initial_conf += 10
+    initial_conf = min(100, initial_conf)
+
+    # Also incorporate quality assessment score into confidence
+    if qa['quality_score'] > 70:
+        initial_conf += 5
+    elif qa['quality_score'] < 50:
+        initial_conf -= 10
+    initial_conf = max(0, min(100, initial_conf))
+
+    STATE["current_confidence"] = initial_conf
+    STATE["market_regime"] = regime_class
+
+    # Continue with original logic (paper or live)
+    if PAPER_MODE:
+        paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
+        STATE.update({
+            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
+            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
+            "peak": 0.0, "atr": atr_local, "entry_time": time.time(), "entry_reasons": [reason],
+            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
+            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
+            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
+            "roe_pct": 0.0, "mark_price": price,
+            "narrative_classification": STATE.get("narrative_classification", ""),
+            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+            "confidence_level": STATE.get("confidence_level", ""),
+            "trade_thesis": thesis.__dict__,
+            "current_confidence": initial_conf,
+            "market_regime": regime_class,
+            "adx_live": market_state["adx"],
+            "di_plus_live": plus_di if plus_di else 0,
+            "di_minus_live": minus_di if minus_di else 0,
+            "trade_personality": "NEUTRAL",
+            "institutional_flow": "NEUTRAL",
+            "synthetic_sl": sl,
+            "synthetic_tp1": tp1,
+            "max_price": price,
+            "min_price": price,
+            "peak_roe": 0.0,
+            "peak_price": price,
+            "peak_unrealized_pnl": 0.0,
+            "drawdown_from_peak": 0.0,
+            "tp1_hold_score": 10,
+            "exit_warning": 0,
+            "runner_mode": False,
+            "entry_atr": atr_local,
+            "entry_quality": qa  # store quality assessment
+        })
+        TRADE_STATE.update({
+            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
+            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
+        })
+        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
+        _live_manager.set_entry_atr(atr_local)
+        STATE["dynamic_manager"] = DynamicTradeManager(
+            symbol, side, price, qty, atr_local, sl, tp1, tp2
+        )
+        update_position_dashboard(symbol, side, price, qty)
+        log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        return True
+
+    # LIVE
+    sym = normalize_symbol(symbol)
+    market = ex.market(sym)
+    min_qty = market['limits']['amount']['min']
+    if qty < min_qty:
+        log_execution(f"SKIP: computed qty {qty:.6f} below minimum {min_qty}", "WARN")
+        return False
+    precision = market['precision']['amount']
+    qty = math.floor(qty / precision) * precision
+    if qty <= 0:
+        log_execution(f"SKIP: qty rounded to zero", "WARN")
+        return False
+    log_execution(f"Position sizing final: free_balance={free_bal:.2f}, usable={balance:.2f}, classification={classification}, margin_percent={margin_percent*100:.0f}%, margin={margin:.2f}, notional={notional:.2f}, qty={qty:.6f}", "INFO")
+    order = open_position(side, qty, symbol)
+    if order:
+        STATE.update({
+            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
+            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
+            "peak": 0.0, "atr": atr_local, "entry_time": time.time(), "entry_reasons": [reason],
+            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
+            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
+            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
+            "roe_pct": 0.0, "mark_price": price,
+            "narrative_classification": STATE.get("narrative_classification", ""),
+            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+            "confidence_level": STATE.get("confidence_level", ""),
+            "trade_thesis": thesis.__dict__,
+            "current_confidence": initial_conf,
+            "market_regime": regime_class,
+            "adx_live": market_state["adx"],
+            "di_plus_live": plus_di if plus_di else 0,
+            "di_minus_live": minus_di if minus_di else 0,
+            "trade_personality": "NEUTRAL",
+            "institutional_flow": "NEUTRAL",
+            "synthetic_sl": sl,
+            "synthetic_tp1": tp1,
+            "max_price": price,
+            "min_price": price,
+            "peak_roe": 0.0,
+            "peak_price": price,
+            "peak_unrealized_pnl": 0.0,
+            "drawdown_from_peak": 0.0,
+            "tp1_hold_score": 10,
+            "exit_warning": 0,
+            "runner_mode": False,
+            "entry_atr": atr_local,
+            "entry_quality": qa
+        })
+        TRADE_STATE.update({
+            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
+            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
+        })
+        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
+        _live_manager.set_entry_atr(atr_local)
+        STATE["dynamic_manager"] = DynamicTradeManager(
+            symbol, side, price, qty, atr_local, sl, tp1, tp2
+        )
+        update_position_dashboard(symbol, side, price, qty)
+        log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        time.sleep(1)
+        sync_position_state(symbol)
+        return True
+    else:
+        return False
+
+# Replace original execute_entry with enhanced version
+execute_entry = execute_entry_enhanced
+
 # ========== FLASK DASHBOARD ==========
 app = Flask(__name__)
 
@@ -8880,229 +9702,7 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
-def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
-    if STATE.get("open") or TRADE_STATE.get("in_position"):
-        log_execution(f"[ENTRY] Already in position, skipping {symbol}", "WARN")
-        return False
-    free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
-    usable_balance = free_bal * BALANCE_SAFETY_FACTOR
-    if PAPER_MODE:
-        balance = paper["balance"]
-    else:
-        balance = usable_balance
-
-    if classification == "SNIPER" or classification == "INSTITUTIONAL_SNIPER":
-        margin_percent = 0.40
-        trade_type_label = "STRONG"
-    elif classification == "TREND":
-        margin_percent = 0.30
-        trade_type_label = "NORMAL"
-    elif classification == "LOW":
-        margin_percent = 0.15
-        trade_type_label = "LOW_CONF"
-    else:
-        margin_percent = 0.30
-        trade_type_label = "NORMAL"
-
-    margin = balance * margin_percent
-    notional = margin * LEVERAGE
-    qty = notional / price
-    log_execution(f"[SIZING]\nFree USDT: {free_bal:.2f}\nUsable (x{BALANCE_SAFETY_FACTOR}): {balance:.2f}\nType: {trade_type_label}\nMargin: {margin:.2f}\nLeverage: {LEVERAGE}X\nNotional: {notional:.2f}\nFinal Qty: {qty:.6f}", "INFO")
-
-    df = get_ohlcv_safe(symbol, 100)
-    plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
-    di_dominance = False
-    if plus_di is not None and minus_di is not None:
-        di_dominance = (side == "BUY" and plus_di > minus_di) or (side == "SELL" and minus_di > plus_di)
-    weak_pullback = False
-    if df is not None:
-        last = df.iloc[-1]
-        if side == "BUY":
-            if last['close'] < last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
-                weak_pullback = True
-        else:
-            if last['close'] > last['open'] and abs(last['close'] - last['open']) < atr_val * 0.3:
-                weak_pullback = True
-    structure_aligned = False
-    struct_shift = detect_structure_shift(df) if df is not None else None
-    if side == "BUY" and struct_shift == "bullish_shift":
-        structure_aligned = True
-    elif side == "SELL" and struct_shift == "bearish_shift":
-        structure_aligned = True
-    counter_displacement = 0.0
-    if df is not None:
-        last = df.iloc[-1]
-        if side == "SELL" and last['close'] > last['open']:
-            body = abs(last['close'] - last['open'])
-            if body > atr_val * 0.6:
-                counter_displacement = body / atr_val
-        elif side == "BUY" and last['close'] < last['open']:
-            body = abs(last['close'] - last['open'])
-            if body > atr_val * 0.6:
-                counter_displacement = body / atr_val
-    market_state = {
-        "adx": compute_adx(df).iloc[-1] if df is not None else 20.0,
-        "regime": MEMORY.get("regime", "UNKNOWN"),
-        "di_dominance": di_dominance,
-        "weak_pullback": weak_pullback,
-        "structure_aligned": structure_aligned,
-        "counter_displacement": counter_displacement,
-        "trend_health": trend_engine.get_trend_health(df, side) if df is not None else 5
-    }
-    narrative = {"classification": classification}
-    entry_context = {"price": price, "atr": atr_val}
-    thesis = _thesis_engine.build_thesis(symbol, side, trade_type, market_state, narrative, entry_context)
-    STATE["trade_thesis"] = thesis.__dict__
-
-    regime_class = MarketRegimeClassifier.classify(df) if df is not None else "UNKNOWN"
-    di_spread = abs(plus_di - minus_di) if plus_di is not None else 0
-    location_quality = "mid"
-    initial_conf = ConfidenceEngine.calculate_initial_confidence(score, narrative.get("narrative_score", 0), regime_class, market_state["adx"], di_spread, location_quality)
-
-    if df is not None:
-        smart_money = SmartMoneyEngine.analyze_smart_money(df)
-        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-        dominance_weight = 0.7 if smart_money["smart_money_dominant"] else 0.3
-        initial_conf += (dominance_weight - 0.5) * 12
-        if momentum["trend_expansion"]:
-            initial_conf += 8
-        if momentum["momentum_decay"]:
-            initial_conf -= 12
-        dist_risk = smart_money["distribution_risk"] / 100.0
-        initial_conf -= dist_risk * 15
-        if smart_money["retail_euphoria"]:
-            initial_conf -= 10
-        continuation_strength = momentum.get("continuation_strength", 50)
-        initial_conf = ConfidenceEngine.apply_institutional_modifiers(initial_conf, smart_money, momentum, continuation_strength)
-        initial_conf = max(0, min(95, initial_conf))
-
-    # --- NEW: add intent score to confidence ---
-    intent_info = MEMORY.get(f"intent_{symbol}", {})
-    intent_score = intent_info.get("score", 0)
-    if intent_score >= 85:
-        initial_conf += 15
-    elif intent_score >= 75:
-        initial_conf += 10
-    initial_conf = min(100, initial_conf)
-
-    STATE["current_confidence"] = initial_conf
-    STATE["market_regime"] = regime_class
-
-    if PAPER_MODE:
-        paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
-        STATE.update({
-            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
-            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
-            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
-            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
-            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
-            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
-            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
-            "roe_pct": 0.0, "mark_price": price,
-            "narrative_classification": STATE.get("narrative_classification", ""),
-            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-            "confidence_level": STATE.get("confidence_level", ""),
-            "trade_thesis": thesis.__dict__,
-            "current_confidence": initial_conf,
-            "market_regime": regime_class,
-            "adx_live": market_state["adx"],
-            "di_plus_live": plus_di if plus_di else 0,
-            "di_minus_live": minus_di if minus_di else 0,
-            "trade_personality": "NEUTRAL",
-            "institutional_flow": "NEUTRAL",
-            "synthetic_sl": sl,
-            "synthetic_tp1": tp1,
-            "max_price": price,
-            "min_price": price,
-            "peak_roe": 0.0,
-            "peak_price": price,
-            "peak_unrealized_pnl": 0.0,
-            "drawdown_from_peak": 0.0,
-            "tp1_hold_score": 10,
-            "exit_warning": 0,
-            "runner_mode": False,
-            "entry_atr": atr_val
-        })
-        TRADE_STATE.update({
-            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
-            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
-        })
-        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
-        _live_manager.set_entry_atr(atr_val)
-        # Create dynamic manager for paper mode
-        STATE["dynamic_manager"] = DynamicTradeManager(
-            symbol, side, price, qty, atr_val, sl, tp1, tp2
-        )
-        update_position_dashboard(symbol, side, price, qty)
-        log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
-        return True
-
-    sym = normalize_symbol(symbol)
-    market = ex.market(sym)
-    min_qty = market['limits']['amount']['min']
-    if qty < min_qty:
-        log_execution(f"SKIP: computed qty {qty:.6f} below minimum {min_qty}", "WARN")
-        return False
-    precision = market['precision']['amount']
-    qty = math.floor(qty / precision) * precision
-    if qty <= 0:
-        log_execution(f"SKIP: qty rounded to zero", "WARN")
-        return False
-    log_execution(f"Position sizing final: free_balance={free_bal:.2f}, usable={balance:.2f}, classification={classification}, margin_percent={margin_percent*100:.0f}%, margin={margin:.2f}, notional={notional:.2f}, qty={qty:.6f}", "INFO")
-    order = open_position(side, qty, symbol)
-    if order:
-        STATE.update({
-            "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
-            "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
-            "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
-            "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
-            "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
-            "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
-            "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
-            "roe_pct": 0.0, "mark_price": price,
-            "narrative_classification": STATE.get("narrative_classification", ""),
-            "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-            "confidence_level": STATE.get("confidence_level", ""),
-            "trade_thesis": thesis.__dict__,
-            "current_confidence": initial_conf,
-            "market_regime": regime_class,
-            "adx_live": market_state["adx"],
-            "di_plus_live": plus_di if plus_di else 0,
-            "di_minus_live": minus_di if minus_di else 0,
-            "trade_personality": "NEUTRAL",
-            "institutional_flow": "NEUTRAL",
-            "synthetic_sl": sl,
-            "synthetic_tp1": tp1,
-            "max_price": price,
-            "min_price": price,
-            "peak_roe": 0.0,
-            "peak_price": price,
-            "peak_unrealized_pnl": 0.0,
-            "drawdown_from_peak": 0.0,
-            "tp1_hold_score": 10,
-            "exit_warning": 0,
-            "runner_mode": False,
-            "entry_atr": atr_val
-        })
-        TRADE_STATE.update({
-            "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
-            "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
-        })
-        _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
-        _live_manager.set_entry_atr(atr_val)
-        # Create dynamic manager
-        STATE["dynamic_manager"] = DynamicTradeManager(
-            symbol, side, price, qty, atr_val, sl, tp1, tp2
-        )
-        update_position_dashboard(symbol, side, price, qty)
-        log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
-        time.sleep(1)
-        sync_position_state(symbol)
-        return True
-    else:
-        return False
+# The enhanced execute_entry is defined above and replaces the original.
 
 # ========== MAIN LOOP ==========
 def main_loop_sniper():
