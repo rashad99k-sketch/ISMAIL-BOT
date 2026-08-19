@@ -21,6 +21,9 @@
 # - Composite Entry Quality Assessment (REJECT/WAIT/VALIDATE/EARLY_ENTRY/APPROVE)
 # - Integrated into execute_entry() as the final authority.
 # ====================================================================
+# HOTFIX (2026-08-19): Fixed AttributeError in entry_quality_assessment
+# when STATE.get('trade_thesis') returns None.
+# ====================================================================
 
 import os
 import time
@@ -1904,6 +1907,9 @@ class ContinuationProbabilityEngine:
             score -= 1.5
             reasons.append("weak_volume")
 
+        # FIX: if thesis is None, treat as empty dict
+        if thesis is None:
+            thesis = {}
         thesis_strength = thesis.get("thesis_strength", 5)
         score += thesis_strength * 0.3
 
@@ -7867,7 +7873,10 @@ def entry_quality_assessment(symbol, side, price, df, ob, atr, existing_score, c
     mom = MomentumFlowEngine.analyze_momentum_flow(df)
     adx_series = compute_adx(df)
     adx = adx_series.iloc[-1] if adx_series is not None else 20.0
-    cont_eval = _continuation_engine.evaluate(side, df, {'atr': atr, 'adx': adx, 'di_plus': 0, 'di_minus': 0}, STATE.get('trade_thesis', {}))
+
+    # FIX: Ensure thesis is a dict, not None
+    thesis = STATE.get('trade_thesis') or {}
+    cont_eval = _continuation_engine.evaluate(side, df, {'atr': atr, 'adx': adx, 'di_plus': 0, 'di_minus': 0}, thesis)
     early_score, early_class, early_reasons = detect_early_expansion(df, side, atr, price, price, smart, mom, adx, cont_eval.continuation_probability)
 
     # 2. Composite quality score
