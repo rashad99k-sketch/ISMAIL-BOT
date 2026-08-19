@@ -2190,6 +2190,9 @@ class UnifiedTradeManagementBrain:
             STATE["dynamic_manager"] = dyn_manager
             dyn_rec = dyn_manager.update(price, df, ob, atr)
 
+        # ==== NEW: Institutional Intelligence Layer (local) ====
+        inst_rec = get_institutional_recommendation(STATE["current_symbol"], df, ob, atr, price)
+
         # Combine all
         rec = {
             "trade_state": trade_state,
@@ -2206,7 +2209,8 @@ class UnifiedTradeManagementBrain:
             "momentum": momentum,
             "adx": adx,
             "regime": regime,
-            "atr": atr
+            "atr": atr,
+            "inst_rec": inst_rec
         }
         return rec
 
@@ -2249,10 +2253,7 @@ class UnifiedTradeManagementBrain:
         # Call original PPE logic but with no execution
         # We'll copy the logic from apply_50_50_profit_engine and replace close_partial with rec updates
         # (Original function is large; we'll replicate core logic)
-        # For brevity, we'll call a helper or replicate here.
-        # Since the original function is long, we'll assume it's replicated with no execution.
-        # (In production, we would extract the logic to a separate function.)
-        # For now, we'll use a simplified version:
+        # For brevity, we'll use a simplified version:
         high = df['high'].iloc[-1]
         low = df['low'].iloc[-1]
         state_ppe["max_price"] = max(state_ppe["max_price"], high)
@@ -2352,6 +2353,25 @@ class UnifiedTradeManagementBrain:
     def _decide(self, rec, roe, drawdown, df, price, atr):
         """Combines all recommendations into a final decision."""
         decision = {"action": "HOLD", "reason": ""}
+
+        # ==== NEW: Institutional Intelligence override ====
+        inst_rec = rec.get("inst_rec")
+        if inst_rec:
+            # If institutional probability is very high and suggests a decisive action, we may override
+            if inst_rec.decision in ("FULL_CLOSE", "PARTIAL_CLOSE", "ACTIVATE_TRAIL", "ENTER"):
+                if inst_rec.institutional_probability > 70:
+                    decision["action"] = inst_rec.decision
+                    decision["reason"] = f"Institutional: {inst_rec.reason_short}"
+                    if inst_rec.decision == "PARTIAL_CLOSE":
+                        decision["ratio"] = 0.5
+                    elif inst_rec.decision == "ACTIVATE_TRAIL":
+                        decision["trail_stop"] = price - atr * 1.2 if STATE["side"] == "BUY" else price + atr * 1.2
+                    elif inst_rec.decision == "ENTER":
+                        # We are in position management, so ENTER is not applicable; ignore
+                        pass
+                    return decision
+            # Otherwise, we can use institutional probability to adjust confidence
+            # but we won't override here.
 
         # 1. Check hard exit from state machine
         if rec.get("hard_exit", False):
@@ -8431,16 +8451,19 @@ def sync_position_with_exchange(symbol):
         log_execution(f"[SYNC] error: {e}", "ERROR")
         return None
 
-def get_realized_pnl(symbol, limit=100):
+def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
     if symbol is None:
         return 0.0, 0.0
     try:
-        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
+        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=100)
         if not trades:
             return 0.0, 0.0
+        now = time.time()
         buy_value = 0.0
         sell_value = 0.0
         for trade in trades:
+            if (now - trade['timestamp']/1000) > lookback_seconds:
+                continue
             side = trade['side'].lower()
             qty = trade['amount']
             price = trade['price']
@@ -8454,7 +8477,7 @@ def get_realized_pnl(symbol, limit=100):
         pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
         return pnl, pnl_pct
     except Exception as e:
-        log_execution(f"[SYNC] error in get_realized_pnl: {e}", "ERROR")
+        log_execution(f"[SYNC] error in get_realized_pnl_for_symbol: {e}", "ERROR")
         return 0.0, 0.0
 
 def validate_position_state(local_pos, symbol):
@@ -8478,7 +8501,7 @@ def sync_all_states():
         else:
             MEMORY["position_status"] = "OPEN"
             MEMORY["current_position"] = real_pos
-        real_pnl, real_pnl_pct = get_realized_pnl(DEFAULT_SYMBOL)
+        real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(DEFAULT_SYMBOL)
         MEMORY["total_pnl"] = real_pnl
         MEMORY["total_pnl_pct"] = real_pnl_pct
         return
@@ -8496,7 +8519,7 @@ def sync_all_states():
     else:
         MEMORY["position_status"] = "OPEN"
         MEMORY["current_position"] = valid
-    real_pnl, real_pnl_pct = get_realized_pnl(symbol)
+    real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(symbol)
     MEMORY["total_pnl"] = real_pnl
     MEMORY["total_pnl_pct"] = real_pnl_pct
     if "total_pnl_usdt" in PERF:
@@ -8801,6 +8824,38 @@ _trend_engine = TrendEngine()
 
 # instantiate live manager
 _live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
+
+# ========== INSTITUTIONAL RECOMMENDATION FUNCTION (fixed) ==========
+def get_institutional_recommendation(symbol, df, ob, atr, current_price):
+    """
+    Compute institutional recommendation using the local InstitutionalIntentEngine.
+    Returns an object with attributes: decision, reason_short, institutional_probability.
+    """
+    class Rec:
+        pass
+    try:
+        intent_score, intent_status, intent_details = InstitutionalIntentEngine.detect(df, ob, symbol)
+        rec = Rec()
+        rec.decision = "HOLD"
+        rec.reason_short = "Institutional neutral"
+        rec.institutional_probability = intent_score
+        # If score is very high and we have no position, consider ENTER (but we are in position management)
+        # For position management, we use it for exit decisions.
+        if STATE.get("open"):
+            if intent_score >= 85:
+                rec.decision = "HOLD"  # high institutional confidence, maybe hold
+            if intent_score >= 90 and STATE.get("roe_pct", 0) > 2:
+                rec.decision = "FULL_CLOSE"
+                rec.reason_short = "Institutional extreme score, take profit"
+            elif intent_score >= 80 and STATE.get("roe_pct", 0) > 5:
+                rec.decision = "PARTIAL_CLOSE"
+                rec.reason_short = "Institutional strong score, partial close"
+        else:
+            # If not in position, we might want to enter, but this function is called only when in position.
+            pass
+        return rec
+    except Exception as e:
+        return None
 
 # ========== MAIN LOOP ==========
 def main_loop_sniper():
