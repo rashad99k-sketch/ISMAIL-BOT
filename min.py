@@ -40,6 +40,9 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+# ==== NEW: Institutional Intelligence Integration ====
+import institutional_intelligence as inst
+
 # ========== ENUM FOR TRADE LIFECYCLE ==========
 class TradeLifecycleState(Enum):
     IDLE = "IDLE"
@@ -2190,8 +2193,12 @@ class UnifiedTradeManagementBrain:
             STATE["dynamic_manager"] = dyn_manager
             dyn_rec = dyn_manager.update(price, df, ob, atr)
 
-        # ==== NEW: Institutional Intelligence Layer (local) ====
-        inst_rec = get_institutional_recommendation(STATE["current_symbol"], df, ob, atr, price)
+        # ==== NEW: Institutional Intelligence Layer ====
+        inst_rec = None
+        try:
+            inst_rec = get_institutional_recommendation(STATE["current_symbol"], df, ob, atr, price)
+        except Exception as e:
+            log_execution(f"[UTMB] Institutional Intelligence failed: {e}", "WARN")
 
         # Combine all
         rec = {
@@ -8451,19 +8458,16 @@ def sync_position_with_exchange(symbol):
         log_execution(f"[SYNC] error: {e}", "ERROR")
         return None
 
-def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
+def get_realized_pnl(symbol, limit=100):
     if symbol is None:
         return 0.0, 0.0
     try:
-        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=100)
+        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
         if not trades:
             return 0.0, 0.0
-        now = time.time()
         buy_value = 0.0
         sell_value = 0.0
         for trade in trades:
-            if (now - trade['timestamp']/1000) > lookback_seconds:
-                continue
             side = trade['side'].lower()
             qty = trade['amount']
             price = trade['price']
@@ -8477,7 +8481,7 @@ def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
         pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
         return pnl, pnl_pct
     except Exception as e:
-        log_execution(f"[SYNC] error in get_realized_pnl_for_symbol: {e}", "ERROR")
+        log_execution(f"[SYNC] error in get_realized_pnl: {e}", "ERROR")
         return 0.0, 0.0
 
 def validate_position_state(local_pos, symbol):
@@ -8501,7 +8505,7 @@ def sync_all_states():
         else:
             MEMORY["position_status"] = "OPEN"
             MEMORY["current_position"] = real_pos
-        real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(DEFAULT_SYMBOL)
+        real_pnl, real_pnl_pct = get_realized_pnl(DEFAULT_SYMBOL)
         MEMORY["total_pnl"] = real_pnl
         MEMORY["total_pnl_pct"] = real_pnl_pct
         return
@@ -8519,7 +8523,7 @@ def sync_all_states():
     else:
         MEMORY["position_status"] = "OPEN"
         MEMORY["current_position"] = valid
-    real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(symbol)
+    real_pnl, real_pnl_pct = get_realized_pnl(symbol)
     MEMORY["total_pnl"] = real_pnl
     MEMORY["total_pnl_pct"] = real_pnl_pct
     if "total_pnl_usdt" in PERF:
@@ -8825,38 +8829,6 @@ _trend_engine = TrendEngine()
 # instantiate live manager
 _live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
 
-# ========== INSTITUTIONAL RECOMMENDATION FUNCTION (fixed) ==========
-def get_institutional_recommendation(symbol, df, ob, atr, current_price):
-    """
-    Compute institutional recommendation using the local InstitutionalIntentEngine.
-    Returns an object with attributes: decision, reason_short, institutional_probability.
-    """
-    class Rec:
-        pass
-    try:
-        intent_score, intent_status, intent_details = InstitutionalIntentEngine.detect(df, ob, symbol)
-        rec = Rec()
-        rec.decision = "HOLD"
-        rec.reason_short = "Institutional neutral"
-        rec.institutional_probability = intent_score
-        # If score is very high and we have no position, consider ENTER (but we are in position management)
-        # For position management, we use it for exit decisions.
-        if STATE.get("open"):
-            if intent_score >= 85:
-                rec.decision = "HOLD"  # high institutional confidence, maybe hold
-            if intent_score >= 90 and STATE.get("roe_pct", 0) > 2:
-                rec.decision = "FULL_CLOSE"
-                rec.reason_short = "Institutional extreme score, take profit"
-            elif intent_score >= 80 and STATE.get("roe_pct", 0) > 5:
-                rec.decision = "PARTIAL_CLOSE"
-                rec.reason_short = "Institutional strong score, partial close"
-        else:
-            # If not in position, we might want to enter, but this function is called only when in position.
-            pass
-        return rec
-    except Exception as e:
-        return None
-
 # ========== MAIN LOOP ==========
 def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, _last_queue_promote, _last_queue_eval
@@ -9016,6 +8988,56 @@ def safe_main_loop():
             except Exception as log_err:
                 print(f"Failed to log: {log_err}")
             time.sleep(5)
+
+# ==== NEW: Institutional Intelligence Wrapper ====
+def get_institutional_recommendation(symbol, df, ob, atr, current_price):
+    """Wrapper to call the institutional intelligence layer."""
+    try:
+        # Prepare symbols for migration (use radar_top5 or default)
+        symbols_list = MEMORY.get("radar_top5", [])
+        if not symbols_list:
+            symbols_list = [symbol]  # fallback
+        # Extract symbol names
+        symbol_names = [s.get("symbol") if isinstance(s, dict) else s for s in symbols_list]
+        if symbol not in symbol_names:
+            symbol_names.append(symbol)
+        symbol_names = list(set(symbol_names))[:20]  # limit
+
+        rec = inst.run_institutional_intelligence(
+            symbol=symbol,
+            df=df,
+            ob=ob,
+            atr=atr,
+            current_price=current_price,
+            state=STATE,
+            memory=MEMORY,
+            compute_atr_func=compute_atr,
+            compute_adx_func=compute_adx,
+            compute_rsi_func=compute_rsi,
+            detect_bos_func=detect_bos,
+            detect_structure_shift_func=detect_structure_shift,
+            detect_order_block_func=detect_order_block,
+            detect_fvg_func=detect_fvg,
+            detect_sweep_func=detect_sweep,
+            build_liquidity_pools_func=build_liquidity_pools,
+            candle_rejection_func=candle_rejection,
+            detect_displacement_func=detect_displacement,
+            classify_volume_func=classify_volume,
+            get_clustered_zones_func=get_clustered_zones,
+            get_sector_func=get_sector,
+            get_ticker_safe_func=get_ticker_safe,
+            get_orderbook_cached_func=get_orderbook_cached,
+            SmartMoneyEngine_class=SmartMoneyEngine,
+            MomentumFlowEngine_class=MomentumFlowEngine,
+            log_execution_func=log_execution,
+            safe_json_func=safe_json,
+            df_getter_for_migration=get_ohlcv_safe,
+            symbols_list_for_migration=symbol_names
+        )
+        return rec
+    except Exception as e:
+        log_execution(f"[INST_WRAPPER] Error: {traceback.format_exc()}", "ERROR")
+        return None
 
 if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
