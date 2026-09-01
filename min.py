@@ -4912,13 +4912,22 @@ def evaluate_liquidity_narrative(df, ob, atr, side):
     return narrative, score
 
 def smart_opportunity_selection():
+    # Gate: confinement to the 40 chosen by the 20-min Global Scanner cycle.
+    # Active-Candidate analysis must not scan sources outside the 40 universe.
+    # Bootstrap: before the first cycle completes the gate stays open so the
+    # watchlist store can be populated; afterwards it is strict.
+    universe = set(MEMORY.get("candidate_universe", []))
     candidates = []
     for c in MEMORY.get("scanner_v2_buy", [])[:5]:
+        if universe and c["symbol"] not in universe:
+            continue
         candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"], "source": "v2"})
     for c in MEMORY.get("scanner_v2_sell", [])[:5]:
+        if universe and c["symbol"] not in universe:
+            continue
         candidates.append({"symbol": c["symbol"], "side": "SELL", "score": c["score"], "source": "v2"})
     for c in MEMORY.get("rf_watchlist", [])[:10]:
-        if c.get("rf_signal") in ("BUY", "SELL"):
+        if c.get("rf_signal") in ("BUY", "SELL") and (not universe or c["symbol"] in universe):
             candidates.append({"symbol": c["symbol"], "side": c["rf_signal"], "score": c["score"], "source": "rf"})
     seen = {}
     for cand in candidates:
@@ -7631,9 +7640,9 @@ def global_discovery_scan():
         candidates.append({"symbol": s["symbol"], "score": s["score"], "side": "SELL", "source": "scanner_v2"})
         store_intent_for_symbol(s["symbol"])
 
-    # 2. RF Scanner
+    # 2. RF Scanner (full native output so the 40 are genuine proximity picks)
     rf_candidates = scan_market_rf(top_n=20)
-    for r in rf_candidates[:10]:
+    for r in rf_candidates[:20]:
         side = r.get("rf_signal")
         if side in ("BUY", "SELL"):
             candidates.append({"symbol": r["symbol"], "score": r["score"]*10, "side": side, "source": "rf"})
@@ -7654,9 +7663,17 @@ def global_discovery_scan():
             candidates.append({"symbol": sym, "score": 0, "side": "SELL", "source": "random"})
             store_intent_for_symbol(sym)
 
-    # Sort by score, keep top 40
+    # Sort by score, keep top 40 unique symbols (dedupe BUY/SELL per symbol).
+    # Zero-score exploration fillers (random discovery) can never enter the 40:
+    # the 40 must be genuine strategy-proximity picks, nothing random.
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    top_candidates = candidates[:40]
+    top_candidates = []
+    _seen_syms = set()
+    for item in candidates:
+        if item["symbol"] not in _seen_syms and item.get("score", 0) > 0:
+            _seen_syms.add(item["symbol"])
+            top_candidates.append(item)
+    top_candidates = top_candidates[:40]
 
     # Update watchlist (MEMORY["watchlist"])
     for item in top_candidates:
@@ -7681,6 +7698,28 @@ def global_discovery_scan():
         # Already stored intent above; but ensure it's stored for all
         store_intent_for_symbol(sym)
 
+    # --- SINGLE SOURCE OF TRUTH: the 40 chosen by this Global Scanner cycle ---
+    # The 40 become the current cycle's candidate universe (watchlist). Nothing
+    # outside these 40 may reach Active Candidates without a recorded explicit
+    # reason. Between cycles the system only re-evaluates these 40; the universe
+    # itself is replaced/updated at the next cycle.
+    universe = [item["symbol"] for item in top_candidates]
+    universe_set = set(universe)
+    MEMORY["candidate_universe"] = universe
+    MEMORY["watchlist"] = {k: v for k, v in MEMORY["watchlist"].items() if k in universe_set}
+    source_counts = {}
+    for _c in candidates:
+        _src = _c.get("source", "unknown")
+        source_counts[_src] = source_counts.get(_src, 0) + 1
+    MEMORY["scan_cycle"] = {
+        "cycle": MEMORY.get("scan_cycle", {}).get("cycle", 0) + 1,
+        "started_at": start_time,
+        "finished_at": time.time(),
+        "count": len(universe),
+        "ranked_by": "score_desc",
+        "sources": source_counts,
+    }
+
     # Also update radar_top5 for compatibility
     radar_top = [{"symbol": c["symbol"], "score": c["score"]} for c in top_candidates[:5]]
     MEMORY["radar_top5"] = radar_top
@@ -7696,20 +7735,18 @@ def promote_to_queue():
         return
 
     watchlist = []
-    # Combine from multiple watchlist sources
-    for source in (MEMORY.get("watchlist", {}).values(),
-                   MEMORY.get("rf_watchlist", []),
-                   MEMORY.get("scanner_v2_buy", []),
-                   MEMORY.get("scanner_v2_sell", [])):
-        if isinstance(source, dict):
-            # if it's a dict of entries
-            for item in source.values():
-                if isinstance(item, dict) and "symbol" in item:
-                    watchlist.append(item)
-        elif isinstance(source, list):
-            for item in source:
-                if isinstance(item, dict) and "symbol" in item:
-                    watchlist.append(item)
+    # SINGLE SOURCE OF TRUTH: only the 40 chosen each 20-min Global Scanner
+    # cycle may feed Active Candidates -- never independent scanner stores.
+    universe = MEMORY.get("candidate_universe") or []
+    for sym in universe:
+        entry = MEMORY.get("watchlist", {}).get(sym)
+        if isinstance(entry, dict) and "symbol" in entry:
+            watchlist.append(entry)
+    if not universe:
+        # Bootstrap fallback until the first 20-min cycle completes: watchlist
+        # store only (still never the independent scanner stores).
+        watchlist = [item for item in MEMORY.get("watchlist", {}).values()
+                     if isinstance(item, dict) and "symbol" in item]
 
     best_per_symbol = {}
     for item in watchlist:
@@ -9187,6 +9224,8 @@ MEMORY = {
     "radar_top5": [],
     "log_debounce": {},
     "watchlist": {},
+    "candidate_universe": [],
+    "scan_cycle": {},
     "no_entry_feed": [],
     "decision_log": []
 }
