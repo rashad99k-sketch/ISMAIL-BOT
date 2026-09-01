@@ -6621,8 +6621,15 @@ class ExecutionCandidate:
     original_reason: str = ""
     signal_type: str = ""
 
+    # Advisory early-entry confluence layer (see SmartZoneCrossoverIntelligence).
+    # Purely evidence/observability: stored, logged and surfaced on the queue.
+    # The small add-only bonus is applied to ZoneMetrics, never a hard gate, and
+    # never alters the READY decision authority in _update_state / execute_entry.
+    early_entry: dict = field(default_factory=dict)
+    evidence: dict = field(default_factory=dict)
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             'symbol': self.symbol,
             'side': self.side,
             'entry_price': self.entry_price,
@@ -6644,6 +6651,388 @@ class ExecutionCandidate:
             'evaluation_count': self.evaluation_count,
             'last_update': self.last_evaluated
         }
+        ee = self.early_entry or {}
+        if ee:
+            d['early_entry'] = {
+                'phase': ee.get('phase'),
+                'convergence_score': ee.get('convergence_score'),
+                'directional_bias': ee.get('directional_bias'),
+                'action': ee.get('action'),
+                'confidence': ee.get('confidence'),
+                'score_shift': ee.get('score_shift'),
+            }
+        return d
+
+class SmartZoneCrossoverIntelligence:
+    """Advisory early-entry confluence intelligence (native to ISMAIL-BOT).
+
+    Detects the START of an institutional move out of a fresh Zone / Order Block.
+    It evaluates INDEPENDENT evidence and reports a PHASE (FIRST / DEVELOPING /
+    LATE) together with structured, explainable evidence. It does NOT gate entry
+    and does NOT become a second execution engine -- it only feeds evidence into
+    the ExecutionQueue and nudges ZoneMetrics via a bounded, add-only advisory
+    bonus. All indicator math reuses MIN.PY's own primitives (RFEngine, VWAP /
+    get_vwap_narrative, compute_adx + ADXDIIntelligence, ema, native
+    build_liquidity_pools / detect_sweep / classify_sweep / detect_stop_hunt /
+    detect_bos / detect_structure_shift, classify_volume, candle_rejection,
+    compute_zone_strength) -- nothing is recreated or replaced.
+
+    The yellow VWeb line is VWeb = VWAP (cumulative, get_vwap_narrative), and is
+    NEVER ADX. ADX is a separate, independent signal.
+
+    Convergence deliberately does NOT require every indicator to cross: the
+    earliest transfer (>=1 independent read) already counts, so the layer
+    recognises meaningful confluence at a meaningful zone rather than overfitting.
+    """
+
+    # Phase thresholds (in ATR units of distance from the causal zone).
+    _FIRST_ATR = 0.5      # at/inside the zone envelope -> FIRST possible
+    _DEV_ATR = 1.5        # up to here -> DEVELOPING
+    # advisory bonus bounds (add-only, capped small so it can never flip gating)
+    _BONUS_MAX = 3.0
+    _BONUS_MIN = 0.0
+
+    def analyze(self, df, side, entry_price, atr, rf_signal=None):
+        """Return an advisory evidence dict for a candidate.
+
+        ``side`` is 'BUY'/'SELL'; ``entry_price`` is the zone/OB price;
+        ``rf_signal`` is the existing RFEngine signal ('BUY'/'SELL'/None).
+        Reuses the bot's own sweep / BOS / structure primitives for consistency.
+        """
+        result = self._empty(side)
+        if df is None or not hasattr(df, 'iloc') or len(df) < 40 or atr <= 0:
+            result["reasons"].append("insufficient_data")
+            result["phase"] = "LATE"
+            result["action"] = "NONE"
+            return result
+
+        d = "BUY" if str(side).upper() in ("BUY", "LONG") else "SELL"
+        price = float(df["close"].iloc[-1])
+        entry = float(entry_price or price)
+
+        # ---- Zone distance (ATR units) -> phase core -------------------------
+        dist_atr = abs(price - entry) / atr if atr > 0 else 99.0
+        result["distance_from_zone_atr"] = round(dist_atr, 3)
+
+        # ---- Zone quality (native OB wick + native zone-volume) --------------
+        zone_quality = self._zone_quality(df, d, entry, atr)
+        result["zone_quality"] = zone_quality
+
+        # ---- Liquidity event (native sweep / stop-hunt) ----------------------
+        liq = self._liquidity_event(df, d)
+        result["liquidity_event"] = liq
+        result["liquidity_score"] = 3.0 if liq in ("SWEEP", "STOP_HUNT") else (1.5 if liq == "FAKE_BREAK" else 0.0)
+
+        # ---- Market structure (native BOS / CHoCH) ---------------------------
+        bos_up, bos_down = self._bos(df)
+        shift = self._structure_shift(df)
+        if d == "BUY":
+            result["structure_state"] = "MSS" if shift == "bullish_shift" else ("BOS" if bos_up else "NONE")
+        else:
+            result["structure_state"] = "MSS" if shift == "bearish_shift" else ("BOS" if bos_down else "NONE")
+        result["structure_aligned"] = result["structure_state"] in ("MSS", "BOS")
+
+        # ---- Retest / mitigation near the zone -------------------------------
+        near = abs(price - entry) / entry < 0.003 if entry else False
+        result["retest_mitigation"] = bool(near)
+
+        # ---- Volume / zone-volume confirmation (native) ----------------------
+        vol_state = "NONE"
+        try:
+            vol_state = classify_volume(df)
+        except Exception:
+            pass
+        result["volume_state"] = vol_state
+        result["volume_confirmation"] = vol_state in ("expansion", "spike", "normal")
+        result["zone_volume"] = self._zone_volume(df, d, entry, atr)
+
+        # ---- Indicator confluence (VWeb + EMA + ADX), NOT a gate -------------
+        vweb = self._vweb_aligned(df, d)
+        ema_ok = self._ema_aligned(df, d)
+        adx_ok = self._adx_aligned(df, d)
+        result["vweb_aligned"] = bool(vweb)
+        result["ema_aligned"] = bool(ema_ok)
+        result["adx_aligned"] = bool(adx_ok)
+        # convergence = how many independent reads agree (0..3). Deliberately
+        # NOT "all must cross" -- the earliest transfer (>=1) already counts.
+        result["convergence_score"] = int(bool(vweb)) + int(bool(ema_ok)) + int(bool(adx_ok))
+
+        # ---- RF alignment (part of confluence, never a veto) -----------------
+        rf = (rf_signal or "").strip().upper()
+        result["rf"] = rf if rf in ("BUY", "SELL") else "NONE"
+        result["rf_aligned"] = bool((rf == "BUY" and d == "BUY") or (rf == "SELL" and d == "SELL"))
+
+        # ---- Displacement / rejection (native) -------------------------------
+        displacement = False
+        try:
+            displacement = detect_displacement(df, d, atr, vol_state,
+                                               body_atr_threshold=0.8,
+                                               volume_expansion_required=False)
+        except Exception:
+            pass
+        rejection = self._rejection(df, d)
+        result["displacement"] = bool(displacement)
+        result["rejection"] = bool(rejection)
+
+        # ---- Phase classification --------------------------------------------
+        result["phase"] = self._classify_phase(dist_atr, liq, result["structure_aligned"],
+                                               result["convergence_score"], near)
+        result["directional_bias"] = d
+
+        # ---- Confidence (0..100, advisory) -----------------------------------
+        result["confidence"] = self._confidence(result)
+
+        # ---- Action (advisory label only) ------------------------------------
+        result["action"] = self._action(result)
+
+        # ---- Bounded add-only advisory shift ---------------------------------
+        result["score_shift"] = self._score_shift(result)
+
+        # ---- Explainable reasons ---------------------------------------------
+        result["reasons"] = self._reasons(result)
+        return result
+
+    # ---------- evidence helpers (reuse MIN.PY primitives) --------------------
+    def _zone_quality(self, df, d, entry, atr):
+        # Last-candle OB wick quality (mirrors _evaluate_order_block) + native
+        # zone-volume participation. 0..3 advisory level.
+        score = 0
+        try:
+            if len(df) < 1:
+                return score
+            last = df.iloc[-1]
+            body = abs(last["close"] - last["open"])
+            rng = last["high"] - last["low"]
+            if rng > 0 and d == "BUY":
+                ratio = (min(last["open"], last["close"]) - last["low"]) / rng
+                if ratio > 0.6 and last["close"] > last["open"]:
+                    score += 2
+                elif ratio > 0.4:
+                    score += 1
+            elif rng > 0 and d == "SELL":
+                ratio = (last["high"] - max(last["open"], last["close"])) / rng
+                if ratio > 0.6 and last["close"] < last["open"]:
+                    score += 2
+                elif ratio > 0.4:
+                    score += 1
+            if self._zone_volume(df, d, entry, atr) >= 1:
+                score += 1
+        except Exception:
+            pass
+        return min(3, score)
+
+    def _zone_volume(self, df, d, entry, atr):
+        # Reuse MIN.PY native zone-strength math: its returned 'vol_strength'
+        # detail is precisely the volume transacted at zone touches vs overall
+        # (0..3). Map into the layer's independent 0..2 zone-volume level.
+        try:
+            zone_type = "support" if d == "BUY" else "resistance"
+            _, details = compute_zone_strength(df, entry, zone_type, atr, None)
+            vol = float(details.get("vol_strength", 0.0) or 0.0)
+            if vol >= 1.5:
+                return 2
+            if vol >= 0.5:
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    def _liquidity_event(self, df, d):
+        try:
+            pools = build_liquidity_pools(df)
+            swept_high, swept_low = detect_sweep(df, pools)
+            if d == "BUY" and swept_low:
+                return "SWEEP"
+            if d == "SELL" and swept_high:
+                return "SWEEP"
+            is_hunt, hunt_side = detect_stop_hunt(df)
+            if is_hunt and hunt_side == d:
+                return "STOP_HUNT"
+            sweep_type, _ = classify_sweep(df, d)
+            if sweep_type == "fake":
+                return "FAKE_BREAK"
+        except Exception:
+            pass
+        return "NONE"
+
+    def _bos(self, df):
+        try:
+            bos_up, bos_down = detect_bos(df)
+            return bool(bos_up), bool(bos_down)
+        except Exception:
+            return False, False
+
+    def _structure_shift(self, df):
+        try:
+            return detect_structure_shift(df)
+        except Exception:
+            return None
+
+    def _vweb_aligned(self, df, d):
+        # VWeb = VWAP (yellow line). Aligned when price is on the favouring side.
+        try:
+            v = get_vwap_narrative(df)
+            if v.get("above") and d == "BUY":
+                return True
+            if v.get("below") and d == "SELL":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _ema_aligned(self, df, d):
+        try:
+            c = df["close"]
+            e20 = ema(c, 20).iloc[-1]
+            e50 = ema(c, 50).iloc[-1]
+            price = c.iloc[-1]
+            if d == "BUY" and price > e20 > e50:
+                return True
+            if d == "SELL" and price < e20 < e50:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _adx_aligned(self, df, d):
+        try:
+            adx_state = ADXDIIntelligence.get_adx_state(df)
+            if adx_state.get("state") not in ("STRONG_TREND", "VERY_STRONG"):
+                return False
+            di = ADXDIIntelligence.get_di_state(df)
+            return (di.get("dominant") == "BUY" and d == "BUY") or \
+                   (di.get("dominant") == "SELL" and d == "SELL")
+        except Exception:
+            return False
+
+    def _rejection(self, df, d):
+        try:
+            return bool(candle_rejection(df, d))
+        except Exception:
+            return False
+
+    # ---------- classification ------------------------------------------------
+    def _classify_phase(self, dist_atr, liq, structure_aligned, convergence, near):
+        if dist_atr > self._DEV_ATR:
+            return "LATE"
+        if dist_atr <= self._FIRST_ATR:
+            # FIRST requires the first meaningful supportive evidence to appear.
+            if liq in ("SWEEP", "STOP_HUNT") or structure_aligned or convergence >= 1 or near:
+                return "FIRST"
+            return "DEVELOPING"
+        if dist_atr <= self._DEV_ATR:
+            if (liq in ("SWEEP", "STOP_HUNT") or structure_aligned) and convergence >= 1:
+                return "DEVELOPING"
+            return "LATE"
+        return "LATE"
+
+    def _confidence(self, r):
+        score = 0.0
+        # zone
+        score += min(20, r["zone_quality"] * 8)
+        # liquidity
+        score += min(20, r["liquidity_score"] * 6.6)
+        # structure
+        if r["structure_aligned"]:
+            score += 15
+        # volume
+        if r["volume_confirmation"]:
+            score += 10
+        # zone volume
+        score += min(10, r["zone_volume"] * 5)
+        # convergence (VWeb+EMA+ADX)
+        score += r["convergence_score"] * 7
+        # RF
+        if r["rf_aligned"]:
+            score += 10
+        # distance
+        if r["distance_from_zone_atr"] <= self._FIRST_ATR:
+            score += 15
+        elif r["distance_from_zone_atr"] <= self._DEV_ATR:
+            score += 7
+        score += 5 if r["rejection"] else 0
+        score += 5 if r["displacement"] else 0
+        return round(float(max(0.0, min(100.0, score))), 1)
+
+    def _action(self, r):
+        if r["phase"] == "LATE":
+            return "SIT_OUT_LATE"
+        if r["phase"] == "FIRST" and r["confidence"] >= 60:
+            return "EARLY_ENTRY"
+        if r["phase"] == "DEVELOPING" and r["confidence"] >= 75 and r["rf_aligned"]:
+            return "EARLY_ENTRY"
+        return "WAIT"
+
+    def _score_shift(self, r):
+        # Advisory, bounded, ADD-ONLY. Never negative here, so this layer can
+        # only ever raise a candidate's advisory boost -- never silently demote
+        # a queue-granted priority or a READY decision.
+        if r["phase"] == "LATE":
+            return 0.0
+        bonus = (r["confidence"] - 50.0) / 10.0
+        return round(float(max(self._BONUS_MIN, min(self._BONUS_MAX, bonus))), 3)
+
+    def _reasons(self, r):
+        reasons = []
+        if r["liquidity_event"] in ("SWEEP", "STOP_HUNT"):
+            reasons.append(r["liquidity_event"])
+        if r["structure_aligned"]:
+            reasons.append(r["structure_state"])
+        if r["retest_mitigation"]:
+            reasons.append("retest_mitigation")
+        if r["rejection"]:
+            reasons.append("rejection")
+        if r["displacement"]:
+            reasons.append("displacement")
+        if r["volume_confirmation"]:
+            reasons.append("volume_confirmation")
+        if r["zone_volume"] >= 1:
+            reasons.append("zone_volume")
+        if r["vweb_aligned"]:
+            reasons.append("vweb")
+        if r["ema_aligned"]:
+            reasons.append("ema")
+        if r["adx_aligned"]:
+            reasons.append("adx")
+        if r["rf_aligned"]:
+            reasons.append("rf")
+        if not reasons:
+            reasons.append("narrative")
+        return reasons
+
+    @staticmethod
+    def _empty(side):
+        return {
+            "phase": "DEVELOPING",
+            "directional_bias": "BUY" if str(side).upper() in ("BUY", "LONG") else "SELL",
+            "action": "WAIT",
+            "confidence": 0.0,
+            "score_shift": 0.0,
+            "convergence_score": 0,
+            "distance_from_zone_atr": 99.0,
+            "zone_quality": 0,
+            "liquidity_event": "NONE",
+            "liquidity_score": 0.0,
+            "structure_state": "NONE",
+            "structure_aligned": False,
+            "retest_mitigation": False,
+            "volume_state": "NONE",
+            "volume_confirmation": False,
+            "zone_volume": 0,
+            "vweb_aligned": False,
+            "ema_aligned": False,
+            "adx_aligned": False,
+            "rf": "NONE",
+            "rf_aligned": False,
+            "displacement": False,
+            "rejection": False,
+            "reasons": [],
+        }
+
+
+# Global advisory engine instance (reused by the ExecutionQueue).
+_early_confluence = SmartZoneCrossoverIntelligence()
+
 
 class ExecutionQueue:
     def __init__(self, max_size: int = 15, re_eval_interval: float = 5.0):
@@ -6730,6 +7119,41 @@ class ExecutionQueue:
                     risk_score=risk_score,
                     trigger_state=trigger_state
                 )
+
+                # ===== SMART ZONE CROSSOVER INTELLIGENCE (advisory, NOT a gate) =
+                # Detects the START of a move out of a fresh Zone / OB via phase
+                # (FIRST / DEVELOPING / LATE) + convergence (VWeb+EMA+ADX) + sweep /
+                # structure + zone-volume + RF. It is advisory only: it stores
+                # structured evidence on cand.early_entry, logs [ISMAIL-EARLY], and
+                # applies a SMALL ADD-ONLY bonus to zone_strength. It NEVER blocks a
+                # queue-valid entry and NEVER alters the READY authority in
+                # _update_state / execute_entry / SL-TP / RF / exchange.
+                _early_rf_sig = None
+                try:
+                    _early_rf_sig = RFEngine(20, 3.5).compute(df).get("signal")
+                except Exception:
+                    _early_rf_sig = None
+                _early_res = _early_confluence.analyze(
+                    df, cand.side, cand.entry_price, atr, rf_signal=_early_rf_sig)
+                cand.early_entry = _early_res
+                cand.evidence["early_entry_confluence"] = _early_res
+                # Advisory bonus ONLY (never a subtraction). Bounded small so it
+                # can only ever nudge a candidate's zone read higher, never demote
+                # a queue decision below its own READY threshold.
+                _early_shift = float(_early_res.get("score_shift") or 0.0)
+                if _early_shift > 0.0:
+                    metrics.zone_strength = min(100.0, max(0.0, metrics.zone_strength + _early_shift))
+                if _early_res.get("action") in ("EARLY_ENTRY", "WAIT"):
+                    log_execution(
+                        "[ISMAIL-EARLY] %s %s PHASE=%s CONV=%d ZONE=%s LIQ=%s VWEB=%s EMA=%s ADX=%s RF=%s CONF=%.0f SHIFT=%.2f REASON=%s" % (
+                            symbol, cand.side,
+                            _early_res.get("phase"), _early_res.get("convergence_score", 0),
+                            _early_res.get("zone_quality"), _early_res.get("liquidity_event"),
+                            _early_res.get("vweb_aligned"), _early_res.get("ema_aligned"),
+                            _early_res.get("adx_aligned"), _early_res.get("rf"),
+                            _early_res.get("confidence", 0.0), _early_shift,
+                            ",".join(_early_res.get("reasons") or [])),
+                        "INFO", debounce_key="ismailearly_%s_%s" % (symbol, cand.side), debounce_sec=10)
 
                 opp_type = self._classify_opportunity(metrics, struct_type, cand.side, df)
                 behaviour = self._detect_institutional_behaviour(df, cand.side)
