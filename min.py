@@ -5054,6 +5054,31 @@ def compute_vwap(df):
     vwap = cum_tp_vol / cum_vol
     return vwap
 
+def compute_tv_session_vwap(df):
+    """TradingView built-in VWAP (exact TV formula + default 'Session' anchor).
+
+    VWAP = cumulative_sum(TypicalPrice * Volume) / cumulative_sum(Volume), where
+    TypicalPrice = (High + Low + Close) / 3. TradingView's built-in VWAP resets
+    the cumulative sums at the start of each new trading session (default anchor
+    'Session', UTC day for crypto). This mirrors that: cumulative VWAP within
+    each UTC day, reset at day boundaries.
+
+    When the frame has no session-aware 'timestamp' column it falls back to the
+    plain window-cumulative VWAP (identical to compute_vwap) so nothing else in
+    the bot changes. This helper is used ONLY as the VWeb evidence source in
+    SmartZoneCrossoverIntelligence; all other VWAP consumers keep compute_vwap.
+    """
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    if 'timestamp' not in df.columns:
+        cum_vol = df['volume'].cumsum()
+        cum_tp_vol = (tp * df['volume']).cumsum()
+        return cum_tp_vol / cum_vol
+    day = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.normalize()
+    cs_vol = df['volume'].groupby(day).cumsum()
+    cs_tpv = (tp * df['volume']).groupby(day).cumsum()
+    vwap = cs_tpv / cs_vol.replace(0, np.nan)
+    return vwap.ffill()
+
 def vwap_features(df):
     vwap = compute_vwap(df)
     price = df['close'].iloc[-1]
@@ -6686,8 +6711,9 @@ class SmartZoneCrossoverIntelligence:
     detect_bos / detect_structure_shift, classify_volume, candle_rejection,
     compute_zone_strength) -- nothing is recreated or replaced.
 
-    The yellow VWeb line is VWeb = VWAP (cumulative, get_vwap_narrative), and is
-    NEVER ADX. ADX is a separate, independent signal.
+    The yellow VWeb line is VWeb = VWAP (the exact TradingView VWAP: HLC3
+    cumulative typical-price x volume, session/UTC-day anchored via
+    compute_tv_session_vwap), and is NEVER ADX. ADX is separate/independent.
 
     Convergence deliberately does NOT require every indicator to cross: the
     earliest transfer (>=1 independent read) already counts, so the layer
@@ -6878,12 +6904,17 @@ class SmartZoneCrossoverIntelligence:
             return None
 
     def _vweb_aligned(self, df, d):
-        # VWeb = VWAP (yellow line). Aligned when price is on the favouring side.
+        # VWeb = TradingView VWAP (yellow line). Aligned when price is on the
+        # favouring side of the exact TV VWAP (HLC3, session/UTC-day anchored).
         try:
-            v = get_vwap_narrative(df)
-            if v.get("above") and d == "BUY":
+            vwap = compute_tv_session_vwap(df)
+            price = float(df['close'].iloc[-1])
+            last = float(vwap.iloc[-1])
+            above = price > last
+            below = price < last
+            if d == "BUY" and above:
                 return True
-            if v.get("below") and d == "SELL":
+            if d == "SELL" and below:
                 return True
         except Exception:
             pass
