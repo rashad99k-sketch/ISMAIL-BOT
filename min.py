@@ -5155,29 +5155,60 @@ def evaluate_institutional_proximity(symbol, side, source="scanner"):
         return None
 
 def smart_opportunity_selection():
-    """Continuous deep analysis of EXACTLY the 40 watchlist assets (15 s cadence).
+    """Select the best opportunity using the new strategy.
 
-    Sources ONLY the 40 symbols from the latest 20-min Global Scanner cycle
-    (MEMORY["candidate_universe"]) and refreshes every asset's cached institutional
-    evidence in MEMORY["institutional_watchlist"] + the native watchlist store.
-    This is intelligence ONLY -- no trade ever executes here (ExecutionQueue +
-    execute_entry remain the sole execution authority)."""
-    universe = MEMORY.get("candidate_universe") or []
-    cached = MEMORY.get("institutional_watchlist") or {}
-    manifest = universe if universe else list(cached.keys())
-    for sym in manifest:
-        entry = cached.get(sym) or {}
-        side = entry.get("side", "BUY")
-        source = entry.get("source", "scanner")
+    Restored ATOM execution path: evaluates the migrated ATOM institutional
+    entry strategy (check_institutional_entry + evaluate_with_narrative) over
+    the broader scanner_v2 candidate universe (plus rf_watchlist signals), and
+    executes the best qualifying setup via execute_entry -- matching ATOM."""
+    candidates = []
+    for c in MEMORY.get("scanner_v2_buy", [])[:5]:
+        candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"], "source": "v2"})
+    for c in MEMORY.get("scanner_v2_sell", [])[:5]:
+        candidates.append({"symbol": c["symbol"], "side": "SELL", "score": c["score"], "source": "v2"})
+    for c in MEMORY.get("rf_watchlist", [])[:10]:
+        if c.get("rf_signal") in ("BUY", "SELL"):
+            candidates.append({"symbol": c["symbol"], "side": c["rf_signal"], "score": c["score"], "source": "rf"})
+    seen = {}
+    for cand in candidates:
+        sym = cand["symbol"]
+        if sym not in seen or cand["score"] > seen[sym]["score"]:
+            seen[sym] = cand
+    candidates = list(seen.values())
+    best_setup = None
+    best_score = -1
+    for cand in candidates[:15]:
         try:
-            ev = evaluate_institutional_proximity(sym, side, source)
-            if ev is None:
+            sym = cand["symbol"]
+            side = cand["side"]
+            df = get_ohlcv_safe(sym, 100)
+            if df is None or not validate_dataframe(df, 80):
                 continue
-            MEMORY["institutional_watchlist"][sym] = ev
-            record_watchlist_entry(sym, side, ev["narrative"], min(100.0, ev["proximity_score"]),
-                                   smart_money=ev["smart_money"], momentum=ev["momentum"])
+            df.symbol = sym
+            ob = get_orderbook_cached(sym, limit=10)
+            atr = compute_atr(df).iloc[-1] if len(df) > 14 else df['close'].iloc[-1] * 0.01
+            price = df['close'].iloc[-1]
+            should_enter, classification, reason_str = check_institutional_entry(sym, side, df, ob, atr, price)
+            if not should_enter:
+                continue
+            should_enter_narr, final_class, narrative = evaluate_with_narrative(sym, side, price, atr, df, ob, side)
+            if not should_enter_narr:
+                continue
+            total = narrative.get('narrative_score', 0) + (2 if classification == "INSTITUTIONAL_SNIPER" else 0)
+            if total > best_score:
+                best_score = total
+                best_setup = (sym, side, total, narrative, df, ob, atr, classification, reason_str)
         except Exception:
             continue
+    if best_setup and best_score >= 7:
+        sym, side, score, narrative, df, ob, atr, classification, reason_str = best_setup
+        price = df['close'].iloc[-1]
+        sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
+        reason_final = f"{reason_str} | NARR={narrative['classification']} | score={score:.1f}"
+        ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_final, atr,
+                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification=classification)
+        if ok:
+            return True
     return False
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None):
@@ -5782,15 +5813,10 @@ def narrative_debug():
 
 # ========== SMART INSTITUTIONAL ENTRY ENGINE ==========
 def check_institutional_entry(symbol, side, df, ob, atr, price):
-    # --- NEW: Institutional Intent Gatekeeper ---
-    intent_score, intent_status, intent_details = InstitutionalIntentEngine.detect(df, ob, symbol)
-    if intent_score < 75:
-        log_execution(f"[INTENT] {symbol} {side} intent score {intent_score} < 75 – abort.", "WARN")
-        return False, None, f"Intent score {intent_score}"
-    MEMORY[f"intent_{symbol}"] = intent_details
-    log_execution(f"[INTENT] {symbol} {side} score={intent_score} status={intent_status}", "SUCCESS")
-
-    # --- Original pipeline continues ---
+    """
+    Roro's original institutional entry logic (from test cv new.py).
+    Returns: (should_enter, classification, reason_str)
+    """
     reasons = []
     pools = build_liquidity_pools(df)
     swept_high, swept_low = detect_sweep(df, pools)
@@ -5802,13 +5828,13 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     zone_ok = False
     zone_price = None
     if side == "BUY":
-        if zones["buy_zones"] and zones["buy_zones"][0]["strength"] >= 5:
+        if zones.get("buy_zones") and zones["buy_zones"][0]["strength"] >= 5:
             zone_price = zones["buy_zones"][0]["price"]
             if abs(price - zone_price) / price < 0.003:
                 zone_ok = True
                 reasons.append(f"Buy zone {zone_price:.4f} (strength {zones['buy_zones'][0]['strength']})")
     else:
-        if zones["sell_zones"] and zones["sell_zones"][0]["strength"] >= 5:
+        if zones.get("sell_zones") and zones["sell_zones"][0]["strength"] >= 5:
             zone_price = zones["sell_zones"][0]["price"]
             if abs(price - zone_price) / price < 0.003:
                 zone_ok = True
@@ -5844,10 +5870,8 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     elif side == "SELL" and (struct_shift == "bearish_shift" or bos_down):
         choch_ok = True
         reasons.append("Bearish MSS/CHoCH")
-    if sweep_ok and not choch_ok:
-        return False, None, "Reversal requires MSS/CHoCH confirmation"
-    elif not sweep_ok and not choch_ok:
-        reasons.append("No MSS/CHoCH (trend continuation, optional)")
+    if not choch_ok:
+        return False, None, "No MSS/CHoCH confirmation"
     rejection_ok = candle_rejection(df, side)
     vol_state = classify_volume(df)
     displacement_ok = detect_displacement(df, side, atr, vol_state, body_atr_threshold=0.8, volume_expansion_required=False)
@@ -5857,6 +5881,7 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
         reasons.append("Rejection candle")
     if displacement_ok:
         reasons.append("Displacement")
+    vol_state = classify_volume(df)
     volume_ok = vol_state in ("expansion", "spike")
     if not volume_ok:
         return False, None, "No volume expansion"
@@ -5867,25 +5892,9 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     adx_now = adx_series.iloc[-1]
     adx_prev = adx_series.iloc[-2]
     adx_slope = adx_now - adx_prev
-    plus_di, minus_di, _, _ = get_di_components(df)
-    di_spread = (plus_di - minus_di) if side == "BUY" else (minus_di - plus_di)
-    if adx_now < 18:
-        return False, None, f"ADX too low ({adx_now:.1f})"
-    if adx_now > 50:
-        if adx_slope > 0 and di_spread > 8:
-            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f} DI_spread={di_spread:.1f}")
-        else:
-            return False, None, f"Exhaustion risk: ADX>50 but slope={adx_slope:.1f} DI_spread={di_spread:.1f}"
-    elif adx_now > 35:
-        if adx_slope > 0:
-            reasons.append(f"Strong trend ADX={adx_now:.1f} slope={adx_slope:.1f}")
-        else:
-            return False, None, f"ADX high but falling slope ({adx_now:.1f} slope={adx_slope:.1f})"
-    else:
-        if adx_slope > 0:
-            reasons.append(f"Healthy ADX={adx_now:.1f} rising")
-        else:
-            return False, None, f"ADX not rising ({adx_now:.1f} slope={adx_slope:.1f})"
+    if not (18 <= adx_now <= 35 and adx_slope > 0):
+        return False, None, f"ADX {adx_now:.1f} (slope {adx_slope:.1f}) not in rising 18-35"
+    reasons.append(f"ADX rising {adx_now:.1f} (+{adx_slope:.1f})")
     rf = RFEngine(20, 3.5).compute(df)
     if rf["signal"] != side:
         return False, None, f"RF signal {rf['signal']} does not match {side}"

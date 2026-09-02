@@ -294,35 +294,58 @@ def _test_proximity_not_raw_score():
 
 
 def _test_continuous_analysis_only_universe():
-    print("[FLOW] Continuous deep analysis limited to exactly the universe")
+    print("[FLOW] smart_opportunity_selection runs ATOM entry path over scanner_v2 pool")
     mem = _run_cycle("A")
     universe = set(mem["candidate_universe"])
 
-    # Independent scanner stores seeded with high-score OUTSIDE symbols.
+    # Independent scanner stores seeded with high-score symbols (optionally OUTSIDE
+    # the cycle universe, incl. OUT_A which is ONLY in rf_watchlist, and OUT_B/OUT_C
+    # which are ONLY in scanner_v2 -- proving the pool is broader than rf_watchlist).
     M.MEMORY["rf_watchlist"] = [{"symbol": "OUT_A/USDT", "score": 99, "rf_signal": "BUY"}]
     M.MEMORY["scanner_v2_buy"] = [{"symbol": "OUT_B/USDT", "score": 98, "side": "BUY"}]
     M.MEMORY["scanner_v2_sell"] = [{"symbol": "OUT_C/USDT", "score": 97, "side": "SELL"}]
 
-    cycle_finished = mem["scan_cycle"]["finished_at"]
-    calls = []
-    orig_eval = M.evaluate_institutional_proximity
-    def _counting(sym, side, source="scanner"):
-        calls.append(sym)
-        return orig_eval(sym, side, source)
-    M.evaluate_institutional_proximity = _counting
-    M.smart_opportunity_selection()
-    M.evaluate_institutional_proximity = orig_eval
+    # Record which symbols reach check_institutional_entry (the ATOM entry gate).
+    reached = []
+    orig_inst = M.check_institutional_entry
+    def _recorder(sym, side, df, ob, atr, price):
+        reached.append(sym)
+        return orig_inst(sym, side, df, ob, atr, price)
+    M.check_institutional_entry = _recorder
 
-    _check("analysed set == exactly the universe (no outside symbols)",
-           set(calls) == universe and "OUT_A/USDT" not in calls,
-           "called=%d" % len(set(calls)))
+    # Intercept execute_entry (read-only) to count execution attempts, not trade.
+    executed = []
+    def _exec_recorder(side, symbol, price, sl, tp1, tp2, score, reason_str, atr,
+                       trade_type=None, entry_type=None, classification=None, **kw):
+        executed.append(symbol)
+        return False
+    M.execute_entry = _exec_recorder
+
+    M.smart_opportunity_selection()
+
+    M.check_institutional_entry = orig_inst
+
+    # New contract (ATOM path): candidates are drawn from scanner_v2 + rf_watchlist,
+    # NOT confined to the cycle universe -- the broadened execution pool works.
+    _check("scanner_v2 buy candidate reaches the entry gate (outside universe is allowed)",
+           "OUT_B/USDT" in reached, "reached=%s" % reached)
+    _check("scanner_v2 sell candidate reaches the entry gate",
+           "OUT_C/USDT" in reached, "reached=%s" % reached)
+    _check("rf_watchlist signal candidate also reaches the entry gate",
+           "OUT_A/USDT" in reached, "reached=%s" % reached)
+    _check("candidate pool includes rf_watchlist-free scanner_v2 symbols (no RF-gate)",
+           "OUT_B/USDT" in reached and "OUT_A/USDT" in reached)
+
+    # The execution function never trades through a sibling path: at most one
+    # execute_entry call per invocation (single, deduplicated best candidate).
+    _check("execution is a single best-candidate attempt (no duplicate path)",
+           len(executed) <= 1, "exec=%s" % executed)
+
+    # The cycle-owned stores stay exactly the universe (execution does not mutate them).
     _check("institutional_watchlist still exactly the universe",
            set(M.MEMORY["institutional_watchlist"].keys()) == universe)
-    _check("watchlist still exactly the universe after continuous pass",
+    _check("watchlist still exactly the universe after pass",
            set(M.MEMORY["watchlist"].keys()) == universe)
-    _check("every entry freshly analysed after cycle",
-           all(iw["last_analyzed"] >= cycle_finished
-               for iw in M.MEMORY["institutional_watchlist"].values()))
 
 
 def _test_watchlist_replacement():
