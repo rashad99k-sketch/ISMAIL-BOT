@@ -5260,13 +5260,402 @@ def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, mom
         MEMORY["watchlist"] = {}
     MEMORY["watchlist"][symbol] = entry
 
-def cleanup_watchlist(ttl=300):
+def cleanup_watchlist(ttl=1800, max_size=60):
+    """ATOM-ported staged watchlist cleanup.
+
+    Two-phase expiration: entries are first marked EXPIRED, then removed on a
+    later pass. Freshness uses max(last_update, analysis.last_analyzed) so an
+    entry that is continuously analyzed (by _analyze_next_watchlist_candidate)
+    never expires. Malformed records are quarantined.
+    """
     now = time.time()
     if "watchlist" not in MEMORY:
         return
-    expired = [sym for sym, v in MEMORY["watchlist"].items() if now - v["last_update"] > ttl]
-    for sym in expired:
-        del MEMORY["watchlist"][sym]
+    quarantine = MEMORY.setdefault("watchlist_quarantine", [])
+    to_remove = []
+    for sym, v in list(MEMORY["watchlist"].items()):
+        if not isinstance(v, dict) or not v.get("symbol"):
+            to_remove.append(sym)
+            quarantine.append({"key": sym, "reason": "MALFORMED_RECORD", "ts": now})
+            continue
+
+        last_update = v.get("last_update", v.get("updated_at", 0))
+        last_analyzed = v.get("analysis", {}).get("last_analyzed", 0)
+        last_activity = max(last_update, last_analyzed) if (last_update or last_analyzed) else 0
+        try:
+            last_activity = float(last_activity or 0)
+        except (TypeError, ValueError):
+            last_activity = 0.0
+
+        if v.get("state") == "EXPIRED":
+            expired_at = v.get("expired_at", 0)
+            if expired_at and now - expired_at > ttl:
+                to_remove.append(sym)
+            continue
+
+        if last_activity <= 0 or now - last_activity > ttl:
+            v["state"] = "EXPIRED"
+            v["expired_at"] = now
+            v["status"] = "DATA_STALE"
+            continue
+
+    for sym in to_remove:
+        MEMORY["watchlist"].pop(sym, None)
+
+    MEMORY["watchlist_quarantine"] = quarantine[-50:]
+
+    if len(MEMORY["watchlist"]) > max_size:
+        sorted_items = sorted(
+            MEMORY["watchlist"].items(),
+            key=lambda x: x[1].get("priority", x[1].get("score", 0)),
+            reverse=True
+        )
+        MEMORY["watchlist"] = dict(sorted_items[:max_size])
+
+# ===== Staggered Watchlist Analysis State (ATOM-ported) =====
+_watchlist_analysis_pointer = 0
+_watchlist_analysis_last_run = 0
+_watchlist_ranking_last_update = 0
+_watchlist_analysis_stats = {
+    "total_analyzed": 0,
+    "analyzed_this_cycle": 0,
+    "stale_analysis": 0,
+    "promoted": 0,
+    "skipped": 0,
+    "cleaned": 0,
+    "quarantine": 0,
+    "watchlist_size": 0,
+}
+
+def compute_liquidity_authenticity(df, side, atr):
+    """ATOM watchlist analysis helper (analysis-only, no execution/risk change)."""
+    if not validate_dataframe(df, 30) or len(df) < 3:
+        return 50, 50, {}
+    details = {}
+    score = 50
+    trap_risk = 50
+    pools = build_liquidity_pools(df)
+    swept_high, swept_low = detect_sweep(df, pools)
+    sweep_detected = (side == "BUY" and swept_low) or (side == "SELL" and swept_high)
+    if not sweep_detected:
+        details['sweep_detected'] = False
+        return 30, 70, details
+    details['sweep_detected'] = True
+    score += 20
+    trap_risk -= 10
+    last = df.iloc[-1]
+    if side == "BUY":
+        reclaim = last['close'] > last['low'] + 0.2 * atr
+    else:
+        reclaim = last['close'] < last['high'] - 0.2 * atr
+    details['reclaim'] = reclaim
+    if reclaim:
+        score += 15
+        trap_risk -= 10
+    else:
+        trap_risk += 15
+    body = abs(last['close'] - last['open'])
+    range_ = last['high'] - last['low']
+    if range_ > 0:
+        displacement = body / range_
+        details['displacement_ratio'] = round(displacement, 2)
+        if displacement > 0.6:
+            score += 20
+            trap_risk -= 15
+        elif displacement > 0.4:
+            score += 10
+            trap_risk -= 5
+        else:
+            trap_risk += 15
+    vol_state = classify_volume(df)
+    details['volume_state'] = vol_state
+    if vol_state in ("expansion", "spike"):
+        score += 15
+        trap_risk -= 10
+    elif vol_state == "exhaustion":
+        trap_risk += 15
+        score -= 5
+    struct_shift = detect_structure_shift(df)
+    bos_up, bos_down = detect_bos(df)
+    struct_ok = (side == "BUY" and (struct_shift == "bullish_shift" or bos_up)) or \
+                (side == "SELL" and (struct_shift == "bearish_shift" or bos_down))
+    details['structure_break'] = struct_ok
+    if struct_ok:
+        score += 20
+        trap_risk -= 15
+    else:
+        trap_risk += 15
+    if side == "BUY" and last['close'] < last['open'] and body > atr * 0.6:
+        trap_risk += 20
+    elif side == "SELL" and last['close'] > last['open'] and body > atr * 0.6:
+        trap_risk += 20
+    supports, resistances = get_clustered_zones(df, lookback=60)
+    price = df['close'].iloc[-1]
+    if side == "BUY":
+        nearest_res = min([r for r in resistances if r > price], default=None)
+        if nearest_res:
+            room = (nearest_res - price) / price
+            if room < 0.01:
+                trap_risk += 20
+            elif room < 0.02:
+                trap_risk += 10
+            details['room_to_run'] = round(room * 100, 2)
+    else:
+        nearest_sup = max([s for s in supports if s < price], default=None)
+        if nearest_sup:
+            room = (price - nearest_sup) / price
+            if room < 0.01:
+                trap_risk += 20
+            elif room < 0.02:
+                trap_risk += 10
+            details['room_to_run'] = round(room * 100, 2)
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        if side == "BUY":
+            if last['close'] > prev['close'] and prev['close'] > prev['open']:
+                score += 5
+            else:
+                trap_risk += 5
+        else:
+            if last['close'] < prev['close'] and prev['close'] < prev['open']:
+                score += 5
+            else:
+                trap_risk += 5
+    score = max(0, min(100, score))
+    trap_risk = max(0, min(100, trap_risk))
+    details['authenticity_score'] = score
+    details['trap_risk'] = trap_risk
+    return score, trap_risk, details
+
+def compute_order_block_quality(df, side, atr):
+    """ATOM watchlist analysis helper (analysis-only, no execution/risk change)."""
+    if not validate_dataframe(df, 30) or len(df) < 5:
+        return 50, 50, {}
+    details = {}
+    bullish_score = 50
+    bearish_score = 50
+    bull_label = "NONE"
+    bear_label = "NONE"
+    ob_bullish = detect_order_block(df, "BUY")
+    ob_bearish = detect_order_block(df, "SELL")
+
+    def causal_strength(ob, side):
+        if not ob:
+            return 30, "NONE"
+        idx = ob['idx']
+        origin = df.iloc[idx]
+        pos = len(df) + idx if idx < 0 else idx
+        leg = df.iloc[pos + 1:min(len(df), pos + 4)]
+        if side == "BUY":
+            if not leg.empty:
+                future_high = leg['high'].max()
+                move = future_high - origin['low']
+            else:
+                move = 0
+        else:
+            if not leg.empty:
+                future_low = leg['low'].min()
+                move = origin['high'] - future_low
+            else:
+                move = 0
+        if move < atr * 0.5:
+            strength = 40
+            label = "WEAK"
+        elif move < atr * 1.0:
+            strength = 60
+            label = "MEDIUM"
+        elif move < atr * 2.0:
+            strength = 80
+            label = "STRONG"
+        else:
+            strength = 90
+            label = "VERY_STRONG"
+        recent_revisit = False
+        if side == "BUY":
+            recent_low = df['low'].iloc[-3:].min()
+            if abs(recent_low - ob['low']) < atr * 0.3:
+                recent_revisit = True
+        else:
+            recent_high = df['high'].iloc[-3:].max()
+            if abs(recent_high - ob['high']) < atr * 0.3:
+                recent_revisit = True
+        if recent_revisit:
+            strength = max(30, strength - 20)
+            label += "_TESTED"
+        return strength, label
+
+    if ob_bullish:
+        bull_str, bull_label = causal_strength(ob_bullish, "BUY")
+        bullish_score = bull_str
+        details['bullish_ob'] = {'price': ob_bullish['high'], 'strength': bull_str, 'label': bull_label}
+    else:
+        details['bullish_ob'] = None
+        bullish_score = 30
+    if ob_bearish:
+        bear_str, bear_label = causal_strength(ob_bearish, "SELL")
+        bearish_score = bear_str
+        details['bearish_ob'] = {'price': ob_bearish['low'], 'strength': bear_str, 'label': bear_label}
+    else:
+        details['bearish_ob'] = None
+        bearish_score = 30
+    bullish_score = max(0, min(100, bullish_score))
+    bearish_score = max(0, min(100, bearish_score))
+    details['bullish_ob_score'] = bullish_score
+    details['bearish_ob_score'] = bearish_score
+    details['bullish_label'] = bull_label
+    details['bearish_label'] = bear_label
+    return bullish_score, bearish_score, details
+
+def _analyze_next_watchlist_candidate():
+    """ATOM-ported staggered continuous watchlist analysis (1 symbol / 15 s).
+
+    Computes OB, liquidity authenticity/pools/sweep, structure shift/BOS,
+    smart-zone proximity, RORO institutional signal, volume, displacement,
+    rejection and RF alignment into a composite score, refreshed continuously
+    so the entry stays active and fresh (never cut off between scanner cycles).
+    """
+    global _watchlist_analysis_pointer, _watchlist_analysis_stats
+    watchlist = MEMORY.get("watchlist", {})
+    if not watchlist:
+        return
+    keys = list(watchlist.keys())
+    if _watchlist_analysis_pointer >= len(keys):
+        _watchlist_analysis_pointer = 0
+    if not keys:
+        return
+    symbol = keys[_watchlist_analysis_pointer]
+    _watchlist_analysis_pointer += 1
+    entry = watchlist.get(symbol)
+    if not entry:
+        return
+    side = entry.get("side", "BUY")
+    df = get_ohlcv_safe(symbol, 100)
+    if not validate_dataframe(df, 30) or len(df) < 30:
+        return
+    ob = get_orderbook_cached(symbol, limit=10)
+    price = df['close'].iloc[-1]
+    atr = compute_atr(df).iloc[-1] if len(df) > 14 else price * 0.01
+
+    bull_ob, bear_ob, ob_details = compute_order_block_quality(df, side, atr)
+    ob_score = bull_ob if side == "BUY" else bear_ob
+
+    auth_score, trap_risk, auth_details = compute_liquidity_authenticity(df, side, atr)
+
+    pools = build_liquidity_pools(df)
+    swept_high, swept_low = detect_sweep(df, pools)
+    liq_score = 50
+    if side == "BUY" and swept_low:
+        liq_score += 25
+    if side == "SELL" and swept_high:
+        liq_score += 25
+
+    struct_shift = detect_structure_shift(df)
+    bos_up, bos_down = detect_bos(df)
+    struct_score = 50
+    if side == "BUY" and (struct_shift == "bullish_shift" or bos_up):
+        struct_score = 90
+    elif side == "SELL" and (struct_shift == "bearish_shift" or bos_down):
+        struct_score = 90
+
+    zones = get_smart_zones(symbol, df, ob)
+    zone_price = None
+    if side == "BUY" and zones.get("buy_zones"):
+        zone_price = zones["buy_zones"][0]["price"]
+    elif side == "SELL" and zones.get("sell_zones"):
+        zone_price = zones["sell_zones"][0]["price"]
+    proximity = 50
+    if zone_price:
+        dist = abs(price - zone_price) / price
+        if dist < 0.003:
+            proximity = 90
+        elif dist < 0.01:
+            proximity = 70
+        else:
+            proximity = 40
+
+    roro_ok, roro_class, roro_reason = check_institutional_entry(symbol, side, df, ob, atr, price)
+    roro_signal = roro_ok
+
+    ob_result = queue._select_strong_ob(df, side, atr) if hasattr(queue, '_select_strong_ob') else {}
+    strong_ob = ob_result.get('grade', 'INVALID') in ('A+', 'A')
+    ob_grade = ob_result.get('grade', 'NONE')
+
+    vol_state = classify_volume(df)
+    displacement = detect_displacement(df, side, atr, vol_state)
+    rejection = candle_rejection(df, side)
+
+    rf = RFEngine(20, 3.5).compute(df)
+    rf_aligned = (rf["signal"] == side) and (abs(rf["distance"]) < 0.003)
+
+    composite = (
+        ob_score * 0.20 +
+        liq_score * 0.15 +
+        struct_score * 0.15 +
+        proximity * 0.10 +
+        auth_score * 0.10
+    )
+    if roro_signal:
+        composite += 15
+    if strong_ob:
+        composite += 10
+    if rf_aligned:
+        composite += 5
+    if displacement or rejection:
+        composite += 5
+    if trap_risk > 60:
+        composite -= 10
+    composite = max(0, min(100, composite))
+
+    entry["analysis"] = {
+        "last_analyzed": time.time(),
+        "ob_score": ob_score,
+        "liq_score": liq_score,
+        "struct_score": struct_score,
+        "proximity": proximity,
+        "auth_score": auth_score,
+        "roro_signal": roro_signal,
+        "roro_reason": roro_reason,
+        "strong_ob": strong_ob,
+        "ob_grade": ob_grade,
+        "rf_aligned": rf_aligned,
+        "displacement": displacement,
+        "rejection": rejection,
+        "vol_state": vol_state,
+        "composite_score": composite,
+        "trap_risk": trap_risk,
+        "ob_details": ob_details,
+        "auth_details": auth_details,
+        "zones": zones,
+        "price": price,
+        "atr": atr,
+        "side": side,
+        "timestamp": time.time()
+    }
+    entry["last_update"] = time.time()
+    _watchlist_analysis_stats["total_analyzed"] += 1
+    _watchlist_analysis_stats["analyzed_this_cycle"] += 1
+    log_execution(f"[WATCHLIST_ANALYSIS] Analyzed {symbol} {side} | composite={composite:.1f} | roro={roro_signal} | OB={ob_grade}", "INFO", debounce_key=f"watchlist_analysis_{symbol}", debounce_sec=60)
+    log_execution(f"[INSTITUTION_DETAIL] {symbol} | RORO={roro_signal} | OB={ob_grade} | composite={composite:.1f}", "INFO")
+
+def _update_watchlist_rankings():
+    """ATOM-ported watchlist ranking (every 60 s)."""
+    watchlist = MEMORY.get("watchlist", {})
+    if not watchlist:
+        return
+    now = time.time()
+    analyzed = []
+    for sym, entry in watchlist.items():
+        analysis = entry.get("analysis")
+        if analysis and (now - analysis.get("last_analyzed", 0) < 300):
+            analyzed.append((sym, analysis.get("composite_score", 0)))
+    analyzed.sort(key=lambda x: x[1], reverse=True)
+    for rank, (sym, score) in enumerate(analyzed, 1):
+        if sym in watchlist:
+            watchlist[sym]["rank"] = rank
+            watchlist[sym]["composite_score"] = score
+    top5 = [{"symbol": sym, "score": score} for sym, score in analyzed[:5]]
+    MEMORY["watchlist_top5"] = top5
+    log_execution(f"[WATCHLIST_RANKING] Updated ranks: {len(analyzed)} active, top={top5[0]['symbol'] if top5 else 'N/A'}", "INFO")
 
 # ========== VWAP ENGINE ==========
 def compute_vwap(df):
@@ -8119,7 +8508,11 @@ def global_discovery_scan():
         record_watchlist_entry(c["symbol"], c["side"], c.get("narrative", {}),
                                min(100.0, c["proximity_score"]),
                                smart_money=c.get("smart_money"), momentum=c.get("momentum"))
-    MEMORY["watchlist"] = {k: v for k, v in MEMORY["watchlist"].items() if k in universe_set}
+    # ATOM behavior: watchlist PERSISTS across cycles (no per-cycle prune to the
+    # new universe). Existing candidates remain under continuous watchlist analysis
+    # (see _analyze_next_watchlist_candidate) even when this scanner cycle finds
+    # nothing new. Removal is handled by cleanup_watchlist (staged TTL + max_size),
+    # never by cutting candidates when a cycle produces a shortfall.
 
     source_counts = {}
     for c in top_candidates:
@@ -10024,6 +10417,9 @@ def main_loop_sniper():
     # Initialize queue timers
     _last_queue_promote = time.time()
     _last_queue_eval = time.time()
+    global _watchlist_analysis_last_run, _watchlist_ranking_last_update
+    _watchlist_analysis_last_run = time.time()
+    _watchlist_ranking_last_update = time.time()
 
     while True:
         try:
@@ -10051,6 +10447,17 @@ def main_loop_sniper():
 
             # ---- Execution Queue integration ----
             if USE_EXECUTION_QUEUE:
+                # Continuous staggered watchlist analysis (ATOM): one candidate
+                # deep-analyzed every 15 s; ranks refreshed every 60 s. Keeps
+                # watchlist entries fresh (never expired/cut off) across scanner
+                # cycles and feeds promotion to the execution queue.
+                if now - _watchlist_analysis_last_run >= 15:
+                    _analyze_next_watchlist_candidate()
+                    _watchlist_analysis_last_run = now
+                if now - _watchlist_ranking_last_update >= 60:
+                    _update_watchlist_rankings()
+                    _watchlist_ranking_last_update = now
+
                 # Promote candidates from watchlist periodically
                 if now - _last_queue_promote > QUEUE_PROMOTE_INTERVAL:
                     promote_to_queue()

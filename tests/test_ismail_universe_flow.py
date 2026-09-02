@@ -157,16 +157,25 @@ def _test_cycle():
     _check("the universe is genuinely from the discovery-pool symbols", set(universe) <= proven,
            str(set(universe) - proven))
 
-    # Replacement: stale entries from a previous cycle must be dropped.
-    for i in range(90):
-        M.MEMORY["watchlist"]["STRAY%02d/USDT" % i] = {
-            "symbol": "STRAY%02d/USDT" % i, "score": 5.0, "side": "BUY", "last_update": 0.0}
+    # ATOM contract: a scanner cycle does NOT prune the watchlist. Entries persist
+    # across cycles and stay under continuous watchlist analysis
+    # (_analyze_next_watchlist_candidate) even if a cycle's universe shrinks or
+    # finds nothing. Removal is cleanup_watchlist's job (staged TTL + max_size),
+    # never a per-cycle wipe/snapshot.
+    M.MEMORY["watchlist"] = {}  # start clean so this test asserts persistence additively
+    _pre = {s: w.get("symbol") for s, w in M.MEMORY["watchlist"].items()}
+    for i in range(3):
+        M.MEMORY["watchlist"]["PERSIST%02d/USDT" % i] = {
+            "symbol": "PERSIST%02d/USDT" % i, "score": 5.0, "side": "BUY",
+            "last_update": 0.0, "analysis": {"last_analyzed": 0.0}}
     M.global_discovery_scan()
-    strays = [k for k in M.MEMORY["watchlist"] if k.startswith("STRAY")]
-    _check("cycle end REPLACES watchlist with the new universe (no stale leftovers)", len(strays) == 0,
-           "strays=%d total=%d" % (len(strays), len(M.MEMORY["watchlist"])))
-    _check("after replacement: watchlist matches the new universe again",
-           set(M.MEMORY["watchlist"].keys()) == set(M.MEMORY["candidate_universe"]), )
+    persist = [k for k in M.MEMORY["watchlist"] if k.startswith("PERSIST")]
+    _check("scanner cycle does NOT wipe existing watchlist candidates (ATOM persistence)",
+           len(persist) == 3,
+           "persist=%d total=%d" % (len(persist), len(M.MEMORY["watchlist"])))
+    _check("new-cycle universe is merged into the persistent watchlist",
+           set(M.MEMORY["candidate_universe"]) <= set(M.MEMORY["watchlist"].keys()),
+           "missing=%s" % sorted(set(M.MEMORY["candidate_universe"]) - set(M.MEMORY["watchlist"].keys())))
 
 
 def _test_stability():
