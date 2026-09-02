@@ -850,6 +850,7 @@ def safe_api_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             if "rate limit" in str(e).lower() or "100410" in str(e):
+                _API_BUDGET["rate_limit_events"] += 1
                 wait = 2 ** attempt
                 print(color_text(f"Rate limit hit, waiting {wait}s...", YELLOW))
                 time.sleep(wait)
@@ -858,6 +859,72 @@ def safe_api_call(func, *args, **kwargs):
                 raise
             time.sleep(1)
     return None
+
+# =====================================================================
+# L0 / L6 — MARKET DATA SNAPSHOT + API REQUEST BUDGET (surgical upgrade)
+# One shared snapshot fetched ONCE per 20-min cycle; every engine reads it
+# instead of re-fetching. Budget logger proves requests/cache/rate-limit.
+# =====================================================================
+_API_BUDGET = {
+    "requests_total": 0, "by_endpoint": {}, "by_component": {},
+    "cache_hits": 0, "cache_misses": 0, "rate_limit_events": 0,
+    "timeouts": 0, "cycle_requests": 0,
+}
+_API_TAG = "core"
+SNAPSHOT_TTL = int(os.getenv("SCAN_SNAPSHOT_TTL", "1500"))
+_MARKET_SNAPSHOT = {}
+_MARKET_SNAPSHOT_OB = {}
+_MARKET_SNAPSHOT_TS = 0.0
+
+
+def _api_log(endpoint, symbol="?"):
+    _API_BUDGET["requests_total"] += 1
+    _API_BUDGET["cycle_requests"] += 1
+    _API_BUDGET["by_endpoint"][endpoint] = _API_BUDGET["by_endpoint"].get(endpoint, 0) + 1
+    _API_BUDGET["by_component"][_API_TAG] = _API_BUDGET["by_component"].get(_API_TAG, 0) + 1
+
+
+def _snapshot_active():
+    return _MARKET_SNAPSHOT and (time.time() - _MARKET_SNAPSHOT_TS) < SNAPSHOT_TTL
+
+
+def build_market_snapshot(symbols):
+    """Fetch each symbol's OHLCV exactly ONCE per cycle (OB stays lazy).
+
+    Sources each frame through get_ohlcv_safe so the snapshot honors the cache
+    layer and is trivially stubable in tests (get_ohlcv_safe == deterministic df)."""
+    global _MARKET_SNAPSHOT_TS
+    _MARKET_SNAPSHOT.clear()
+    _MARKET_SNAPSHOT_OB.clear()
+    for sym in symbols:
+        if sym in _MARKET_SNAPSHOT:
+            continue
+        df = get_ohlcv_safe(sym, 150)
+        if df is not None and len(df) >= 100:
+            _MARKET_SNAPSHOT[sym] = df
+    _MARKET_SNAPSHOT_TS = time.time()
+    return len(_MARKET_SNAPSHOT)
+
+
+def snapshot_ob(symbol, limit=10):
+    key = f"{symbol}_{limit}"
+    if _snapshot_active():
+        if key in _MARKET_SNAPSHOT_OB:
+            return _MARKET_SNAPSHOT_OB[key]
+        ob = fetch_orderbook(symbol, limit)
+        if ob is not None:
+            _MARKET_SNAPSHOT_OB[key] = ob
+        return ob
+    return None
+
+
+def log_api_budget(prefix="BUDGET"):
+    b = _API_BUDGET
+    log_execution(
+        f"[{prefix}] total={b['requests_total']} cycle={b['cycle_requests']} "
+        f"hits={b['cache_hits']} misses={b['cache_misses']} "
+        f"rate_limits={b['rate_limit_events']} "
+        f"endpoints={b['by_endpoint']} components={b['by_component']}", "INFO")
 
 # ========== TELEGRAM ==========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1001,6 +1068,7 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
 # ========== DATA FETCHING (OPTIMIZED CACHE) ==========
 def fetch_ohlcv(symbol, limit=150):
     try:
+        _api_log("fetch_ohlcv", symbol)
         sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
         if not data or len(data) < 100:
@@ -1023,6 +1091,7 @@ def fetch_ohlcv(symbol, limit=150):
 
 def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
     try:
+        _api_log("fetch_ohlcv_htf", symbol)
         sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
         if not data or len(data) < 30:
@@ -1039,9 +1108,11 @@ def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
         return None
 
 def fetch_ticker(symbol):
+    _api_log("fetch_ticker", symbol)
     return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol))
 
 def fetch_orderbook(symbol, limit=20):
+    _api_log("fetch_orderbook", symbol)
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
 
 def get_balance():
@@ -1086,6 +1157,10 @@ def validate_dataframe(df, min_length=100):
     return True
 
 def get_ohlcv_safe(symbol, limit=120, htf=False):
+    if not htf and _snapshot_active() and symbol in _MARKET_SNAPSHOT:
+        df = _MARKET_SNAPSHOT[symbol]
+        if df is not None and len(df) >= 100:
+            return df.iloc[-limit:].copy()
     ttl = 15 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 45)
@@ -1132,6 +1207,10 @@ def get_free_balance_safe():
     return bal
 
 def get_orderbook_cached(symbol, limit=20):
+    if _snapshot_active():
+        ob = snapshot_ob(symbol, limit)
+        if ob is not None:
+            return ob
     if STATE.get("open") or TRADE_STATE["in_position"]:
         cached = cache_get("orderbook", 60, f"{symbol}_{limit}")
         if cached is not None:
@@ -4911,82 +4990,194 @@ def evaluate_liquidity_narrative(df, ob, atr, side):
     if narrative["rf_alignment"]: score += 2
     return narrative, score
 
-def smart_opportunity_selection():
-    # Gate: confinement to the 40 chosen by the 20-min Global Scanner cycle.
-    # Active-Candidate analysis must not scan sources outside the 40 universe.
-    # Bootstrap: before the first cycle completes the gate stays open so the
-    # watchlist store can be populated; afterwards it is strict.
-    universe = set(MEMORY.get("candidate_universe", []))
-    candidates = []
-    for c in MEMORY.get("scanner_v2_buy", [])[:5]:
-        if universe and c["symbol"] not in universe:
-            continue
-        candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"], "source": "v2"})
-    for c in MEMORY.get("scanner_v2_sell", [])[:5]:
-        if universe and c["symbol"] not in universe:
-            continue
-        candidates.append({"symbol": c["symbol"], "side": "SELL", "score": c["score"], "source": "v2"})
-    for c in MEMORY.get("rf_watchlist", [])[:10]:
-        if c.get("rf_signal") in ("BUY", "SELL") and (not universe or c["symbol"] in universe):
-            candidates.append({"symbol": c["symbol"], "side": c["rf_signal"], "score": c["score"], "source": "rf"})
-    seen = {}
-    for cand in candidates:
-        sym = cand["symbol"]
-        if sym not in seen or cand["score"] > seen[sym]["score"]:
-            seen[sym] = cand
-    candidates = list(seen.values())
-    best_setup = None
-    best_score = -1
-    for cand in candidates[:15]:
+# ========== INSTITUTIONAL-PROXIMITY INTELLIGENCE (discovery + intelligence layer) ==========
+# This block ONLY reuses the bot's existing native institutional mathematics:
+#   evaluate_liquidity_narrative(), SmartMoneyEngine, MomentumFlowEngine,
+#   InstitutionalIntentEngine, get_smart_zones(), compute_tv_session_vwap(),
+#   compute_adx(), RFEngine, _early_confluence (SmartZoneCrossoverIntelligence).
+# It is STRICTLY a discovery + intelligence layer: it pre-computes and caches the
+# institutional evidence for the 40 watchlist assets AT CYCLE TIME (warm start)
+# and refreshes it continuously every 15 s. It NEVER opens a trade:
+# ExecutionQueue / execute_entry remain the sole execution authority.
+
+def _institutional_align(df, close_price, side, atr, narrative, rf_signal):
+    """Native alignment read (VWeb=TV VWAP + EMA + ADX + RF + convergence) from
+    the existing SmartZoneCrossoverIntelligence; graceful native fallback."""
+    try:
+        res = _early_confluence.analyze(df, side, close_price, atr, rf_signal=rf_signal)
+        return {
+            "vweb": bool(res.get("vweb_aligned")),
+            "ema": bool(res.get("ema_aligned")),
+            "adx": bool(res.get("adx_aligned")),
+            "rf": bool(res.get("rf")),
+            "convergence": float(res.get("convergence_score") or 0.0),
+            "liquidity_event": res.get("liquidity_event"),
+            "zone_quality": res.get("zone_quality"),
+            "engine": "szc"
+        }
+    except Exception:
+        pass
+    try:
+        vwap_s = compute_tv_session_vwap(df)
+        vwap_l = float(vwap_s.iloc[-1]) if len(vwap_s) else close_price
+        adx_s = compute_adx(df)
+        adx_l = float(adx_s.iloc[-1]) if len(adx_s) else 0.0
+        return {
+            "vweb": (close_price > vwap_l) if side == "BUY" else (close_price < vwap_l),
+            "ema": False,
+            "adx": adx_l >= 20.0,
+            "rf": bool(narrative.get("rf_alignment")),
+            "convergence": 0.0,
+            "liquidity_event": None,
+            "zone_quality": None,
+            "engine": "native"
+        }
+    except Exception:
+        return {"vweb": False, "ema": False, "adx": False, "rf": False,
+                "convergence": 0.0, "liquidity_event": None,
+                "zone_quality": None, "engine": "fallback"}
+
+def evaluate_institutional_proximity(symbol, side, source="scanner"):
+    """One full native institutional pass over a watchlist asset.
+
+    Reuses the exact evidence the queue's re_evaluate_all would compute: native
+    narrative, smart-money, momentum, institutional intent, smart zones and the
+    VWeb(EM-A/ADX/RF) alignment. Returns the explainable state (phase + Zone /
+    Align / CSD evidence) cached into MEMORY["institutional_watchlist"], or None
+    when data is insufficient. Never executes a trade."""
+    try:
+        df = get_ohlcv_safe(symbol, 100)
+        if df is None or not validate_dataframe(df, 80):
+            return None
+        df.symbol = symbol
+        ob = get_orderbook_cached(symbol, limit=10)
+        price = float(df['close'].iloc[-1])
+        atr = float(compute_atr(df).iloc[-1]) if len(df) > 14 else price * 0.01
+        narrative, nscore = evaluate_liquidity_narrative(df, ob, atr, side)
+
+        smart_money = SmartMoneyEngine.analyze_smart_money(df)
+        momentum = MomentumFlowEngine.analyze_momentum_flow(df)
+
+        intent_score = 0.0
         try:
-            sym = cand["symbol"]
-            side = cand["side"]
-            df = get_ohlcv_safe(sym, 100)
-            if df is None or not validate_dataframe(df, 80):
+            intents = InstitutionalIntentEngine.detect(df, ob, symbol)
+            intent_score = float(intents[0]) if intents and intents[0] is not None else 0.0
+        except Exception:
+            intent_score = 0.0
+
+        # Native confidence adjustment (identical to the queue's own read).
+        confidence_adjust = 0
+        if smart_money.get("smart_money_dominant") and smart_money.get("institutional_bias") == side:
+            confidence_adjust += 15
+        if momentum.get("trend_expansion") and momentum.get("flow_bias") == side:
+            confidence_adjust += 10
+        if smart_money.get("distribution_risk", 0) > 70:
+            confidence_adjust -= 15
+        if momentum.get("momentum_decay"):
+            confidence_adjust -= 12
+        if momentum.get("exhaustion_risk", 0) > 70:
+            confidence_adjust -= 10
+        adjusted_nscore = max(0.0, nscore + (confidence_adjust / 10.0))
+
+        zones = {}
+        zone_strength = 0.0
+        try:
+            zones = get_smart_zones(symbol, df, ob)
+            if side == "BUY" and zones.get("buy_zones"):
+                zone_strength = float(zones["buy_zones"][0].get("strength", 0) or 0)
+            elif side == "SELL" and zones.get("sell_zones"):
+                zone_strength = float(zones["sell_zones"][0].get("strength", 0) or 0)
+        except Exception:
+            zone_strength = 0.0
+
+        proximity_score = adjusted_nscore + zone_strength * 0.5
+
+        rf_signal = None
+        try:
+            rf_signal = RFEngine(20, 3.5).compute(df).get("signal")
+        except Exception:
+            rf_signal = None
+        align = _institutional_align(df, price, side, atr, narrative, rf_signal)
+
+        zone_ready = bool(zone_strength and zone_strength > 0)
+        side_bias = smart_money.get("institutional_bias") == side
+        narrative_flags = [
+            ("Sweep", narrative.get("sweep")),
+            ("CHoCH/BOS", narrative.get("choch_bos")),
+            ("Retest", narrative.get("retest")),
+            ("Rejection", narrative.get("rejection")),
+            ("Displacement", narrative.get("displacement")),
+            ("Volume", narrative.get("volume_confirmation")),
+            ("RF", narrative.get("rf_alignment")),
+            ("VWeb", align.get("vweb")),
+            ("EMA+ADX", bool(align.get("ema") and align.get("adx"))),
+            ("Trend", momentum.get("trend_expansion")),
+            ("SM", side_bias),
+            ("Zone", zone_ready),
+        ]
+        confluence = sum(1 for _k, _v in narrative_flags if _v)
+        reasons = [k for k, v in narrative_flags if v]
+
+        if not zone_ready and confluence < 2:
+            phase = "NO_SETUP"
+        elif zone_ready and confluence >= 5:
+            phase = "READY_NEAR"
+        elif zone_ready and confluence >= 3:
+            phase = "SETUP_FORMING"
+        else:
+            phase = "EARLY_DEVELOPING"
+
+        story = "ZONE=%g INTENT=%.0f CONF=%d NARR=%.1f PHASE=%s | %s" % (
+            zone_strength, intent_score, confluence, adjusted_nscore, phase,
+            "+".join(reasons) or "-")
+
+        return {
+            "symbol": symbol, "side": side, "source": source,
+            "price": round(price, 6), "atr": round(atr, 6),
+            "narrative": narrative, "nscore": round(nscore, 2),
+            "adjusted_nscore": round(adjusted_nscore, 2),
+            "proximity_score": round(proximity_score, 2),
+            "intent_score": round(intent_score, 1),
+            "zone_strength": round(zone_strength, 2),
+            "zones": {
+                "buy_count": len(zones.get("buy_zones") or []) if zones else 0,
+                "sell_count": len(zones.get("sell_zones") or []) if zones else 0,
+                "buy_strength": round(float((zones.get("buy_zones") or [{}])[0].get("strength", 0) or 0), 2) if zones else 0.0,
+                "sell_strength": round(float((zones.get("sell_zones") or [{}])[0].get("strength", 0) or 0), 2) if zones else 0.0,
+            },
+            "smart_money": smart_money, "momentum": momentum,
+            "align": align, "phase": phase, "confluence": confluence,
+            "reasons": reasons,
+            "csd": {"score": round(adjusted_nscore, 2), "direction": side, "confluence": confluence},
+            "story": story, "last_analyzed": time.time(),
+        }
+    except Exception:
+        return None
+
+def smart_opportunity_selection():
+    """Continuous deep analysis of EXACTLY the 40 watchlist assets (15 s cadence).
+
+    Sources ONLY the 40 symbols from the latest 20-min Global Scanner cycle
+    (MEMORY["candidate_universe"]) and refreshes every asset's cached institutional
+    evidence in MEMORY["institutional_watchlist"] + the native watchlist store.
+    This is intelligence ONLY -- no trade ever executes here (ExecutionQueue +
+    execute_entry remain the sole execution authority)."""
+    universe = MEMORY.get("candidate_universe") or []
+    cached = MEMORY.get("institutional_watchlist") or {}
+    manifest = universe if universe else list(cached.keys())
+    for sym in manifest:
+        entry = cached.get(sym) or {}
+        side = entry.get("side", "BUY")
+        source = entry.get("source", "scanner")
+        try:
+            ev = evaluate_institutional_proximity(sym, side, source)
+            if ev is None:
                 continue
-            df.symbol = sym
-            ob = get_orderbook_cached(sym, limit=10)
-            atr = compute_atr(df).iloc[-1] if len(df) > 14 else df['close'].iloc[-1] * 0.01
-            narrative, nscore = evaluate_liquidity_narrative(df, ob, atr, side)
-            smart_money = SmartMoneyEngine.analyze_smart_money(df)
-            momentum = MomentumFlowEngine.analyze_momentum_flow(df)
-            total_confidence_adjust = 0
-            if smart_money["smart_money_dominant"] and smart_money["institutional_bias"] == side:
-                total_confidence_adjust += 15
-            if momentum["trend_expansion"] and momentum["flow_bias"] == side:
-                total_confidence_adjust += 10
-            if smart_money["distribution_risk"] > 70:
-                total_confidence_adjust -= 15
-            if momentum["momentum_decay"]:
-                total_confidence_adjust -= 12
-            if momentum["exhaustion_risk"] > 70:
-                total_confidence_adjust -= 10
-            adjusted_nscore = nscore + (total_confidence_adjust / 10)
-            record_watchlist_entry(sym, side, narrative, adjusted_nscore, smart_money, momentum)
-            if adjusted_nscore < 7:
-                continue
-            zones = get_smart_zones(sym, df, ob)
-            zone_strength = 0
-            if side == "BUY" and zones["buy_zones"]:
-                zone_strength = zones["buy_zones"][0]["strength"]
-            elif side == "SELL" and zones["sell_zones"]:
-                zone_strength = zones["sell_zones"][0]["strength"]
-            total = adjusted_nscore + zone_strength * 0.5
-            if total > best_score:
-                best_score = total
-                best_setup = (sym, side, total, narrative, zones, df, ob, atr)
+            MEMORY["institutional_watchlist"][sym] = ev
+            record_watchlist_entry(sym, side, ev["narrative"], min(100.0, ev["proximity_score"]),
+                                   smart_money=ev["smart_money"], momentum=ev["momentum"])
         except Exception:
             continue
-    if best_setup and best_score >= 9:
-        sym, side, score, narrative, zones, df, ob, atr = best_setup
-        price = df['close'].iloc[-1]
-        leg_class = "REVERSAL"
-        sl, tp1, tp2 = compute_sl_tp(price, side, leg_class, atr, df)
-        reason_str = f"INST_SWEEP+CHOCH+RETEST | nscore={score:.1f}"
-        ok = execute_entry(side, sym, price, sl, tp1, tp2, score, reason_str, atr,
-                           trade_type="INSTITUTIONAL", entry_type="NARRATIVE", classification="SNIPER")
-        if ok:
-            return True
     return False
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None):
@@ -7654,109 +7845,327 @@ queue = ExecutionQueue(max_size=QUEUE_MAX_SIZE, re_eval_interval=QUEUE_RE_EVAL_I
 _last_queue_promote = 0
 _last_queue_eval = 0
 
+# =====================================================================
+# L1/L2/L3 — MARKET-DATA LANES + DIRECTIONAL GATE + EXHAUSTION + SMART RANK
+# Seven independent read-only lanes run on the L0 snapshot frame for every
+# symbol. Each lane emits direction-neutral evidence; the Directional Gate then
+# decides ONLY what the data supports (never forces BUY/SELL). The Exhaustion
+# Filter drops over-extended names. Smart Rank fuses lane + proximity evidence
+# with tunable weights. No lane ever executes a trade.
+# =====================================================================
+# Tunable weights (L4 Smart Rank).
+LANE_WEIGHTS = {
+    "early": 1.0, "explosive": 1.2, "topmover": 0.9, "volume_anomaly": 1.1,
+    "volatility": 1.0, "breakout": 1.3, "stophunt": 1.1,
+    "direction_gate": 1.5, "exhaustion_penalty": -2.0,
+}
+DEFAULT_USE_LEGACY_UNIVERSE = os.getenv("USE_LEGACY_UNIVERSE", "false").lower() in ("1", "true", "yes")
+
+# A "directionless" score: how much genuine institutional setup evidence exists
+# (sum of lane hits scaled to a 0..1 range) BEFORE any direction is chosen.
+def _lane_evidence_summary(sym, df):
+    out = {"price": float(df['close'].iloc[-1]),
+           "vol_last": float(df['volume'].iloc[-1]),
+           "vol_ma20": float(df['volume'].iloc[-20:].mean()) if len(df) >= 20 else float(df['volume'].mean())}
+    try:
+        out["atr_pct"] = (float(compute_atr(df).iloc[-1]) / out["price"] * 100) if out["price"] > 0 else 0.0
+    except Exception:
+        out["atr_pct"] = 0.0
+    try:
+        out["adx"] = float(compute_adx(df).iloc[-1]) if len(compute_adx(df)) else 20.0
+    except Exception:
+        out["adx"] = 20.0
+    try:
+        out["rsi"] = float(compute_rsi(df).iloc[-1])
+    except Exception:
+        out["rsi"] = 50.0
+    return out
+
+
+def lane_early(df, d):
+    # Weak pullback into structure after an impulse; continuation direction
+    # defaults to the impulse direction.
+    if len(df) < 15:
+        return None
+    closes = df['close'].tolist()
+    c1, c5, c10 = closes[-1], closes[-6] if len(df) >= 6 else closes[0], closes[-11] if len(df) >= 11 else closes[0]
+    impulse = (c10 and c1 > c10)
+    pullback = (c1 < c5) if impulse else (c1 > c5)
+    if impulse and pullback and d["vol_ma20"] > 0 and d["vol_last"] > 0.6 * d["vol_ma20"]:
+        return {"side": ("BUY" if impulse else "SELL"), "strength": min(1.0, abs(c1 - c5) / (d["price"] or 1) * 100)}
+    return None
+
+
+def lane_explosive(df, d):
+    if len(df) < 20 or d["vol_ma20"] <= 0:
+        return None
+    vr = d["vol_last"] / d["vol_ma20"]
+    closes = df['close'].tolist()
+    r3 = (closes[-1] - closes[-4]) / (closes[-4] or 1) * 100
+    if vr >= 1.8 and abs(r3) >= 2.0:
+        return {"side": ("BUY" if r3 > 0 else "SELL"), "strength": min(1.0, vr / 4.0)}
+    return None
+
+
+def lane_topmover(df, d, lookback=5):
+    if len(df) < lookback + 1:
+        return None
+    base = df['close'].iloc[-1 - lookback]
+    if base <= 0:
+        return None
+    ret = (df['close'].iloc[-1] - base) / base * 100
+    if abs(ret) >= 1.5:
+        return {"side": ("BUY" if ret > 0 else "SELL"), "strength": min(1.0, abs(ret) / 10.0)}
+    return None
+
+
+def lane_volume_anomaly(df, d):
+    if len(df) < 20 or d["vol_ma20"] <= 0:
+        return None
+    vr = d["vol_last"] / d["vol_ma20"]
+    closes = df['close'].tolist()
+    r1 = (closes[-1] - closes[-2]) / (closes[-2] or 1) * 100
+    if vr >= 2.5 and abs(r1) >= 0.5:
+        return {"side": ("BUY" if r1 > 0 else "SELL"), "strength": min(1.0, vr / 5.0)}
+    return None
+
+
+def lane_volatility(df, d):
+    if len(df) < 20:
+        return None
+    if d["atr_pct"] >= 2.0:
+        return {"side": None, "strength": min(1.0, d["atr_pct"] / 5.0)}  # regime flag, no hard side
+    return None
+
+
+def lane_breakout(df, d):
+    if len(df) < 20:
+        return None
+    hi20 = float(df['high'].iloc[-20:].max())
+    lo20 = float(df['low'].iloc[-20:].min())
+    last = float(df['close'].iloc[-1])
+    d_hi = (last - hi20) / (hi20 or 1)
+    d_lo = (lo20 - last) / (lo20 or 1)
+    if d_hi >= 0.001 and d_vol_confirm(df):
+        return {"side": "BUY", "strength": min(1.0, d_hi / 0.02)}
+    if d_lo >= 0.001 and d_vol_confirm(df):
+        return {"side": "SELL", "strength": min(1.0, d_lo / 0.02)}
+    return None
+
+
+def d_vol_confirm(df):
+    if len(df) < 20:
+        return True
+    return float(df['volume'].iloc[-1]) >= 0.8 * float(df['volume'].iloc[-20:].mean())
+
+
+def lane_stophunt(df, d):
+    # Sweep of recent swing high/low followed by rejection back into range.
+    if len(df) < 20:
+        return None
+    hi = float(df['high'].iloc[-15:-1].max())
+    lo = float(df['low'].iloc[-15:-1].min())
+    last_h = float(df['high'].iloc[-1])
+    last_l = float(df['low'].iloc[-1])
+    close = float(df['close'].iloc[-1])
+    if last_h > hi and close < hi:  # swept highs, closed back below -> SELL setup
+        return {"side": "SELL", "strength": 0.8}
+    if last_l < lo and close > lo:  # swept lows, closed back above -> BUY setup
+        return {"side": "BUY", "strength": 0.8}
+    return None
+
+
+def run_all_lanes(sym, df):
+    try:
+        d = _lane_evidence_summary(sym, df)
+    except Exception:
+        return None
+    hits = []
+    for name, fn in [("early", lane_early), ("explosive", lane_explosive),
+                     ("topmover", lane_topmover), ("volume_anomaly", lane_volume_anomaly),
+                     ("volatility", lane_volatility), ("breakout", lane_breakout),
+                     ("stophunt", lane_stophunt)]:
+        try:
+            r = fn(df, d)
+        except Exception:
+            r = None
+        if r:
+            hits.append((name, r))
+    return d, hits
+
+
+def exhaustion_check(d, hits):
+    """Return True if the name looks over-extended/exhausted and should be dropped.
+
+    Only extreme RSI (climax/panic) counts as exhaustion. High ADX is a STRONG
+    trend signature -- the exact institutional movers the funnel exists to catch --
+    so it must NOT be filtered out."""
+    rsi = d.get("rsi", 50.0)
+    if rsi >= 88 or rsi <= 12:
+        return True
+    return False
+
+
 # ========== GLOBAL DISCOVERY SCANNER (NEW) ==========
 def global_discovery_scan():
-    """Scan entire market every 20 minutes, update watchlist with top candidates."""
-    log_execution("[DISCOVERY] Starting global discovery scan...", "INFO")
+    """Global Market Scan every 20 min -> up to 40 institutional assets (TOP-40).
+
+    Replaces the old forced 20 BUY + 20 SELL with an HONEST multi-lane funnel:
+      1) L0 market-data snapshot fetched once per cycle (all engines read it)
+      2) seven read-only lanes (A: Early, B: Explosive, C: TopMovers,
+         D: VolumeAnomaly, E: Volatility, F: Breakout, G: StopHunt) fire on the
+         snapshot frame for every symbol in the discovered universe
+      3) Directional Gate labels each name ONLY as the data supports (no
+         forced sides), Exhaustion Filter drops over-extended names
+      4) Smart Rank fuses lane strength + institutional proximity with tunable
+         weights
+      5) top-40 (honest counts, NOT a forced 20/20) become the single source
+         of truth; legacy cannot independently rebuild the universe.
+
+    Every selected asset is deep-analyzed DURING this cycle (warm start);
+    ExecutionQueue refines that cached context. Discovery + intelligence ONLY,
+    never executes a trade."""
+    log_execution("[DISCOVERY] Starting global discovery scan (multi-lane)...", "INFO")
     start_time = time.time()
     all_symbols = get_usdt_perp_symbols()[:200]
-    candidates = []
 
-    # 1. Smart Scanner v2 (existing)
-    buy, sell = smart_scanner_v2()
-    for b in buy[:5]:
-        candidates.append({"symbol": b["symbol"], "score": b["score"], "side": "BUY", "source": "scanner_v2"})
-        store_intent_for_symbol(b["symbol"])
-    for s in sell[:5]:
-        candidates.append({"symbol": s["symbol"], "score": s["score"], "side": "SELL", "source": "scanner_v2"})
-        store_intent_for_symbol(s["symbol"])
+    # ---- 1. L0 snapshot: OHLCV fetched exactly ONCE per cycle for all symbols ----
+    if not _snapshot_active():
+        build_market_snapshot(all_symbols)
+    snapshot_n = len(_MARKET_SNAPSHOT)
+    log_execution(f"[DISCOVERY] L0 snapshot frames = {snapshot_n} for {len(all_symbols)} candidates", "INFO")
 
-    # 2. RF Scanner (full native output so the 40 are genuine proximity picks)
-    rf_candidates = scan_market_rf(top_n=20)
-    for r in rf_candidates[:20]:
-        side = r.get("rf_signal")
-        if side in ("BUY", "SELL"):
-            candidates.append({"symbol": r["symbol"], "score": r["score"]*10, "side": side, "source": "rf"})
-            store_intent_for_symbol(r["symbol"])
+    # ---- 2. Lanes A-G on the snapshot frames (read-only) ----
+    lane_evidence = {}   # sym -> {"d": summary, "hits": [(lane, hit), ...]}
+    for sym in all_symbols:
+        df = _MARKET_SNAPSHOT.get(sym)
+        if df is None or not validate_dataframe(df, 30):
+            continue
+        res = run_all_lanes(sym, df)
+        if res:
+            lane_evidence[sym] = res
 
-    # 3. Fresh Liquidity Radar
-    fresh = FreshLiquidityRadar.scan(all_symbols, limit=15)
-    for f in fresh:
-        candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "BUY", "source": "fresh"})
-        candidates.append({"symbol": f["symbol"], "score": f["score"]*2, "side": "SELL", "source": "fresh"})
-        store_intent_for_symbol(f["symbol"])
+    # ---- 3. Directional Gate + Exhaustion Filter ----
+    gated = []   # list of dicts: symbol, side, lane_strength, lanes...
+    for sym, (d, hits) in lane_evidence.items():
+        # Volatility-only lane emits no hard direction: skip unless another lane fired.
+        hard = [h for h in hits if h[1].get("side")]
+        if not hard:
+            continue
+        if exhaustion_check(d, hits):
+            continue
+        # Direction = majority vote among hard lane signals; strength = max.
+        sides = [h[1]["side"] for h in hard]
+        buy_votes = sides.count("BUY"); sell_votes = sides.count("SELL")
+        side = "BUY" if buy_votes >= sell_votes else "SELL"
+        top_strength = max(h[1].get("strength", 0.0) for h in hard)
+        names = [h[0] for h in hard]
+        # Smart Rank fuses lane strength with the directional-gate confidence.
+        direction_confidence = abs(buy_votes - sell_votes) / float(len(hard)) if hard else 0.0
+        gated.append({
+            "symbol": sym, "side": side,
+            "lane_strength": round(top_strength, 3),
+            "lanes": names,
+            "direction_confidence": round(direction_confidence, 3),
+            "adx": d.get("adx", 0.0), "atr_pct": d.get("atr_pct", 0.0),
+        })
 
-    # 4. Random discovery (10% of symbols)
-    random.shuffle(all_symbols)
-    for sym in all_symbols[:10]:
-        if not any(c["symbol"] == sym for c in candidates):
-            candidates.append({"symbol": sym, "score": 0, "side": "BUY", "source": "random"})
-            candidates.append({"symbol": sym, "score": 0, "side": "SELL", "source": "random"})
-            store_intent_for_symbol(sym)
+    # ---- 4. Institutional-proximity scoring on the survivors (one native pass each) ----
+    smart_ranked = []
+    seen = set()
+    for g in sorted(gated, key=lambda x: -x["lane_strength"]):
+        sym = g["symbol"]
+        if sym in seen:
+            continue
+        seen.add(sym)
+        source = "(" + "+".join(g["lanes"]) + ")"
+        ev = evaluate_institutional_proximity(sym, g["side"], source)
+        if ev is None:
+            continue
+        # Smart Rank = proximity * (1 + directional confidence) * lane weight sum.
+        lane_w = sum(LANE_WEIGHTS.get(n, 1.0) for n in g["lanes"])
+        rank = float(ev["proximity_score"]) * (1.0 + g["direction_confidence"]) * (0.2 + min(1.0, lane_w / 5.0))
+        ev["smart_rank"] = round(rank, 2)
+        ev["lane_direction"] = g["side"]
+        ev["lanes"] = g["lanes"]
+        ev["direction_confidence"] = g["direction_confidence"]
+        smart_ranked.append(ev)
 
-    # Sort by score, keep top 40 unique symbols (dedupe BUY/SELL per symbol).
-    # Zero-score exploration fillers (random discovery) can never enter the 40:
-    # the 40 must be genuine strategy-proximity picks, nothing random.
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    top_candidates = []
-    _seen_syms = set()
-    for item in candidates:
-        if item["symbol"] not in _seen_syms and item.get("score", 0) > 0:
-            _seen_syms.add(item["symbol"])
-            top_candidates.append(item)
-    top_candidates = top_candidates[:40]
+    # ---- 5. TOP-40 by smart_rank (honest counts, no forced 20/20, no _fill_deficit) ----
+    smart_ranked.sort(key=lambda e: (-e.get("smart_rank", 0), e["symbol"]))
+    top_candidates = smart_ranked[:40]
+    if len(top_candidates) < 40:
+        log_execution(f"[DISCOVERY] Shortfall: only {len(top_candidates)} genuine candidates (no filler injected).", "WARN")
 
-    # Update watchlist (MEMORY["watchlist"])
-    for item in top_candidates:
-        sym = item["symbol"]
-        side = item["side"]
-        narrative = {
-            "sweep": False,
-            "choch_bos": False,
-            "retest": False,
-            "rejection": False,
-            "displacement": False,
-            "volume_confirmation": False,
-            "rf_alignment": False
-        }
-        if item["source"] == "scanner_v2":
-            narrative["sweep"] = True
-        elif item["source"] == "rf":
-            narrative["rf_alignment"] = True
-        elif item["source"] == "fresh":
-            narrative["volume_confirmation"] = True
-        record_watchlist_entry(sym, side, narrative, item["score"])
-        # Already stored intent above; but ensure it's stored for all
-        store_intent_for_symbol(sym)
-
-    # --- SINGLE SOURCE OF TRUTH: the 40 chosen by this Global Scanner cycle ---
-    # The 40 become the current cycle's candidate universe (watchlist). Nothing
-    # outside these 40 may reach Active Candidates without a recorded explicit
-    # reason. Between cycles the system only re-evaluates these 40; the universe
-    # itself is replaced/updated at the next cycle.
-    universe = [item["symbol"] for item in top_candidates]
+    # ---- 6. Single source of truth: the TOP-40 (replaces previous cycle) ----
+    universe = [c["symbol"] for c in top_candidates]
     universe_set = set(universe)
     MEMORY["candidate_universe"] = universe
+    MEMORY["institutional_watchlist"] = {}
+    for c in top_candidates:
+        entry = dict(c)
+        MEMORY["institutional_watchlist"][c["symbol"]] = entry
+
+    for c in top_candidates:
+        record_watchlist_entry(c["symbol"], c["side"], c.get("narrative", {}),
+                               min(100.0, c["proximity_score"]),
+                               smart_money=c.get("smart_money"), momentum=c.get("momentum"))
     MEMORY["watchlist"] = {k: v for k, v in MEMORY["watchlist"].items() if k in universe_set}
+
     source_counts = {}
-    for _c in candidates:
-        _src = _c.get("source", "unknown")
-        source_counts[_src] = source_counts.get(_src, 0) + 1
+    for c in top_candidates:
+        src = c.get("source", "unknown")
+        source_counts[src] = source_counts.get(src, 0) + 1
     MEMORY["scan_cycle"] = {
         "cycle": MEMORY.get("scan_cycle", {}).get("cycle", 0) + 1,
         "started_at": start_time,
         "finished_at": time.time(),
         "count": len(universe),
-        "ranked_by": "score_desc",
+        "buy_count": sum(1 for c in top_candidates if c["side"] == "BUY"),
+        "sell_count": sum(1 for c in top_candidates if c["side"] == "SELL"),
+        "ranked_by": "smart_rank_multi_lane",
+        "warm_start": True,
         "sources": source_counts,
+        "snapshot_frames": snapshot_n,
+        "lane_strength": {c["symbol"]: c.get("lane_strength", 0) for c in top_candidates},
     }
 
-    # Also update radar_top5 for compatibility
-    radar_top = [{"symbol": c["symbol"], "score": c["score"]} for c in top_candidates[:5]]
+    # Also update radar_top5 for compatibility (with proximity-scored entries)
+    radar_top = [{"symbol": c["symbol"], "score": c.get("proximity_score", c.get("score", 0))} for c in top_candidates[:5]]
     MEMORY["radar_top5"] = radar_top
 
     elapsed = time.time() - start_time
-    log_execution(f"[DISCOVERY] Scan completed in {elapsed:.1f}s, {len(top_candidates)} candidates added to watchlist.", "INFO")
+    log_execution(f"[DISCOVERY] Scan completed in {elapsed:.1f}s, {len(top_candidates)} candidates "
+                  f"(BUY {MEMORY['scan_cycle']['buy_count']} / SELL {MEMORY['scan_cycle']['sell_count']}).", "INFO")
+    log_api_budget("DISCOVERY_BUDGET")
+
+def fast_radar(limit=60):
+    """FastRadar (L5): lightweight snapshot-only re-rank of the discovered universe.
+
+    Runs entirely on the L0 snapshot frames (NO extra API calls). Emits a quick
+    direction + lane-strength read for the dashboard so the 40-deep institutional
+    pass stays cold (warm-start) and never needs extra requests mid-cycle."""
+    radar = []
+    for sym, df in list(_MARKET_SNAPSHOT.items()):
+        if df is None or not validate_dataframe(df, 30):
+            continue
+        res = run_all_lanes(sym, df)
+        if not res:
+            continue
+        _d, hits = res
+        hard = [h for h in hits if h[1].get("side")]
+        if not hard:
+            continue
+        if exhaustion_check(_d, hits):
+            continue
+        sides = [h[1]["side"] for h in hard]
+        side = "BUY" if sides.count("BUY") >= sides.count("SELL") else "SELL"
+        strength = max(h[1].get("strength", 0.0) for h in hard)
+        radar.append({"symbol": sym, "side": side, "strength": round(strength, 3),
+                      "lanes": [h[0] for h in hard]})
+    radar.sort(key=lambda x: -x["strength"])
+    return radar[:limit]
+
 
 def promote_to_queue():
     """Scan watchlist and add high-potential symbols to the execution queue."""
@@ -9255,6 +9664,7 @@ MEMORY = {
     "radar_top5": [],
     "log_debounce": {},
     "watchlist": {},
+    "institutional_watchlist": {},
     "candidate_universe": [],
     "scan_cycle": {},
     "no_entry_feed": [],
@@ -9589,6 +9999,7 @@ def main_loop_sniper():
     last_universe_build = 0
     last_discovery_scan = 0
     last_priority_update = 0
+    last_fast_radar = 0
     watchlist_rotation = None
     try:
         ex.load_markets()
@@ -9615,6 +10026,15 @@ def main_loop_sniper():
                 global_discovery_scan()
                 last_discovery_scan = now
 
+            # ---- FastRadar + API budget heartbeat (snapshot-only, no new calls) ----
+            if _snapshot_active() and now - last_fast_radar > 60:
+                try:
+                    MEMORY["fast_radar"] = fast_radar(limit=60)
+                    log_api_budget("BUDGET_60S")
+                except Exception as _e:
+                    log_execution(f"[FAST_RADAR] refresh error: {_e}", "WARN")
+                last_fast_radar = now
+
             # ---- Watchlist Priority Update (every 5 min) ----
             if now - last_priority_update > 300:
                 WatchlistPriorityManager.update_priorities()
@@ -9640,7 +10060,7 @@ def main_loop_sniper():
                 if now % 60 < 1:
                     queue.cleanup()
 
-            if now - last_universe_build > 1800:
+            if DEFAULT_USE_LEGACY_UNIVERSE and now - last_universe_build > 1800:
                 universe = build_40_symbol_universe()
                 watchlist_rotation = WatchlistRotation(universe)
                 log_execution(f"[UNIVERSE] Built 40-symbol universe: {universe[:10]}...", "INFO")
@@ -9681,7 +10101,7 @@ def main_loop_sniper():
                         last_radar_refresh = now
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        if watchlist_rotation and watchlist_rotation.should_rotate():
+                        if DEFAULT_USE_LEGACY_UNIVERSE and watchlist_rotation and watchlist_rotation.should_rotate():
                             batch = watchlist_rotation.get_next_batch()
                             for sym in batch:
                                 df = get_ohlcv_safe(sym, 60)

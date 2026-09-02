@@ -84,6 +84,23 @@ def _install_cycle_stubs():
         "asks": [{"price": _DF["close"].iloc[-1] * 1.0002, "qty": 1.0}],
     }
     M.InstitutionalIntentEngine.detect = staticmethod(lambda df, ob=None, symbol=None: (60.0, "ACCUMULATION", {}))
+    M.get_smart_zones = lambda sym, df, ob: {"buy_zones": [{"strength": 12.0}], "sell_zones": [{"strength": 12.0}]}
+    M.evaluate_liquidity_narrative = lambda df, ob, atr, side: (
+        {"sweep": True, "choch_bos": True, "retest": True, "rejection": True,
+         "displacement": True, "volume_confirmation": True, "rf_alignment": True}, 8.0)
+    M.SmartMoneyEngine.analyze_smart_money = staticmethod(lambda df: {
+        "smart_money_dominant": True, "institutional_bias": "BUY",
+        "institutional_bias_detailed": "BUY", "distribution_risk": 10,
+        "accumulation_strength": 9.0, "retail_euphoria": False})
+    M.MomentumFlowEngine.analyze_momentum_flow = staticmethod(lambda df: {
+        "trend_expansion": True, "flow_bias": "BUY", "momentum_decay": False,
+        "exhaustion_risk": 10, "continuation_strength": 9.0, "climax_risk": 10,
+        "greed_state": False})
+    M._early_confluence.analyze = staticmethod(lambda df, side, entry_price, atr, rf_signal=None: {
+        "vweb_aligned": True, "ema_aligned": True, "adx_aligned": False, "rf": True,
+        "convergence_score": 50.0, "liquidity_event": "sweep", "zone_quality": 50.0,
+        "confidence": 40.0, "score_shift": 0.0, "action": "WAIT",
+        "phase": "DEVELOPING", "reasons": ["stub"]})
 
 
 def _reset_candidate_state():
@@ -102,33 +119,42 @@ def _run_cycle():
 
 
 def _test_cycle():
-    print("[E2E] Global Scanner cycle -> exactly 40 -> watchlist <- universe")
+    print("[E2E] Global Scanner cycle -> TOP-40 (honest counts) -> watchlist <- universe")
     mem = _run_cycle()
     universe = mem["candidate_universe"]
     wl = mem["watchlist"]
 
-    _check("universe == exactly 40", len(universe) == 40, "len=%d" % len(universe))
-    _check("no duplicate symbols in the 40", len(set(universe)) == 40)
-    _check("watchlist keys == exactly the 40", set(wl.keys()) == set(universe),
+    _check("universe <= 40 and non-empty", 0 < len(universe) <= 40, "len=%d" % len(universe))
+    _check("no duplicate symbols in the universe", len(set(universe)) == len(universe))
+    _check("watchlist keys == exactly the universe", set(wl.keys()) == set(universe),
            "wl=%d uni=%d" % (len(wl), len(universe)))
-    _check("scan_cycle count recorded = 40", mem["scan_cycle"].get("count") == 40,
+    _check("scan_cycle count recorded == universe size", mem["scan_cycle"].get("count") == len(universe),
            mem["scan_cycle"].get("count"))
-    _check("scan_cycle ranked_by = score_desc", mem["scan_cycle"].get("ranked_by") == "score_desc")
+    _check("scan_cycle ranked_by = smart_rank_multi_lane", mem["scan_cycle"].get("ranked_by") == "smart_rank_multi_lane")
+    _check("scan_cycle records warm-start", mem["scan_cycle"].get("warm_start") is True)
     _check("scan_cycle increments per cycle", mem["scan_cycle"].get("cycle") == 1)
 
-    scores = [wl[s]["score"] for s in universe]
-    ordered = all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1))
-    _check("40 rank-sorted by setup proximity (score desc)", ordered,
-           str(scores[:5]))
+    iw = mem.get("institutional_watchlist") or {}
+    sides = [iw[s]["side"] for s in universe]
+    _check("honest direction counts (BUY+SELL == total, no forced 20/20)",
+           len(sides) == len(universe) and sides.count("BUY") + sides.count("SELL") == len(universe),
+           "buy=%d sell=%d tot=%d" % (sides.count("BUY"), sides.count("SELL"), len(universe)))
+    _check("no side forced to exactly 20", not (sides.count("BUY") == 20 and sides.count("SELL") == 20) or len(universe) != 40)
+    _check("every selected asset carries a directional lane", all(s in ("BUY", "SELL") for s in sides),
+           str(set(sides)))
 
-    proven = set()
-    for i in range(5):
-        proven.add("V2B%d/USDT" % i); proven.add("V2S%d/USDT" % i)
-    for i in range(20):
-        proven.add("RF%02d/USDT" % i)
-    for i in range(15):
-        proven.add("FR%02d/USDT" % i)
-    _check("the 40 are genuinely from the global scanner outputs", set(universe) <= proven,
+    phases = [iw[s].get("phase") for s in universe]
+    _check("every watchlist asset has an explainable institutional state",
+           all(p in ("EARLY_DEVELOPING", "SETUP_FORMING", "READY_NEAR", "NO_SETUP") for p in phases),
+           str(set(phases)))
+    _check("institutional evidence cached at watchlist-entry (warm start)",
+           all(iw[s].get("csd") and iw[s].get("align") and iw[s].get("reasons")
+               and iw[s].get("proximity_score") is not None for s in universe))
+    _check("no random filler among the universe",
+           "random" not in [iw[s].get("source") for s in universe])
+
+    proven = set(M.get_usdt_perp_symbols())
+    _check("the universe is genuinely from the discovery-pool symbols", set(universe) <= proven,
            str(set(universe) - proven))
 
     # Replacement: stale entries from a previous cycle must be dropped.
@@ -137,9 +163,10 @@ def _test_cycle():
             "symbol": "STRAY%02d/USDT" % i, "score": 5.0, "side": "BUY", "last_update": 0.0}
     M.global_discovery_scan()
     strays = [k for k in M.MEMORY["watchlist"] if k.startswith("STRAY")]
-    _check("cycle end REPLACES watchlist with the new 40 (no stale leftovers)", len(strays) == 0,
+    _check("cycle end REPLACES watchlist with the new universe (no stale leftovers)", len(strays) == 0,
            "strays=%d total=%d" % (len(strays), len(M.MEMORY["watchlist"])))
-    _check("after replacement: exactly 40 again", len(M.MEMORY["watchlist"]) == 40)
+    _check("after replacement: watchlist matches the new universe again",
+           set(M.MEMORY["watchlist"].keys()) == set(M.MEMORY["candidate_universe"]), )
 
 
 def _test_stability():
