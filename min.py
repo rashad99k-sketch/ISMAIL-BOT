@@ -12,6 +12,7 @@
 # - Explainable CouncilDecision objects
 # - Fixed: entry_atr on recovered positions, prev_di_spread init,
 #          distribution_risk ordering, single SL/Trail owner
+# - FIX (2026-09-11b): moved dataclass import to top of file
 # ====================================================================
 
 import os
@@ -26,6 +27,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
 from collections import deque
+from dataclasses import dataclass, field   # ═══ FIX: moved to top ═══
 import queue as qlib
 import copy
 
@@ -548,7 +550,6 @@ class EntryZoneCouncil:
         if df is None or len(df) < 20:
             return CouncilEvidence("Zone", 50.0, "UNKNOWN", ["No data"])
 
-        # Original entry quality (from snapshot at entry time)
         entry_zone_score = entry_snapshot.get("entry_zone_score", 50.0)
         if entry_zone_score >= 80:
             score += 15
@@ -559,14 +560,11 @@ class EntryZoneCouncil:
             score -= 10
             reasons.append("Weak entry zone")
 
-        # Does price still respect the zone?
         last = df.iloc[-1]
         price = last['close']
-        # Zone = a band around entry price of ~0.5 ATR
         band = atr * 0.5 if atr > 0 else entry_price * 0.003
         in_zone = abs(price - entry_price) <= band
 
-        # Zone invalidation: price closed beyond 1 ATR in the losing direction
         if side == "BUY":
             if price < entry_price - atr * 1.0:
                 score -= 30
@@ -589,7 +587,6 @@ class EntryZoneCouncil:
         if in_zone:
             reasons.append("Price at entry zone (retest)")
 
-        # Rejection wick from the zone?
         body = abs(last['close'] - last['open'])
         rng = last['high'] - last['low']
         if rng > 0:
@@ -624,7 +621,6 @@ class StructureCouncil:
         bos_up, bos_down = detect_bos(df, lookback=5)
         last_close = df['close'].iloc[-1]
 
-        # Higher highs / higher lows (or inverse) over last 10 candles
         hh = df['high'].iloc[-1] > df['high'].iloc[-6]
         hl = df['low'].iloc[-1] > df['low'].iloc[-6]
         lh = df['high'].iloc[-1] < df['high'].iloc[-6]
@@ -718,7 +714,6 @@ class LiquidityCouncil:
             score += 5
             reasons.append("Equal highs (liquidity magnet)")
 
-        # Reclaim after sweep
         if swept_l or swept_h:
             last = df.iloc[-1]
             if side == "BUY" and swept_l and last['close'] > last['low']:
@@ -774,7 +769,6 @@ class MomentumCouncil:
             reasons.append(f"Climax risk {climax:.0f}")
             flags["climax"] = True
 
-        # ADX / DI
         try:
             plus_di, minus_di, adx, adx_slope = get_di_components(df)
             if adx is None:
@@ -823,7 +817,6 @@ class VolumeCouncil:
         bullish_candle = last['close'] > last['open']
         bearish_candle = last['close'] < last['open']
 
-        # Volume against position?
         if side == "BUY" and bearish_candle and ratio > 1.5:
             score -= 20
             reasons.append("Heavy volume against (bearish)")
@@ -833,7 +826,6 @@ class VolumeCouncil:
             reasons.append("Heavy volume against (bullish)")
             flags["against_volume"] = True
 
-        # Volume supportive
         if side == "BUY" and bullish_candle and ratio > 1.2:
             score += 15
             reasons.append("Supportive volume")
@@ -971,7 +963,6 @@ class RiskCouncil:
         if atr <= 0 or entry_price <= 0:
             return CouncilEvidence("Risk", 50.0, "UNKNOWN", ["Invalid inputs"])
 
-        # Adverse excursion
         if side == "BUY":
             adverse = (entry_price - current_price) / entry_price
         else:
@@ -986,14 +977,12 @@ class RiskCouncil:
             score -= 10
             reasons.append(f"Moderate adverse {adverse_atr:.1f} ATR")
 
-        # Drawdown from peak
         drawdown = max(0, peak_roe - current_roe)
         if peak_roe > 5 and drawdown > peak_roe * 0.5:
             score -= 15
             reasons.append(f"Large drawdown from peak ({drawdown:.1f}%)")
             flags["large_drawdown"] = True
 
-        # Extreme volatility (hard risk)
         try:
             atr_series = compute_atr(df)
             atr_ma = atr_series.rolling(20).mean().iloc[-1] if len(atr_series) >= 20 else atr
@@ -1018,7 +1007,6 @@ class ProfitCouncil:
         flags = {}
         score = 50.0
 
-        # Price reached TP1?
         if not tp1_hit and tp1_price > 0:
             if side == "BUY":
                 price_reached_tp1 = current_price >= tp1_price
@@ -1028,7 +1016,6 @@ class ProfitCouncil:
             if price_reached_tp1:
                 reasons.append(f"TP1 reached ({tp1_price:.4f})")
 
-        # Is TP2 nearby?
         if tp2_price > 0:
             if side == "BUY":
                 distance_tp2 = (tp2_price - current_price) / current_price
@@ -1065,7 +1052,6 @@ class PullbackClassifier:
         last = df.iloc[-1]
         price = last['close']
 
-        # Distance from entry in ATR
         if side == "BUY":
             move_against = (entry_price - price) / atr if price < entry_price else 0
         else:
@@ -1074,23 +1060,19 @@ class PullbackClassifier:
         if move_against < 0.1:
             return PullbackType.NONE
 
-        # Thesis failure check first
         if structure_evidence.flags.get("against_shift") and \
            smart_evidence.flags.get("against") and \
            volume_evidence.flags.get("against_volume"):
             return PullbackType.REVERSAL
 
-        # Distribution check
         if smart_evidence.flags.get("distribution") and \
            volume_evidence.flags.get("against_volume"):
             return PullbackType.DISTRIBUTION
 
-        # Fill test / mitigation
         if move_against <= 0.7 and structure_evidence.flags.get("trend_intact"):
             if abs(price - entry_price) / entry_price < 0.005:
                 return PullbackType.FILL_TEST
 
-        # Healthy pullback
         if structure_evidence.flags.get("trend_intact") and \
            not structure_evidence.flags.get("against_shift") and \
            not volume_evidence.flags.get("against_volume"):
@@ -1109,7 +1091,7 @@ class TradeManagementCouncil:
     Orchestrates 9 sub-councils and produces a single CouncilDecision.
     Handles state machine, hysteresis, and ATR+structure trailing.
     """
-    HYSTERESIS_REQUIRED = 2   # consecutive cycles required for dangerous actions
+    HYSTERESIS_REQUIRED = 2
 
     def __init__(self):
         self.state = CouncilState.INITIAL
@@ -1122,9 +1104,7 @@ class TradeManagementCouncil:
         self.state_entered_at = time.time()
         self.entry_snapshot: Dict[str, Any] = {}
 
-    # ---------- Public API ----------
     def on_trade_open(self, entry_price, side, atr, entry_meta: dict):
-        """Capture entry snapshot for the whole life of the trade."""
         self.state = CouncilState.INITIAL
         self.state_entered_at = time.time()
         self.confirmation_counters = {"thesis_failure": 0, "distribution": 0, "hard_exit": 0}
@@ -1140,13 +1120,6 @@ class TradeManagementCouncil:
         }
 
     def update(self, ctx: dict) -> CouncilDecision:
-        """
-        ctx keys required:
-            df, side, entry_price, current_price, atr, peak_roe, current_roe,
-            tp1_price, tp2_price, tp1_hit, tp2_hit, market_state, current_sl,
-            current_trail, entry_time
-        Returns a CouncilDecision the execution service will apply.
-        """
         side = ctx["side"]
         df = ctx["df"]
         entry_price = ctx["entry_price"]
@@ -1160,7 +1133,6 @@ class TradeManagementCouncil:
         current_sl = ctx.get("current_sl", 0.0)
         market_state = ctx.get("market_state", {})
 
-        # ---------- Gather evidence ----------
         zone_ev = EntryZoneCouncil.evaluate(df, ctx.get("ob"), entry_price, side, atr, self.entry_snapshot)
         struct_ev = StructureCouncil.evaluate(df, side)
         liq_ev = LiquidityCouncil.evaluate(df, side)
@@ -1175,7 +1147,6 @@ class TradeManagementCouncil:
         pullback = PullbackClassifier.classify(df, side, entry_price, atr,
                                                 struct_ev, liq_ev, vol_ev, smart_ev)
 
-        # ---------- Thesis status ----------
         thesis_status = ThesisStatus.VALID
         if struct_ev.flags.get("against_shift") and \
            (smart_ev.flags.get("against") or vol_ev.flags.get("against_volume")):
@@ -1186,27 +1157,23 @@ class TradeManagementCouncil:
         elif struct_ev.score < 45 or smart_ev.score < 40 or risk_ev.flags.get("large_drawdown"):
             thesis_status = ThesisStatus.WEAKENING
 
-        # ---------- Hard Risk Emergency (bypasses hysteresis) ----------
         hard_risk = False
         if risk_ev.state == "DANGER" and risk_ev.score <= 20:
             hard_risk = True
         if atr > 0 and abs(current_price - entry_price) / atr > 2.5 and current_roe < -3:
             hard_risk = True
 
-        # ---------- Update state machine ----------
         new_state = self._compute_state(
             zone_ev, struct_ev, liq_ev, mom_ev, vol_ev, smart_ev, trend_ev, risk_ev, profit_ev,
             pullback, thesis_status, current_roe, peak_roe
         )
 
-        # ---------- Confirmation / Hysteresis for dangerous actions ----------
         dangerous = new_state in (CouncilState.THESIS_FAILURE, CouncilState.DISTRIBUTION, CouncilState.EXIT)
         if dangerous and not hard_risk:
             key = "thesis_failure" if new_state == CouncilState.THESIS_FAILURE else \
                   "distribution" if new_state == CouncilState.DISTRIBUTION else "hard_exit"
             self.confirmation_counters[key] += 1
             if self.confirmation_counters[key] < self.HYSTERESIS_REQUIRED:
-                # Hold current state, produce HOLD but keep proposed trail
                 new_state = self.state
                 confirmed = False
             else:
@@ -1221,14 +1188,12 @@ class TradeManagementCouncil:
             self.state = new_state
             self.state_entered_at = time.time()
 
-        # ---------- Build action & SL/Trail ----------
         action, proposed_sl, proposed_trail, partial_ratio, exit_reason = self._decide_action(
             new_state, side, entry_price, current_price, atr,
             current_sl, tp1_price, tp1_hit, current_roe, peak_roe,
             struct_ev, smart_ev, risk_ev, profit_ev, pullback, hard_risk, confirmed
         )
 
-        # ---------- Compose decision ----------
         decision = CouncilDecision(
             side=side,
             state=self.state.value,
@@ -1258,27 +1223,19 @@ class TradeManagementCouncil:
         self.last_decision = decision
         return decision
 
-    # ---------- Internals ----------
     def _compute_state(self, zone_ev, struct_ev, liq_ev, mom_ev, vol_ev, smart_ev,
                         trend_ev, risk_ev, profit_ev, pullback, thesis_status,
                         current_roe, peak_roe) -> CouncilState:
-        # Level 1: Risk emergency
         if risk_ev.state == "DANGER" and risk_ev.score <= 20:
             return CouncilState.THESIS_FAILURE
-
-        # Level 2: Thesis failure
         if thesis_status == ThesisStatus.FAILED:
             return CouncilState.THESIS_FAILURE
-
-        # Level 3: Institutional distribution
         if pullback == PullbackType.DISTRIBUTION:
             return CouncilState.DISTRIBUTION
         if pullback == PullbackType.REVERSAL:
             return CouncilState.THESIS_FAILURE
 
-        # Profit / trend transitions
         if current_roe < 1.5 and peak_roe < 2:
-            # Early stage
             if thesis_status == ThesisStatus.VALID:
                 return CouncilState.INITIAL if current_roe < 0.3 else CouncilState.PROFIT_FORMING
             return CouncilState.INITIAL
@@ -1299,7 +1256,7 @@ class TradeManagementCouncil:
                 return CouncilState.PROFIT_PROTECTION
             return CouncilState.TREND_HEALTHY
 
-        return self.state  # keep current
+        return self.state
 
     def _decide_action(self, state, side, entry_price, current_price, atr,
                         current_sl, tp1_price, tp1_hit, current_roe, peak_roe,
@@ -1311,35 +1268,25 @@ class TradeManagementCouncil:
         partial_ratio = 0.0
         exit_reason = ""
 
-        # ---- Level 1: Hard risk ----
         if hard_risk:
             return "EXIT", current_sl, current_sl, 0.0, "Hard risk emergency"
 
-        # ---- Level 2: Thesis failure ----
         if state == CouncilState.THESIS_FAILURE and confirmed:
             return "EXIT", current_sl, current_sl, 0.0, "Thesis failure confirmed"
 
-        # ---- Level 3: Distribution ----
         if state == CouncilState.DISTRIBUTION and confirmed:
-            # Partial protective close, not full exit
             partial_ratio = 0.5 if current_roe > 3 else 0.3
-            # Move SL to breakeven or better
             if side == "BUY":
                 proposed_sl = max(current_sl, entry_price)
             else:
                 proposed_sl = min(current_sl, entry_price) if current_sl > 0 else entry_price
             return "PARTIAL", proposed_sl, current_sl, partial_ratio, "Institutional distribution"
 
-        # ---- Protective structure-aware SL for profitable trades ----
-        # We only START protecting once trade is meaningfully in profit AND structure is still intact.
         if current_roe >= 1.5 and struct_ev.score >= 60:
-            # ATR + structure trail
             if side == "BUY":
-                # Trail below last swing low - 1 ATR
                 swing_low = self._last_swing_low(current_price, atr)
                 atr_sl = current_price - atr * 1.5
                 struct_sl = min(swing_low, atr_sl) if swing_low > 0 else atr_sl
-                # Never below entry once TP1 hit
                 if tp1_hit:
                     struct_sl = max(struct_sl, entry_price)
                 if struct_sl > proposed_sl:
@@ -1356,7 +1303,6 @@ class TradeManagementCouncil:
                     action = "TRAIL" if action == "HOLD" else action
             proposed_trail = proposed_sl
 
-        # ---- Event-based TP1: only if price_reached AND evidence supports ----
         if not tp1_hit and tp1_price > 0:
             if side == "BUY":
                 price_reached = current_price >= tp1_price
@@ -1364,7 +1310,6 @@ class TradeManagementCouncil:
                 price_reached = current_price <= tp1_price
 
             if price_reached:
-                # Council evaluates whether to actually book partial
                 should_book = (
                     smart_ev.flags.get("distribution") or
                     pullback == PullbackType.DISTRIBUTION or
@@ -1374,20 +1319,17 @@ class TradeManagementCouncil:
                 if should_book:
                     partial_ratio = 0.4
                     action = "PARTIAL"
-                    # After partial: SL to BE
                     if side == "BUY":
                         proposed_sl = max(proposed_sl, entry_price)
                     else:
                         proposed_sl = min(proposed_sl, entry_price) if proposed_sl > 0 else entry_price
                 else:
-                    # Trend strong: skip partial, extend runner
                     if side == "BUY":
                         proposed_sl = max(proposed_sl, current_price - atr * 2.0)
                     else:
                         proposed_sl = min(proposed_sl, current_price + atr * 2.0) if proposed_sl > 0 else current_price + atr * 2.0
-                    action = "HOLD"  # keep running
+                    action = "HOLD"
 
-        # ---- Trend Rider explicit signal ----
         if state == CouncilState.TREND_RIDER and action == "HOLD":
             action = "TREND_RIDER"
 
@@ -1428,20 +1370,17 @@ class TradeExecutionService:
         self.close_lock = threading.Lock()
 
     def apply(self, decision: CouncilDecision, symbol, state: dict) -> str:
-        # ---- SL update ----
         if decision.proposed_sl > 0 and state.get("synthetic_sl", 0) != decision.proposed_sl:
             state["synthetic_sl"] = decision.proposed_sl
             state["trail_stop"] = decision.proposed_trail or decision.proposed_sl
             log_execution(f"[COUNCIL] SL updated → {decision.proposed_sl:.4f}", "INFO",
                           debounce_key=f"council_sl_{symbol}", debounce_sec=10)
 
-        # ---- Partial close ----
         if decision.action == "PARTIAL" and decision.partial_ratio > 0 and not state.get("tp1_hit", False):
             if self.partial_lock.acquire(blocking=False):
                 try:
-                    # Verify price condition again
                     if symbol in MEMORY.get("_prices", {}):
-                        pass  # placeholder
+                        pass
                     close_partial(decision.partial_ratio)
                     state["tp1_hit"] = True
                     state["tp1_price_actual"] = state.get("mark_price", 0.0)
@@ -1451,7 +1390,6 @@ class TradeExecutionService:
             else:
                 log_execution("[COUNCIL] Partial close already in progress, skipping", "WARN")
 
-        # ---- Full exit ----
         if decision.action == "EXIT":
             if self.close_lock.acquire(blocking=False):
                 try:
@@ -1463,7 +1401,6 @@ class TradeExecutionService:
             else:
                 log_execution("[COUNCIL] Close already in progress, skipping", "WARN")
 
-        # ---- TREND_RIDER: no action, just hold & allow trailing ----
         if decision.action == "TREND_RIDER":
             return "TREND_RIDER"
 
@@ -1551,7 +1488,6 @@ class TradeStateMachine:
         return self.current_state in ("EXHAUSTION", "DISTRIBUTION", "MOMENTUM_COLLAPSE", "PROFIT_DEFENSE", "LIQUIDITY_EXHAUSTION")
 
     def should_hard_exit(self) -> bool:
-        # ═══ FIX #6: reduce aggression — require state to persist ═══
         if self.current_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE"):
             if time.time() - self.last_state_change > 20:
                 return True
@@ -1715,7 +1651,7 @@ MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
 LEVERAGE = 10
-USE_PPE = False  # Legacy PPE disabled (Council owns management)
+USE_PPE = False
 
 USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
 QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
@@ -1943,7 +1879,7 @@ def get_mark_price(symbol):
     return get_ticker_safe(symbol)
 
 # ========== TRADE THESIS ENGINE ==========
-from dataclasses import dataclass, field
+# ═══ NOTE: dataclass import moved to top of file ═══
 
 @dataclass
 class TradeThesis:
@@ -2629,7 +2565,7 @@ def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
 
 # ========== PARTIAL CLOSE (single-threaded) ==========
 _closing_in_progress = False
-_closing_lock = threading.Lock()   # ═══ FIX #7: proper lock ═══
+_closing_lock = threading.Lock()
 
 def close_partial(ratio):
     global _closing_in_progress
@@ -2768,10 +2704,6 @@ def close_position_full():
 
 # ========== LEGACY PPE — NOW ONLY PRODUCES EVIDENCE (writes disabled) ==========
 def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
-    """
-    ═══ FIX #3: This function is now a NO-OP for SL/Trail writes.
-    Council is the single authority. Kept for backward compatibility.
-    """
     return "HOLD", state.get("sl", 0.0), state.get("trail_stop", 0.0)
 
 # ========== LIVE TRADE MANAGER — COUNCIL DRIVEN ==========
@@ -2885,7 +2817,6 @@ class LiveTradeManager:
             STATE["peak_roe"] = roe
             peak_roe = roe
 
-        # Compute market_state for evidence
         plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
         if plus_di is None: plus_di = 20.0
         if minus_di is None: minus_di = 20.0
@@ -2901,7 +2832,6 @@ class LiveTradeManager:
             "df": df_live,
         }
 
-        # Update dashboard evidence
         smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
         momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
         regime = self.regime_classifier.classify(df_live, None)
@@ -2915,7 +2845,6 @@ class LiveTradeManager:
         STATE["market_regime"] = regime
         STATE["trade_state"] = trade_state
 
-        # ═══ COUNCIL DECISION ═══
         council_ctx = {
             "df": df_live,
             "side": side,
@@ -2933,7 +2862,6 @@ class LiveTradeManager:
         }
         decision = _council.update(council_ctx)
 
-        # Persist explainable decision
         STATE["council_state"] = decision.state
         STATE["council_action"] = decision.action
         STATE["council_decision"] = {
@@ -2960,7 +2888,6 @@ class LiveTradeManager:
             "ts": decision.timestamp,
         }
 
-        # Log explainable decision every cycle (throttled)
         if now - self.last_live_debug_ts >= 5:
             self.last_live_debug_ts = now
             log_execution(
@@ -2975,7 +2902,6 @@ class LiveTradeManager:
                 "INFO"
             )
 
-        # Apply via execution service
         result = _execution_service.apply(decision, symbol, STATE)
         if result == "EXITED":
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
@@ -3022,17 +2948,14 @@ def sync_position_state(symbol=None):
             TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": snap.side,
                                 "entry": snap.entry_price, "qty": snap.qty, "last_update_ts": time.time()})
             _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty, 0.0, 0.0, 0.0)
-            # ═══ FIX #2: initialize entry_atr for recovered positions ═══
             df = get_ohlcv_safe(symbol, 50)
             if df is not None:
                 atr_rec = compute_atr(df).iloc[-1]
                 _live_manager.set_entry_atr(atr_rec)
-                # Init Council for this recovered position
                 _council.on_trade_open(snap.entry_price, snap.side, atr_rec, {
                     "entry_zone_score": 50.0, "entry_type": "RECOVERED",
                     "classification": "UNKNOWN", "intent_score": 0
                 })
-                # ═══ FIX #5: initialize prev_di_spread ═══
                 try:
                     p_di, m_di, _, _ = get_di_components(df)
                     if p_di is not None and m_di is not None:
@@ -5139,8 +5062,7 @@ def smart_scanner_v2():
     return sorted(buy_candidates, key=lambda x: x["score"], reverse=True)[:10], \
            sorted(sell_candidates, key=lambda x: x["score"], reverse=True)[:10]
 
-def smart_opportunity_selection():
-    # same as earlier — kept for compatibility
+def smart_opportunity_selection_v2():
     candidates = []
     for c in MEMORY.get("scanner_v2_buy", [])[:5]:
         candidates.append({"symbol": c["symbol"], "side": "BUY", "score": c["score"]})
@@ -5391,7 +5313,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     STATE["current_confidence"] = initial_conf
     STATE["market_regime"] = regime_class
 
-    # Common state init
     common_state = {
         "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
         "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
@@ -5411,7 +5332,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "tp1_hold_score": 10, "exit_warning": 0, "runner_mode": False, "entry_atr": atr_val,
         "trade_thesis": thesis.__dict__,
         "council_state": "INITIAL", "council_action": "HOLD",
-        # ═══ FIX #5: proper initialization ═══
         "prev_di_spread": (plus_di - minus_di) if plus_di is not None and minus_di is not None else 0.0,
     }
 
@@ -5422,7 +5342,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                             "qty": qty, "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()})
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         _live_manager.set_entry_atr(atr_val)
-        # Init Council
         _council.on_trade_open(price, side, atr_val, {
             "entry_zone_score": score, "entry_type": entry_type,
             "classification": classification, "intent_score": intent_score
@@ -5640,7 +5559,7 @@ def main_loop_sniper():
                     rebuild_radar_watchlist(); last_radar_scan = now
                 if now - last_radar_refresh >= WATCHLIST_REFRESH:
                     refresh_radar_watchlist(); last_radar_refresh = now
-                if now - last_candidate_scan >= CANDIDATE_INTERVAL if False else 15:
+                if now - last_candidate_scan >= CANDIDATE_INTERVAL:
                     if watchlist_rotation and watchlist_rotation.should_rotate():
                         batch = watchlist_rotation.get_next_batch()
                     last_candidate_scan = now
