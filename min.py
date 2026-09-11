@@ -7192,54 +7192,509 @@ def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
 def clear_position_dashboard():
     DASHBOARD_STATE["position"] = None
 
+def render_live_supervisor_panel():
+    return """
+    <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
+      <div class="rf-live-header">
+        <span class="rf-live-title">🧠 RF v28 Fixed Live Supervisor</span>
+        <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
+      </div>
+      <div class="rf-live-grid">
+        <div class="rf-live-card"><div class="rf-live-metric-icon">💰</div><div class="rf-live-metric-label">Entry</div><div class="rf-live-metric-value" id="rf-sup-entry">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📈</div><div class="rf-live-metric-label">Mark Price</div><div class="rf-live-metric-value" id="rf-sup-mark">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">ROE%</div><div class="rf-live-metric-value" id="rf-sup-roe">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">💵</div><div class="rf-live-metric-label">Unrealized PnL</div><div class="rf-live-metric-value" id="rf-sup-upnl">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📊</div><div class="rf-live-metric-label">ADX</div><div class="rf-live-metric-value" id="rf-sup-adx">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🟢</div><div class="rf-live-metric-label">DI+</div><div class="rf-live-metric-value" id="rf-sup-dip">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🔴</div><div class="rf-live-metric-label">DI-</div><div class="rf-live-metric-value" id="rf-sup-dim">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🔥</div><div class="rf-live-metric-label">Continuation</div><div class="rf-live-metric-value" id="rf-sup-cont">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Thesis Failure</div><div class="rf-live-metric-value" id="rf-sup-fail">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">✅</div><div class="rf-live-metric-label">Confidence</div><div class="rf-live-metric-value" id="rf-sup-conf">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP1</div><div class="rf-live-metric-value" id="rf-sup-tp1">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP2</div><div class="rf-live-metric-value" id="rf-sup-tp2">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">Trailing</div><div class="rf-live-metric-value" id="rf-sup-trail">❌</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Personality</div><div class="rf-live-metric-value" id="rf-sup-personality">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🏦</div><div class="rf-live-metric-label">Institutional Flow</div><div class="rf-live-metric-value" id="rf-sup-flow">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⚙️</div><div class="rf-live-metric-label">Trade State</div><div class="rf-live-metric-value" id="rf-sup-state">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">📏</div><div class="rf-live-metric-label">Trail Mult</div><div class="rf-live-metric-value" id="rf-sup-trail-mult">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">⏰</div><div class="rf-live-metric-label">Delay TP1</div><div class="rf-live-metric-value" id="rf-sup-delay-tp1">❌</div></div>
+      </div>
+      <div class="rf-live-status-row">
+        <span id="rf-pill-thesis" class="rf-live-pill rf-live-pill-active">🧠 THESIS ACTIVE</span>
+        <span id="rf-pill-trail" class="rf-live-pill">⚡ TRAILING OFF</span>
+        <span id="rf-pill-flow" class="rf-live-pill">🏦 NEUTRAL</span>
+        <span id="rf-pill-reclaim" class="rf-live-pill">🟢 RECLAIM LOW</span>
+      </div>
+    </div>
+    <style>
+    .rf-live-supervisor {background: linear-gradient(145deg, #0f1724 0%, #0a0f17 100%); border-radius: 20px; padding: 20px; margin-bottom: 20px; border: 1px solid #2c3e50;}
+    .rf-live-header {display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid #2c3e50;}
+    .rf-live-title {font-size: 18px; font-weight: bold; color: #00ffa6;}
+    .rf-live-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px;}
+    .rf-live-card {background: #111827; border-radius: 14px; padding: 10px; text-align: center;}
+    .rf-live-metric-icon {font-size: 22px; margin-bottom: 4px;}
+    .rf-live-metric-label {font-size: 11px; color: #9ca3af; text-transform: uppercase;}
+    .rf-live-metric-value {font-size: 15px; font-weight: bold; color: #e6edf3; margin-top: 4px;}
+    .rf-live-status-row {display: flex; flex-wrap: wrap; gap: 8px;}
+    .rf-live-pill {background: #111827; padding: 6px 14px; border-radius: 30px; font-size: 12px; font-weight: 600; border: 1px solid #2c3e50; display: inline-flex; align-items: center; gap: 6px;}
+    .rf-live-pill-active {background: rgba(0, 255, 166, 0.1); border-color: #00ffa6; color: #00ffa6;}
+    .rf-live-pill-trail {background: rgba(0, 255, 166, 0.1); border-color: #00ffa6;}
+    .rf-live-pill-risk-low {color: #00ffa6;}
+    .rf-live-pill-risk-mid {color: #ffc800;}
+    .rf-live-pill-risk-high {color: #ff4d4d;}
+    </style>
+    """
+
+
 @app.route("/")
 def dashboard():
-    return "<h1>RF v28 (FIXED)</h1><p>See <a href='/data'>/data</a> for live state.</p>"
+    rf_items = MEMORY.get("rf_dashboard", [])[:20]
+    rf_html = "".join([f"<div>{item['icon']} {item['symbol']} | {item['status']} | score={item['score']:.2f} | ADX={item['adx']:.1f} | RSI={item['rsi']:.1f}</div>" for item in rf_items])
 
-@app.route("/data")
-def data():
-    cached = cache_get("dashboard", 5)
-    if cached is not None:
-        return jsonify(safe_json(cached))
-    try:
-        bal = get_balance_safe()
-        free_bal = get_free_balance_safe()
-        avail_margin = free_bal
-        mode = "LIVE" if MODE_LIVE else "PAPER"
-        DASHBOARD_STATE["account"]["balance"] = bal
-        DASHBOARD_STATE["account"]["free_balance"] = free_bal
-        DASHBOARD_STATE["account"]["available_margin"] = avail_margin
-        DASHBOARD_STATE["account"]["mode"] = mode
-        perf = get_dashboard_metrics()
-        pos = None
-        if STATE["open"] and STATE.get("current_symbol"):
-            roe = STATE.get("roe_pct", 0.0)
-            pos = {
-                "symbol": STATE["current_symbol"], "side": STATE["side"],
-                "entry": round(STATE["entry"],4),
-                "qty": STATE.get("qty", 0),
-                "pnl": round(roe, 2),
-                "sl": round(STATE.get("synthetic_sl",0),4),
-                "tp1": round(STATE.get("synthetic_tp1",0),4),
-                "tp2": round(STATE.get("tp2_price",0),4),
-                "tp1_done": STATE.get("tp1_hit", False),
-                "trailing_active": STATE.get("trail_activated", False),
-                "regime": MEMORY.get("regime", "UNKNOWN"),
-                "trade_type": STATE.get("trade_type", "N/A"),
-                "entry_type": STATE.get("entry_type", "N/A"),
-                "classification": STATE.get("classification", "N/A"),
-                "location": STATE.get("location", "N/A"),
-                "zone": STATE.get("zone_info", "N/A"),
-                "score": STATE.get("trade_score", 0),
-                "narrative_classification": STATE.get("narrative_classification", ""),
-                "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-                "confidence_level": STATE.get("confidence_level", ""),
-                "current_confidence": STATE.get("current_confidence", 50.0),
-                "market_regime": STATE.get("market_regime", "UNKNOWN"),
-                "continuation_pressure": STATE.get("continuation_pressure", 50),
-                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
-                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
+    scanner_buy = MEMORY.get("scanner_v2_buy", [])
+    scanner_sell = MEMORY.get("scanner_v2_sell", [])
+    buy_html = ""
+    for b in scanner_buy:
+        icon = "🔥" if b["score"] >= 7 else "⚡"
+        sm = b.get("smart_money", {})
+        mom = b.get("momentum", {})
+        sm_str = f"{sm.get('bias_detailed', sm.get('bias', '?'))} "
+        if sm.get("dominant"): sm_str += "🧠"
+        mom_str = ""
+        if mom.get("expansion"): mom_str += "🚀"
+        if mom.get("decay"): mom_str += "📉"
+        buy_html += f"<div>{icon} {b['symbol']} | Score: {b['score']}<br>📍 {b['location']} | RF: {b['rf_prox']}% | Vol: {'Spike' if b['volume_spike'] else 'Norm'} | Rej: {'✔' if b['rejection'] else '✖'}<br>🏦 {sm_str} | 📈 {mom_str}</div><hr>"
+    sell_html = ""
+    for s in scanner_sell:
+        icon = "🔥" if s["score"] >= 7 else "⚡"
+        sm = s.get("smart_money", {})
+        mom = s.get("momentum", {})
+        sm_str = f"{sm.get('bias_detailed', sm.get('bias', '?'))} "
+        if sm.get("dominant"): sm_str += "🧠"
+        mom_str = ""
+        if mom.get("expansion"): mom_str += "🚀"
+        if mom.get("decay"): mom_str += "📉"
+        sell_html += f"<div>{icon} {s['symbol']} | Score: {s['score']}<br>📍 {s['location']} | RF: {s['rf_prox']}% | Vol: {'Spike' if s['volume_spike'] else 'Norm'} | Rej: {'✔' if s['rejection'] else '✖'}<br>🏦 {sm_str} | 📈 {mom_str}</div><hr>"
+    scanner_v2_section = f"""
+    <div class="section smart-layer"><div class="title">📡 SMART SCANNER v2 (Ranked)</div>
+    <div style="display:flex; gap:20px;">
+        <div style="flex:1; background:#0f1724; padding:12px; border-radius:8px;"><b>🟢 TOP 10 BUY</b><br>{buy_html or 'No candidates'}</div>
+        <div style="flex:1; background:#0f1724; padding:12px; border-radius:8px;"><b>🔴 TOP 10 SELL</b><br>{sell_html or 'No candidates'}</div>
+    </div>
+    </div>
+    """
+
+    decision_panel_html = """
+    <div id="decision-panel" style="padding:12px; border:1px solid #2c3e50; margin-bottom:16px; border-radius:8px; background:#0a0c10;">
+      <h3>🧠 SMC Decision Engine (Scenario + Decision)</h3>
+      <div id="decision-list" style="max-height:400px; overflow-y:auto; font-size:13px;"></div>
+    </div>
+    """
+
+    watchlist_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">👁 WATCHLIST / ACTIVE CANDIDATES</div>
+      <div id="watchlist-panel" style="max-height:400px; overflow-y:auto; font-size:13px; background:#0f1724; padding:10px; border-radius:8px;">
+        Loading...
+      </div>
+    </div>
+    """
+
+    no_entry_feed_section_html = """
+    <div class="section smart-layer"><div class="title">🚫 WHY NO ENTRY (Last 5)</div>
+    <div id="no-entry-feed" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+
+    free_balance_card = '<div class="card">FREE BALANCE<div id="free_bal">-</div><div id="avail_margin">-</div></div>'
+
+    continuation_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">📈 CONTINUATION ENGINE</div>
+      <div id="continuation-panel" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+
+    thesis_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">🧠 TRADE THESIS</div>
+      <div id="thesis-panel" class="card" style="font-size:12px;"></div>
+    </div>
+    """
+
+    confidence_regime_panel = """
+    <div class="section smart-layer">
+      <div class="title">📊 CONFIDENCE & REGIME</div>
+      <div class="grid">
+        <div class="card">Current Confidence<div id="current_conf">-</div></div>
+        <div class="card">Market Regime<div id="market_regime">-</div></div>
+        <div class="card">Continuation Pressure<div id="cont_pressure">-</div></div>
+        <div class="card">Thesis Failure Score<div id="thesis_failure">-</div></div>
+      </div>
+    </div>
+    """
+
+    intent_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">🔮 Institutional Intent Engine (9 Layers)</div>
+      <div class="grid" style="grid-template-columns: repeat(4,1fr);">
+        <div class="card">Score<div id="intent-score" class="green">-</div></div>
+        <div class="card">Status<div id="intent-status">-</div></div>
+        <div class="card">Liquidity<div id="intent-liq">-</div></div>
+        <div class="card">Absorption<div id="intent-abs">-</div></div>
+        <div class="card">Volatility<div id="intent-vol">-</div></div>
+        <div class="card">Flow<div id="intent-flow">-</div></div>
+        <div class="card">Structure<div id="intent-struct">-</div></div>
+        <div class="card">Momentum<div id="intent-mom">-</div></div>
+        <div class="card">Volume<div id="intent-vol-ctx">-</div></div>
+        <div class="card">Narrative<div id="intent-narr">-</div></div>
+        <div class="card">Regime Weights<div id="intent-weights">-</div></div>
+      </div>
+    </div>
+    """
+
+    dynamic_trade_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">⚡ Dynamic Trade Management</div>
+      <div class="grid" style="grid-template-columns: repeat(4,1fr);">
+        <div class="card">Current ROE<div id="dyn-roe">-</div></div>
+        <div class="card">Trailing Active<div id="dyn-trail">❌</div></div>
+        <div class="card">TP1 Hit<div id="dyn-tp1">❌</div></div>
+        <div class="card">TP2 Hit<div id="dyn-tp2">❌</div></div>
+        <div class="card">Runner Active<div id="dyn-runner">❌</div></div>
+        <div class="card">Drawdown<div id="dyn-dd">0.0%</div></div>
+        <div class="card">Lifecycle<div id="dyn-lifecycle">-</div></div>
+      </div>
+    </div>
+    """
+
+    flow_section_html = """
+    <div class="section smart-layer">
+      <div class="title">🧠 Institutional Flow Intelligence</div>
+      <div class="rf-flow-grid">
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Banker Pressure</div><div id="flow-banker" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Retail Pressure</div><div id="flow-retail" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Hot Money</div><div id="flow-hot" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Institutional Bias</div><div id="flow-bias" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Flow Alignment</div><div id="flow-align" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Distribution Risk</div><div id="flow-dist" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Momentum Health</div><div id="flow-mom-health" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Continuation Strength</div><div id="flow-cont-str" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Exhaustion Risk</div><div id="flow-exh-risk" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Climax Risk</div><div id="flow-climax" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Greed State</div><div id="flow-greed" class="rf-flow-value">-</div></div>
+        <div class="rf-flow-card"><div class="rf-flow-metric-label">Smart Money Dominant</div><div id="flow-dom" class="rf-flow-value">-</div></div>
+      </div>
+    </div>
+    <style>
+    .rf-flow-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 8px;}
+    .rf-flow-card {background: #111827; border-radius: 12px; padding: 8px; text-align: center;}
+    .rf-flow-metric-label {font-size: 11px; color: #9ca3af; text-transform: uppercase;}
+    .rf-flow-value {font-size: 16px; font-weight: bold; margin-top: 4px; color: #e6edf3;}
+    </style>
+    """
+
+    queue_panel_html = """
+    <div class="section smart-layer" id="queue-panel" style="display: none;">
+        <div class="title">🎯 EXECUTION QUEUE – Institutional Zone Analysis</div>
+        <div id="queue-summary" class="grid" style="grid-template-columns: repeat(6,1fr); margin-bottom:10px;">
+            <div class="card">Total<div id="q-total">0</div></div>
+            <div class="card">Ready<div id="q-ready" class="green">0</div></div>
+            <div class="card">Waiting Trigger<div id="q-waiting" class="orange">0</div></div>
+            <div class="card">Good Zone<div id="q-good-zone" class="blue">0</div></div>
+            <div class="card">Returned<div id="q-returned" class="grey">0</div></div>
+            <div class="card">Best Score<div id="q-best-score">0</div></div>
+        </div>
+        <div id="queue-table" style="max-height:400px; overflow-y:auto; font-size:12px;">
+            <table style="width:100%; border-collapse:collapse; background:#0f1724; border-radius:8px; overflow:hidden;">
+                <thead>
+                    <tr style="background:#1a2332; color:#9ca3af; text-align:center;">
+                        <th>Symbol</th><th>Side</th><th>Score</th><th>OB</th><th>Zone</th><th>Liq</th><th>Inst</th>
+                        <th>Struct</th><th>Timing</th><th>Trend</th><th>Risk</th><th>Trigger</th><th>Type</th><th>State</th>
+                    </tr>
+                </thead>
+                <tbody id="queue-body"></tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+    supervisor_panel_html = render_live_supervisor_panel()
+
+    html = f"""
+<!DOCTYPE html>
+<html><head><title>RF v28 + Board v1</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
+.header{{padding:14px 16px;background:#111827;color:#00ff9f;font-size:22px;}}
+.section{{padding:12px 14px;border-bottom:1px solid #1f2937}}
+.title{{color:#9ca3af;margin-bottom:6px}}
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}
+.card{{background:#111827;border-radius:10px;padding:10px}}
+.green{{color:#00ffa6}} .red{{color:#ff4d4d}} .blue{{color:#3498db}} .orange{{color:#f1c40f}} .grey{{color:#95a5a6}}
+.log,.err{{max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px}}
+.btn{{background:#2d3748;border:none;color:white;padding:8px 16px;margin:4px;border-radius:6px;cursor:pointer}}
+.btn-buy{{background:#0f7b3a}} .btn-sell{{background:#9b2c2c}} .btn-close{{background:#4a5568}}
+.smart-layer{{background:#0f1724;margin-top:12px;border-radius:8px}}
+</style>
+</head>
+<body>
+<div class="header">🔥 RF v28 + Trade Management Board v1</div>
+{decision_panel_html}
+{scanner_v2_section}
+{queue_panel_html}
+{supervisor_panel_html}
+{intent_panel_html}
+{dynamic_trade_panel_html}
+{flow_section_html}
+{continuation_panel_html}
+{thesis_panel_html}
+{confidence_regime_panel}
+<div class="section"><div class="title">💰 ACCOUNT & PERFORMANCE</div><div class="grid">
+<div class="card">Balance<div id="bal">-</div></div>
+{free_balance_card}
+<div class="card">Mode<div id="mode">-</div></div>
+<div class="card">Trades<div id="trades">0</div></div>
+<div class="card">Wins<div id="wins" class="green">0</div></div>
+<div class="card">Losses<div id="losses" class="red">0</div></div>
+<div class="card">WinRate<div id="winrate">0%</div></div>
+</div></div>
+<div class="section"><div class="title">📊 TOTAL P&L & LAST TRADE</div><div class="grid">
+<div class="card">Total PnL%<div id="total_pnl" class="green">0%</div></div>
+<div class="card">Total PnL USDT<div id="total_pnl_usdt">0.00</div></div>
+<div class="card">Last Trade<div id="last_trade">N/A</div></div>
+</div></div>
+<div class="section"><div class="title">📍 LIVE POSITION</div>
+<div id="pos" class="card"></div>
+</div>
+<div class="section smart-layer"><div class="title">📡 TOP RF OPPORTUNITIES</div>
+<div id="top5" class="card"></div>
+</div>
+<div class="section smart-layer"><div class="title">📡 RF SIGNALS (Trigger Candidates)</div>
+<div id="rfSignals" class="card">{rf_html}</div>
+</div>
+{watchlist_panel_html}
+<div class="section"><div class="title">📜 EXECUTION LOG</div><div id="logs" class="card log"></div></div>
+<div class="section"><div class="title">🚨 SYSTEM ERRORS</div><div id="errors" class="card err"></div></div>
+{no_entry_feed_section_html}
+<div class="section"><div class="title">🎮 MANUAL CONTROLS</div>
+<button class="btn btn-buy" onclick="manualTrade('BUY')">BUY</button>
+<button class="btn btn-sell" onclick="manualTrade('SELL')">SELL</button>
+<button class="btn btn-close" onclick="manualClose()">CLOSE</button>
+</div>
+<div class="section smart-layer"><div class="title">📡 MONITORING</div><div class="grid">
+<div class="card">Regime<div id="regimeLabel">-</div></div>
+<div class="card">Scanned<div id="scanned">0</div></div>
+<div class="card">Last Scan<div id="lastScan">-</div></div>
+</div></div>
+<div class="section smart-layer"><div class="title">🩺 SYSTEM HEALTH</div><div class="grid">
+<div class="card">API Status<div id="apiStatus">-</div></div>
+<div class="card">Errors<div id="errCount">0</div></div>
+<div class="card">Bot Status<div id="botStatus">-</div></div>
+</div></div>
+<script>
+let lastFetch = 0;
+let cachedData = null;
+async function fetchData() {{
+    const now = Date.now();
+    if (cachedData && (now - lastFetch) < 5000) {{ updateUI(cachedData); return; }}
+    lastFetch = now;
+    try {{
+        const r = await fetch('/data');
+        const d = await r.json();
+        cachedData = d;
+        updateUI(d);
+    }} catch(e) {{ console.error(e); }}
+}}
+function updateUI(d) {{
+    document.getElementById("bal").innerText = d.balance.toFixed(2);
+    document.getElementById("free_bal").innerText = "$" + d.free_balance.toFixed(2);
+    document.getElementById("avail_margin").innerText = "Margin: " + d.avail_margin.toFixed(2);
+    document.getElementById("mode").innerText = d.mode;
+    document.getElementById("trades").innerText = d.stats.trades;
+    document.getElementById("wins").innerText = d.stats.wins;
+    document.getElementById("losses").innerText = d.stats.losses;
+    document.getElementById("winrate").innerText = d.stats.win_rate.toFixed(1)+"%";
+    document.getElementById("total_pnl").innerHTML = d.total_pnl || "0%";
+    document.getElementById("total_pnl_usdt").innerHTML = d.total_pnl_usdt ? d.total_pnl_usdt.toFixed(2) : "0.00";
+    document.getElementById("last_trade").innerText = d.last_trade || "N/A";
+    if(d.position) {{
+        let pnlClass = d.position.pnl >= 0 ? "green" : "red";
+        document.getElementById("pos").innerHTML = `
+            <div><b>${{d.position.symbol}}</b> | ${{d.position.side}} | ${{d.position.entry_type}} (${{d.position.classification}})</div>
+            <div>Entry: ${{d.position.entry}} | PnL: <span class="${{pnlClass}}">${{d.position.pnl}}%</span></div>
+            <div>SL: ${{d.position.sl}} | TP1: ${{d.position.tp1}} | TP2: ${{d.position.tp2}}</div>
+            <div>TP1 done: ${{d.position.tp1_done}} | Trailing: ${{d.position.trailing_active}}</div>
+            <div>Location: ${{d.position.location}} | Zone: ${{d.position.zone}}</div>
+            <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}})</div>
+            <div>Current Confidence: ${{d.position.current_confidence}} | Regime: ${{d.position.market_regime}}</div>
+            <div>Trade State: ${{d.position.trade_state}} | Trail Mult: ${{d.position.trail_multiplier}}</div>
+        `;
+    }} else {{
+        document.getElementById("pos").innerHTML = "No active trade";
+    }}
+    if(d.live_trade_mode && d.supervisor) {{
+        const sup = d.supervisor;
+        document.getElementById("rf-sup-entry").innerText = sup.entry_price?.toFixed(4) || "-";
+        document.getElementById("rf-sup-mark").innerText = sup.mark_price?.toFixed(4) || "-";
+        document.getElementById("rf-sup-roe").innerHTML = sup.roe_pct?.toFixed(2) + "%";
+        document.getElementById("rf-sup-upnl").innerText = sup.unrealized_pnl?.toFixed(2) || "-";
+        document.getElementById("rf-sup-adx").innerText = sup.adx?.toFixed(1) || "-";
+        document.getElementById("rf-sup-dip").innerText = sup.di_plus?.toFixed(1) || "-";
+        document.getElementById("rf-sup-dim").innerText = sup.di_minus?.toFixed(1) || "-";
+        document.getElementById("rf-sup-cont").innerText = sup.continuation_pressure || "-";
+        document.getElementById("rf-sup-fail").innerText = sup.thesis_failure_score || "-";
+        document.getElementById("rf-sup-conf").innerText = sup.current_confidence?.toFixed(1) || "-";
+        document.getElementById("rf-sup-tp1").innerHTML = sup.tp1_hit ? "✅" : "❌";
+        document.getElementById("rf-sup-tp2").innerHTML = sup.tp2_hit ? "✅" : "❌";
+        document.getElementById("rf-sup-trail").innerHTML = sup.trailing_active ? "✅" : "❌";
+        document.getElementById("rf-sup-personality").innerText = sup.trade_personality || "NEUTRAL";
+        document.getElementById("rf-sup-flow").innerText = sup.institutional_flow || "NEUTRAL";
+        document.getElementById("rf-sup-state").innerText = sup.trade_state || "RANGE_CHOP";
+        document.getElementById("rf-sup-trail-mult").innerText = sup.trail_multiplier || "1.5";
+        document.getElementById("rf-sup-delay-tp1").innerHTML = sup.delay_tp1 ? "✅" : "❌";
+        const reclaim = sup.reclaim_risk || 0;
+        let reclaimClass = "rf-live-pill-risk-low";
+        if (reclaim > 0.6) reclaimClass = "rf-live-pill-risk-high";
+        else if (reclaim > 0.3) reclaimClass = "rf-live-pill-risk-mid";
+        document.getElementById("rf-pill-reclaim").innerHTML = `🟢 RECLAIM ${{(reclaim*100).toFixed(0)}}%`;
+        document.getElementById("rf-pill-reclaim").className = `rf-live-pill ${{reclaimClass}}`;
+        const trailActive = sup.trailing_active;
+        document.getElementById("rf-pill-trail").innerHTML = trailActive ? "⚡ TRAILING ON" : "⚡ TRAILING OFF";
+        document.getElementById("rf-pill-trail").className = trailActive ? "rf-live-pill rf-live-pill-trail" : "rf-live-pill";
+        document.getElementById("rf-live-panel").style.display = "block";
+    }} else {{
+        document.getElementById("rf-live-panel").style.display = "none";
+    }}
+    if(d.continuation_probability) {{
+        let color = d.continuation_probability >= 0.65 ? "green" : (d.continuation_probability >= 0.5 ? "yellow" : "red");
+        document.getElementById("continuation-panel").innerHTML = `
+            <div>Continuation: <span style="color:${{color}};">${{(d.continuation_probability*100).toFixed(1)}}%</span></div>
+            <div>Hold Quality: ${{d.hold_quality}}</div>
+            <div>Trend Strength: ${{d.trend_strength}}</div>
+            <div>Counter Pressure: ${{d.counter_pressure}}</div>
+            <div>Reclaim Risk: ${{d.reclaim_risk}}</div>
+            <div>Reasons: ${{(d.continuation_reasons || []).join(", ")}}</div>
+        `;
+    }}
+    if(d.trade_thesis) {{
+        let t = d.trade_thesis;
+        document.getElementById("thesis-panel").innerHTML = `
+            <div>Status: ${{t.current_status || "ACTIVE"}}</div>
+            <div>Confidence: ${{t.confidence}}</div>
+            <div>Continuation Prob: ${{t.continuation_probability}}</div>
+            <div>Entry Reasons: ${{(t.entry_reason || []).join(", ")}}</div>
+            <div>Risks: ${{(t.risk_factors || []).join(", ")}}</div>
+        `;
+    }}
+    document.getElementById("current_conf").innerHTML = (d.current_confidence || 50).toFixed(1);
+    document.getElementById("market_regime").innerHTML = d.market_regime || "UNKNOWN";
+    document.getElementById("cont_pressure").innerHTML = d.continuation_pressure || 50;
+    document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
+    document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
+    document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
+    let top5Html = "";
+    (d.top5 || []).forEach(o => {{
+        top5Html += `<div><b>${{o.symbol}}</b> | Score: ${{o.score.toFixed(2)}} | ADX: ${{o.adx || 0}} | RSI: ${{o.rsi || 0}}</div><hr>`;
+    }});
+    document.getElementById("top5").innerHTML = top5Html || "No opportunities";
+    document.getElementById("scanned").innerText = d.scanned_count;
+    document.getElementById("lastScan").innerText = d.last_scan ? new Date(d.last_scan*1000).toLocaleTimeString() : "-";
+    document.getElementById("regimeLabel").innerText = d.regime;
+    document.getElementById("apiStatus").innerText = d.health.api;
+    document.getElementById("errCount").innerText = d.health.errors;
+    document.getElementById("botStatus").innerText = d.health.status;
+    if(d.rf_dashboard) {{
+        let rfHtml = "";
+        d.rf_dashboard.forEach(item => {{
+            let signalIcon = item.signal === "BUY" ? "🟢" : (item.signal === "SELL" ? "🔴" : "⚪");
+            rfHtml += `<div>${{item.icon}} ${{signalIcon}} ${{item.symbol}} | ${{item.status}} | score=${{item.score.toFixed(2)}} | ADX=${{item.adx||0}} | RSI=${{item.rsi||0}}</div>`;
+        }});
+        document.getElementById("rfSignals").innerHTML = rfHtml || "No RF signals";
+    }}
+    if(d.watchlist) {{
+        let wHtml = "";
+        for (let sym in d.watchlist) {{
+            let w = d.watchlist[sym];
+            let sideIcon = w.side === "BUY" ? "🟢" : "🔴";
+            wHtml += `<div style="margin-bottom:8px;border-bottom:1px solid #2c3e50;padding-bottom:4px;"><b>${{sideIcon}} ${{w.symbol}}</b> | Score: ${{w.score}} | ${{w.state}} | Reasons: ${{(w.reasons||[]).join(", ")}}</div>`;
+        }}
+        document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
+    }}
+    let noEntryHtml = "";
+    if(d.no_entry_feed) {{
+        d.no_entry_feed.forEach(item => {{
+            let timeStr = new Date(item.time * 1000).toLocaleTimeString();
+            noEntryHtml += `<div>${{timeStr}} | ${{item.symbol}} ${{item.side}}: ${{item.reason}}</div>`;
+        }});
+    }}
+    document.getElementById("no-entry-feed").innerHTML = noEntryHtml || "No recent skips";
+    if(d.institutional_flow) {{
+        let flow = d.institutional_flow;
+        document.getElementById("flow-banker").innerHTML = (flow.banker_pressure || 0).toFixed(1);
+        document.getElementById("flow-retail").innerHTML = (flow.retailer_pressure || 0).toFixed(1);
+        document.getElementById("flow-hot").innerHTML = (flow.hot_money || 0).toFixed(1);
+        document.getElementById("flow-bias").innerHTML = flow.institutional_bias_detailed || flow.institutional_bias || "-";
+        document.getElementById("flow-align").innerHTML = (flow.flow_alignment || 0).toFixed(1);
+        document.getElementById("flow-dist").innerHTML = (flow.distribution_risk || 0).toFixed(1);
+        document.getElementById("flow-mom-health").innerHTML = (flow.momentum_health || 0).toFixed(1);
+        document.getElementById("flow-cont-str").innerHTML = (flow.continuation_strength || 0).toFixed(1);
+        document.getElementById("flow-exh-risk").innerHTML = (flow.exhaustion_risk || 0).toFixed(1);
+        document.getElementById("flow-climax").innerHTML = (flow.climax_risk || 0).toFixed(1);
+        document.getElementById("flow-greed").innerHTML = flow.greed_state ? "🚨 Yes" : "✅ No";
+        document.getElementById("flow-dom").innerHTML = flow.smart_money_dominant ? "✅ Yes" : "❌ No";
+    }}
+    if (d.queue && d.queue.enabled !== false) {{
+        document.getElementById("queue-panel").style.display = "block";
+        document.getElementById("q-total").innerText = d.queue.total;
+        document.getElementById("q-ready").innerText = d.queue.ready;
+        document.getElementById("q-best-score").innerText = d.queue.best_score ? d.queue.best_score.toFixed(1) : "0";
+        let body = document.getElementById("queue-body");
+        body.innerHTML = "";
+        (d.queue.candidates || []).slice(0, 15).forEach(c => {{
+            let tr = document.createElement("tr");
+            tr.style.borderBottom = "1px solid #2c3e50";
+            tr.innerHTML = `<td><b>${{c.symbol}}</b></td><td>${{c.side}}</td><td>${{c.zone_score.toFixed(1)}}</td><td>${{c.ob_score.toFixed(0)}}</td><td>${{c.zone_strength.toFixed(0)}}</td><td>${{c.liquidity.toFixed(0)}}</td><td>${{c.institutional.toFixed(0)}}</td><td>${{c.structure.toFixed(0)}}</td><td>${{c.timing.toFixed(0)}}</td><td>${{c.trend.toFixed(0)}}</td><td>${{c.risk.toFixed(0)}}</td><td>${{c.trigger_state}}</td><td style="font-size:10px;">${{c.opportunity_type}}</td><td>${{c.state}}</td>`;
+            body.appendChild(tr);
+        }});
+    }} else {{
+        document.getElementById("queue-panel").style.display = "none";
+    }}
+    if (d.intent_engine) {{
+        const ie = d.intent_engine;
+        document.getElementById("intent-score").innerText = ie.score || 0;
+        document.getElementById("intent-status").innerText = ie.status || "NEUTRAL";
+        if (ie.details) {{
+            document.getElementById("intent-liq").innerText = ie.details.liquidity_score || "-";
+            document.getElementById("intent-abs").innerText = ie.details.absorption_score || "-";
+            document.getElementById("intent-vol").innerText = ie.details.volatility_score || "-";
+            document.getElementById("intent-flow").innerText = ie.details.flow_score || "-";
+            document.getElementById("intent-struct").innerText = ie.details.structure_score || "-";
+            document.getElementById("intent-mom").innerText = ie.details.momentum_score || "-";
+            document.getElementById("intent-vol-ctx").innerText = ie.details.volume_score || "-";
+            document.getElementById("intent-narr").innerText = ie.details.narrative || "-";
+        }}
+    }}
+    if (d.dynamic_trade) {{
+        const dt = d.dynamic_trade;
+        document.getElementById("dyn-roe").innerHTML = dt.roe?.toFixed(2) + "%" || "0.00%";
+        document.getElementById("dyn-trail").innerHTML = dt.trailing_active ? "✅" : "❌";
+        document.getElementById("dyn-tp1").innerHTML = dt.tp1_hit ? "✅" : "❌";
+        document.getElementById("dyn-tp2").innerHTML = dt.tp2_hit ? "✅" : "❌";
+        document.getElementById("dyn-runner").innerHTML = dt.runner_active ? "✅" : "❌";
+        document.getElementById("dyn-dd").innerHTML = dt.drawdown?.toFixed(1) + "%" || "0.0%";
+        document.getElementById("dyn-lifecycle").innerText = dt.lifecycle || "N/A";
+    }}
+}}
+async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
+async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
+setInterval(fetchData, 6000);
+fetchData();
+</script>
+</body></html>
+"""
+    return html
             }
         else:
             pos = DASHBOARD_STATE["position"]
