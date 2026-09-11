@@ -2045,7 +2045,7 @@ class ExchangeSyncService:
         except Exception:
             pass
 
-# ⬇️⬇️⬇️ [الجزء 2 يبدأ من هنا] ⬇️⬇️⬇️# ⬆️⬆️⬆️ [الجزء 1 ينتهي عند نهاية ExchangeSyncService] ⬆️⬆️⬆️
+# ⬇️⬇️⬇️ [الجزء 2 يبدأ من هنا] # ⬆️⬆️⬆️ [الجزء 1 ينتهي عند نهاية ExchangeSyncService] ⬆️⬆️⬆️
 
 class RecoveryGuard:
     def __init__(self, event_bus, exchange_sync):
@@ -7196,7 +7196,7 @@ def render_live_supervisor_panel():
     return """
     <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
       <div class="rf-live-header">
-        <span class="rf-live-title">🧠 RF v28 Fixed Live Supervisor</span>
+        <span class="rf-live-title">🧠 RF v28 + Live Supervisor</span>
         <span id="rf-live-status-badge" class="rf-live-pill rf-live-pill-idle">⚡ ADAPTIVE LIVE SYNC</span>
       </div>
       <div class="rf-live-grid">
@@ -7213,7 +7213,7 @@ def render_live_supervisor_panel():
         <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP1</div><div class="rf-live-metric-value" id="rf-sup-tp1">❌</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">🎯</div><div class="rf-live-metric-label">TP2</div><div class="rf-live-metric-value" id="rf-sup-tp2">❌</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">⚡</div><div class="rf-live-metric-label">Trailing</div><div class="rf-live-metric-value" id="rf-sup-trail">❌</div></div>
-        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Personality</div><div class="rf-live-metric-value" id="rf-sup-personality">-</div></div>
+        <div class="rf-live-card"><div class="rf-live-metric-icon">🧠</div><div class="rf-live-metric-label">Lifecycle</div><div class="rf-live-metric-value" id="rf-sup-lifecycle">-</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">🏦</div><div class="rf-live-metric-label">Institutional Flow</div><div class="rf-live-metric-value" id="rf-sup-flow">-</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">⚙️</div><div class="rf-live-metric-label">Trade State</div><div class="rf-live-metric-value" id="rf-sup-state">-</div></div>
         <div class="rf-live-card"><div class="rf-live-metric-icon">📏</div><div class="rf-live-metric-label">Trail Mult</div><div class="rf-live-metric-value" id="rf-sup-trail-mult">-</div></div>
@@ -7244,7 +7244,6 @@ def render_live_supervisor_panel():
     .rf-live-pill-risk-high {color: #ff4d4d;}
     </style>
     """
-
 
 @app.route("/")
 def dashboard():
@@ -7423,7 +7422,7 @@ def dashboard():
 
     html = f"""
 <!DOCTYPE html>
-<html><head><title>RF v28 + Board v1</title>
+<html><head><title>RF v28 + Live Supervisor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
@@ -7440,7 +7439,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </style>
 </head>
 <body>
-<div class="header">🔥 RF v28 + Trade Management Board v1</div>
+<div class="header">🔥 RF v28 + Live Supervisor (FIXED)</div>
 {decision_panel_html}
 {scanner_v2_section}
 {queue_panel_html}
@@ -7549,7 +7548,7 @@ function updateUI(d) {{
         document.getElementById("rf-sup-tp1").innerHTML = sup.tp1_hit ? "✅" : "❌";
         document.getElementById("rf-sup-tp2").innerHTML = sup.tp2_hit ? "✅" : "❌";
         document.getElementById("rf-sup-trail").innerHTML = sup.trailing_active ? "✅" : "❌";
-        document.getElementById("rf-sup-personality").innerText = sup.trade_personality || "NEUTRAL";
+        document.getElementById("rf-sup-lifecycle").innerText = d.lifecycle_state || "-";
         document.getElementById("rf-sup-flow").innerText = sup.institutional_flow || "NEUTRAL";
         document.getElementById("rf-sup-state").innerText = sup.trade_state || "RANGE_CHOP";
         document.getElementById("rf-sup-trail-mult").innerText = sup.trail_multiplier || "1.5";
@@ -7649,13 +7648,46 @@ function updateUI(d) {{
         document.getElementById("queue-panel").style.display = "block";
         document.getElementById("q-total").innerText = d.queue.total;
         document.getElementById("q-ready").innerText = d.queue.ready;
+        document.getElementById("q-waiting").innerText = (d.queue.candidates || []).filter(c => c.state === "WAITING_TRIGGER").length;
+        document.getElementById("q-good-zone").innerText = (d.queue.candidates || []).filter(c => c.state === "GOOD_ZONE" || c.state === "ENTRY_VALIDATION").length;
+        document.getElementById("q-returned").innerText = (d.queue.candidates || []).filter(c => c.state === "RETURNED_WATCHLIST").length;
         document.getElementById("q-best-score").innerText = d.queue.best_score ? d.queue.best_score.toFixed(1) : "0";
         let body = document.getElementById("queue-body");
         body.innerHTML = "";
         (d.queue.candidates || []).slice(0, 15).forEach(c => {{
             let tr = document.createElement("tr");
             tr.style.borderBottom = "1px solid #2c3e50";
-            tr.innerHTML = `<td><b>${{c.symbol}}</b></td><td>${{c.side}}</td><td>${{c.zone_score.toFixed(1)}}</td><td>${{c.ob_score.toFixed(0)}}</td><td>${{c.zone_strength.toFixed(0)}}</td><td>${{c.liquidity.toFixed(0)}}</td><td>${{c.institutional.toFixed(0)}}</td><td>${{c.structure.toFixed(0)}}</td><td>${{c.timing.toFixed(0)}}</td><td>${{c.trend.toFixed(0)}}</td><td>${{c.risk.toFixed(0)}}</td><td>${{c.trigger_state}}</td><td style="font-size:10px;">${{c.opportunity_type}}</td><td>${{c.state}}</td>`;
+            let stateColor = "";
+            if (c.state === "READY") stateColor = "#2ecc71";
+            else if (c.state === "ENTRY_VALIDATION") stateColor = "#3498db";
+            else if (c.state === "WAITING_TRIGGER") stateColor = "#f1c40f";
+            else if (c.state === "GOOD_ZONE") stateColor = "#3498db";
+            else if (c.state === "MITIGATION") stateColor = "#e67e22";
+            else if (c.state === "INVALIDATED" || c.state === "RETURNED_WATCHLIST") stateColor = "#95a5a6";
+            else stateColor = "#ecf0f1";
+            let triggerState = c.trigger_state || "WAITING_TRIGGER";
+            let triggerColor = triggerState === "MSS_CONFIRMED" ? "#2ecc71" :
+                               triggerState === "LIQUIDITY_SWEEP" ? "#3498db" :
+                               triggerState === "BOS_CONFIRMED" ? "#9b59b6" :
+                               triggerState === "CHOCH_CONFIRMED" ? "#1abc9c" :
+                               triggerState === "MITIGATION" ? "#f1c40f" :
+                               "#95a5a6";
+            tr.innerHTML = `
+                <td><b>${{c.symbol}}</b></td>
+                <td style="color:${{c.side === 'BUY' ? '#2ecc71' : '#e74c3c'}}">${{c.side}}</td>
+                <td style="font-weight:bold; color:${{c.zone_score >= 80 ? '#2ecc71' : c.zone_score >= 60 ? '#f1c40f' : '#e74c3c'}}">${{c.zone_score.toFixed(1)}}</td>
+                <td>${{c.ob_score.toFixed(0)}}</td>
+                <td>${{c.zone_strength.toFixed(0)}}</td>
+                <td>${{c.liquidity.toFixed(0)}}</td>
+                <td>${{c.institutional.toFixed(0)}}</td>
+                <td>${{c.structure.toFixed(0)}}</td>
+                <td>${{c.timing.toFixed(0)}}</td>
+                <td>${{c.trend.toFixed(0)}}</td>
+                <td>${{c.risk.toFixed(0)}}</td>
+                <td style="color:${{triggerColor}}; font-weight:bold;">${{triggerState}}</td>
+                <td style="font-size:10px;">${{c.opportunity_type}}</td>
+                <td style="color:${{stateColor}}; font-weight:bold;">${{c.state}}</td>
+            `;
             body.appendChild(tr);
         }});
     }} else {{
@@ -7695,6 +7727,51 @@ fetchData();
 </body></html>
 """
     return html
+
+@app.route("/data")
+def data():
+    cached = cache_get("dashboard", 5)
+    if cached is not None:
+        return jsonify(safe_json(cached))
+    try:
+        bal = get_balance_safe()
+        free_bal = get_free_balance_safe()
+        avail_margin = free_bal
+        mode = "LIVE" if MODE_LIVE else "PAPER"
+        DASHBOARD_STATE["account"]["balance"] = bal
+        DASHBOARD_STATE["account"]["free_balance"] = free_bal
+        DASHBOARD_STATE["account"]["available_margin"] = avail_margin
+        DASHBOARD_STATE["account"]["mode"] = mode
+        perf = get_dashboard_metrics()
+        pos = None
+        if STATE["open"] and STATE.get("current_symbol"):
+            roe = STATE.get("roe_pct", 0.0)
+            pos = {
+                "symbol": STATE["current_symbol"], "side": STATE["side"],
+                "entry": round(STATE["entry"],4),
+                "qty": STATE.get("qty", 0),
+                "pnl": round(roe, 2),
+                "sl": round(STATE.get("synthetic_sl",0),4),
+                "tp1": round(STATE.get("synthetic_tp1",0),4),
+                "tp2": round(STATE.get("tp2_price",0),4),
+                "tp1_done": STATE.get("tp1_hit", False),
+                "trailing_active": STATE.get("trail_activated", False),
+                "regime": MEMORY.get("regime", "UNKNOWN"),
+                "trade_type": STATE.get("trade_type", "N/A"),
+                "entry_type": STATE.get("entry_type", "N/A"),
+                "classification": STATE.get("classification", "N/A"),
+                "location": STATE.get("location", "N/A"),
+                "zone": STATE.get("zone_info", "N/A"),
+                "score": STATE.get("trade_score", 0),
+                "narrative_classification": STATE.get("narrative_classification", ""),
+                "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+                "confidence_level": STATE.get("confidence_level", ""),
+                "current_confidence": STATE.get("current_confidence", 50.0),
+                "market_regime": STATE.get("market_regime", "UNKNOWN"),
+                "continuation_pressure": STATE.get("continuation_pressure", 50),
+                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+                "delay_tp1": STATE.get("delay_tp1", False)
             }
         else:
             pos = DASHBOARD_STATE["position"]
@@ -7930,7 +8007,7 @@ def print_snapshot():
     mode = "LIVE" if MODE_LIVE else "PAPER"
     perf = get_dashboard_metrics()
     print("\n" + "="*70)
-    print(color_text(f"🔥 RF v28 (FIXED) ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
+    print(color_text(f"🔥 RF v28 + Live Supervisor ({mode}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", BOLD))
     print(f"💰 Balance: {color_text(f'{bal:.2f} USDT', GREEN)}  Free: {color_text(f'{free_bal:.2f} USDT', GREEN)}")
     print(f"📊 Total PnL: {perf['total_pnl']} | Last Trade: {perf['last_trade']}")
     if STATE["open"]:
@@ -7938,9 +8015,12 @@ def print_snapshot():
         roe_colored = color_pnl(roe)
         lifecycle = _live_manager.lifecycle_state.value
         print(f"📊 POSITION: {STATE['current_symbol']} {STATE['side']} | ROE: {roe_colored} | Lifecycle: {lifecycle}")
-        print(f"   SL: {STATE.get('synthetic_sl',0):.4f} | TP1: {STATE.get('synthetic_tp1',0):.4f}")
+        print(f"   SL: {STATE.get('synthetic_sl',0):.4f} | TP1: {STATE.get('synthetic_tp1',0):.4f} | TP2: {STATE.get('tp2_price',0):.4f}")
     else:
         print("📊 POSITION: None")
+    if USE_EXECUTION_QUEUE:
+        qstat = queue.get_status()
+        print(f"🎯 QUEUE: {qstat['total_candidates']} candidates, {qstat['ready']} ready")
     print("="*70 + "\n")
 
 def build_rf_dashboard():
