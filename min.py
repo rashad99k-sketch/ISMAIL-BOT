@@ -45,6 +45,9 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+# ========== [COUNCIL-FIX] dataclass import moved to top ==========
+from dataclasses import dataclass, field
+
 # ========== FALLBACK LOGGING ==========
 if 'log_execution' not in dir():
     def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
